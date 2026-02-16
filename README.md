@@ -241,16 +241,6 @@ After a successful OAuth flow, `~/.openclaw/auth-profiles.json` will contain:
 
 This file should be `chmod 600` (owner-only). The plugin auto-refreshes tokens 60 seconds before expiry and persists the new tokens back to this file.
 
-#### Personal API Key (Fallback)
-
-If you can't use OAuth, you can set a personal API key as a fallback:
-
-```bash
-export LINEAR_ACCESS_TOKEN="your_personal_api_key"
-```
-
-> **Limitation:** Personal API keys lack `app:assignable` and `app:mentionable` scopes, so agent sessions, branded comments, and assignment menus will not work. Only basic comment posting and issue operations are available.
-
 ### 7. Configure Agent Profiles
 
 Create `~/.openclaw/agent-profiles.json` to define role-based agents:
@@ -319,13 +309,14 @@ curl -s -X POST https://your-domain.com/linear/webhook \
 
 ## How It Works
 
-### Token Resolution Priority
+### Token Resolution
+
+The plugin resolves an OAuth token from:
 
 1. Plugin config `accessToken` (static, for testing)
-2. Auth profile store `linear:default` (OAuth — preferred, has agent scopes)
-3. `LINEAR_ACCESS_TOKEN` / `LINEAR_API_KEY` env var (personal API key, fallback)
+2. Auth profile store `linear:default` (from the OAuth flow — this is the normal path)
 
-OAuth tokens carry a refresh token and use `Bearer` prefix. Personal API keys have no refresh token and are sent as-is. The plugin determines the format automatically.
+OAuth is required. The plugin needs `app:assignable` and `app:mentionable` scopes to function — agent sessions, branded comments, assignment triage, and @mention routing all depend on the application identity that only OAuth provides.
 
 ### Webhook Event Routing
 
