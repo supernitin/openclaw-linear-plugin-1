@@ -40,7 +40,77 @@ Separately from the OAuth app, create a workspace-level webhook:
 
 > **Why two webhooks?** The OAuth app webhook handles `AgentSessionEvent` and `AppUserNotification` events (agent-specific). The workspace webhook handles `Comment` and `Issue` events (workspace-wide). Both must point to the same URL — the plugin routes internally.
 
-### 3. Set Environment Variables
+### 3. Expose the Gateway via Cloudflare Tunnel
+
+The OpenClaw gateway listens on `localhost:<port>` (default `18789`). Linear must reach it over HTTPS to deliver webhooks. A [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) is the recommended approach — no open inbound ports, no self-managed TLS.
+
+#### Install `cloudflared`
+
+```bash
+# RHEL / Rocky / Alma
+sudo dnf install -y cloudflared
+
+# Debian / Ubuntu
+curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflared.list
+sudo apt update && sudo apt install -y cloudflared
+
+# macOS
+brew install cloudflare/cloudflare/cloudflared
+```
+
+#### Authenticate and create a tunnel
+
+```bash
+cloudflared tunnel login                         # opens browser, authorizes your Cloudflare account
+cloudflared tunnel create openclaw               # creates the tunnel, outputs a tunnel ID
+```
+
+#### Configure the tunnel
+
+Create `~/.cloudflared/config.yml`:
+
+```yaml
+tunnel: <TUNNEL_ID>
+credentials-file: /home/<user>/.cloudflared/<TUNNEL_ID>.json
+
+ingress:
+  - hostname: linear.yourdomain.com
+    service: http://localhost:18789
+  - service: http_status:404
+```
+
+#### Add a DNS route
+
+```bash
+cloudflared tunnel route dns openclaw linear.yourdomain.com
+```
+
+This creates a CNAME in Cloudflare DNS pointing `linear.yourdomain.com` to your tunnel.
+
+#### Run as a service
+
+```bash
+# systemd (Linux)
+sudo cloudflared service install
+sudo systemctl enable --now cloudflared
+
+# Or run manually for testing
+cloudflared tunnel run openclaw
+```
+
+#### Verify end-to-end
+
+```bash
+curl -s https://linear.yourdomain.com/linear/webhook \
+  -X POST -H "Content-Type: application/json" \
+  -d '{"type":"test","action":"ping"}'
+# Should return: "ok"
+```
+
+> **Note:** The hostname you choose here (`linear.yourdomain.com`) is what you'll use for the OAuth redirect URI and both webhook URLs in Linear. Make sure they all match.
+
+### 4. Set Environment Variables
 
 Required:
 ```bash
@@ -54,7 +124,7 @@ export LINEAR_REDIRECT_URI="https://your-domain.com/linear/oauth/callback"
 export OPENCLAW_GATEWAY_PORT="18789"  # if non-default
 ```
 
-### 4. Install the Plugin
+### 5. Install the Plugin
 
 Add the plugin path to your OpenClaw config (`~/.openclaw/openclaw.json`):
 
@@ -79,7 +149,7 @@ Restart the gateway to load the plugin:
 openclaw gateway restart
 ```
 
-### 5. Run the OAuth Flow
+### 6. Run the OAuth Flow
 
 There are two ways to authorize the plugin with Linear.
 
@@ -154,7 +224,7 @@ export LINEAR_ACCESS_TOKEN="your_personal_api_key"
 
 > **Limitation:** Personal API keys lack `app:assignable` and `app:mentionable` scopes, so agent sessions, branded comments, and assignment menus will not work. Only basic comment posting and issue operations are available.
 
-### 6. Configure Agent Profiles
+### 7. Configure Agent Profiles
 
 Create `~/.openclaw/agent-profiles.json` to define role-based agents:
 
@@ -204,7 +274,7 @@ Create `~/.openclaw/agent-profiles.json` to define role-based agents:
 
 Each agent ID (the JSON key) must match a configured OpenClaw agent in `openclaw.json`. The plugin dispatches to agents via `openclaw agent --agent <id>`.
 
-### 7. Verify
+### 8. Verify
 
 ```bash
 openclaw gateway restart
