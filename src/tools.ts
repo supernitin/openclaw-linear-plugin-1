@@ -1,16 +1,16 @@
 import type { AnyAgentTool, OpenClawPluginApi, OpenClawPluginToolContext } from "openclaw/plugin-sdk";
 import { jsonResult } from "openclaw/plugin-sdk";
 import { LinearClient } from "./client.js";
+import { resolveLinearToken } from "./linear-api.js";
 
 export function createLinearTools(api: OpenClawPluginApi, ctx: OpenClawPluginToolContext): AnyAgentTool[] {
   const getClient = () => {
-    // In a real implementation, we would resolve the token from auth profiles
-    // For now, we'll try to get it from environment or a known profile
-    const token = process.env.LINEAR_ACCESS_TOKEN;
-    if (!token) {
-      throw new Error("Linear access token not found. Please authenticate first.");
+    const pluginConfig = (api as any).pluginConfig as Record<string, unknown> | undefined;
+    const resolved = resolveLinearToken(pluginConfig);
+    if (!resolved.accessToken) {
+      throw new Error("Linear access token not found. Run 'openclaw openclaw-linear auth' to authenticate.");
     }
-    return new LinearClient(token);
+    return new LinearClient(resolved.accessToken);
   };
   
   return [

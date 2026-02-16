@@ -4,6 +4,7 @@ Webhook-driven Linear integration with OAuth support, multi-agent routing, and a
 
 ## What It Does
 
+- **Auto-triage** — New issues are automatically estimated (story points), labeled, and prioritized with a posted assessment
 - **Issue triage** — When an issue is assigned/delegated to the app user, an agent estimates story points, applies labels, and posts an assessment
 - **Agent sessions** — Full plan-approve-implement-audit pipeline triggered from Linear's agent UI
 - **@mention routing** — Comment mentions like `@qa` or `@infra` route to specific role-based agents with different expertise
@@ -20,6 +21,42 @@ openclaw gateway restart
 That's it — the plugin is installed and enabled. Continue with the [setup steps](#setup) below to configure Linear OAuth and webhooks.
 
 > To install from a local checkout instead: `openclaw plugins install --link /path/to/linear`
+
+## First Run
+
+After installing, the plugin loads but **will not process any webhooks or agent tools until you authenticate**. You'll see this in the logs:
+
+```
+Linear agent extension registered (agent: default, token: missing)
+```
+
+This is normal — the plugin does not crash without auth. It registers all routes and CLI commands, but webhook handlers and tools will return errors until a token is available.
+
+To authenticate:
+
+```bash
+# Set your OAuth app credentials
+export LINEAR_CLIENT_ID="your_client_id"
+export LINEAR_CLIENT_SECRET="your_client_secret"
+
+# Run the OAuth flow
+openclaw openclaw-linear auth
+
+# Verify
+openclaw openclaw-linear status
+```
+
+The auth flow stores tokens in `~/.openclaw/auth-profiles.json`. This file is created automatically — you do not need to create it manually. After auth, restart the gateway:
+
+```bash
+openclaw gateway restart
+```
+
+You should now see `token: profile` in the logs:
+
+```
+Linear agent extension registered (agent: default, token: profile)
+```
 
 ## Prerequisites
 
@@ -185,7 +222,7 @@ If you prefer to manage config by hand, add the plugin path to `~/.openclaw/open
       "paths": ["/path/to/linear"]
     },
     "entries": {
-      "linear": {
+      "openclaw-linear": {
         "enabled": true
       }
     }
@@ -203,7 +240,7 @@ There are two ways to authorize the plugin with Linear.
 #### Option A: CLI Flow (Recommended)
 
 ```bash
-openclaw auth linear oauth
+openclaw openclaw-linear auth
 ```
 
 This launches the OAuth flow interactively:
@@ -395,6 +432,7 @@ POST /linear/webhook
   +-- AgentSessionEvent.prompted --> Resume pipeline (user approved plan)
   +-- AppUserNotification        --> Direct agent response to mention/assignment
   +-- Comment.create             --> Route @mention to role-based agent
+  +-- Issue.create               --> Auto-triage new issues (estimate, labels, priority)
   +-- Issue.update               --> Triage if assigned/delegated to app user
 ```
 
@@ -449,7 +487,7 @@ Optional settings in `openclaw.json` under the plugin entry:
 {
   "plugins": {
     "entries": {
-      "linear": {
+      "openclaw-linear": {
         "enabled": true,
         "clientId": "...",
         "clientSecret": "...",
@@ -519,7 +557,7 @@ openclaw logs | grep -i "linear\|plugin\|error"
 **Agent sessions not working:**
 - OAuth tokens require `app:assignable` and `app:mentionable` scopes
 - Personal API keys cannot create agent sessions — use OAuth
-- Re-run `openclaw auth linear oauth` to get fresh tokens
+- Re-run `openclaw openclaw-linear auth` to get fresh tokens
 
 **"No defaultAgentId" error:**
 - Set `defaultAgentId` in plugin config, OR
