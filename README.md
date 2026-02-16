@@ -59,12 +59,43 @@ sudo apt update && sudo apt install -y cloudflared
 brew install cloudflare/cloudflare/cloudflared
 ```
 
-#### Authenticate and create a tunnel
+#### Authenticate with Cloudflare
 
 ```bash
-cloudflared tunnel login                         # opens browser, authorizes your Cloudflare account
-cloudflared tunnel create openclaw               # creates the tunnel, outputs a tunnel ID
+cloudflared tunnel login
 ```
+
+This opens your browser to Cloudflare's authorization page. You must:
+
+1. Log in to your Cloudflare account
+2. **Select the domain** (zone) you want the tunnel to use (e.g., `yourdomain.com`)
+3. Click **Authorize**
+
+Cloudflare writes an origin certificate to `~/.cloudflared/cert.pem`. This certificate grants `cloudflared` permission to create tunnels and DNS records under that domain. Without it, tunnel creation will fail.
+
+#### Create a tunnel
+
+```bash
+cloudflared tunnel create openclaw
+```
+
+This outputs a **Tunnel ID** (a UUID like `da1f21bf-856e-...`) and writes a credentials file to `~/.cloudflared/<TUNNEL_ID>.json`.
+
+#### Create a DNS subdomain for the tunnel
+
+```bash
+cloudflared tunnel route dns openclaw linear.yourdomain.com
+```
+
+This creates a **CNAME record** in your Cloudflare DNS:
+
+```
+linear.yourdomain.com  CNAME  <TUNNEL_ID>.cfargotunnel.com
+```
+
+You can verify it in the Cloudflare dashboard under **DNS > Records** for your domain. The subdomain (`linear.yourdomain.com`) is what Linear will use for webhook delivery and OAuth callbacks.
+
+> **Important:** Your domain must already be on Cloudflare (nameservers pointed to Cloudflare). If it's not, add it in the Cloudflare dashboard first.
 
 #### Configure the tunnel
 
@@ -80,22 +111,18 @@ ingress:
   - service: http_status:404
 ```
 
-#### Add a DNS route
+The `ingress` rule routes all traffic for your subdomain to the OpenClaw gateway on localhost. The catch-all `http_status:404` rejects requests for any other hostname.
+
+#### Run as a systemd service
 
 ```bash
-cloudflared tunnel route dns openclaw linear.yourdomain.com
-```
-
-This creates a CNAME in Cloudflare DNS pointing `linear.yourdomain.com` to your tunnel.
-
-#### Run as a service
-
-```bash
-# systemd (Linux)
 sudo cloudflared service install
 sudo systemctl enable --now cloudflared
+```
 
-# Or run manually for testing
+This installs a system-level service that starts on boot. To test without installing:
+
+```bash
 cloudflared tunnel run openclaw
 ```
 
