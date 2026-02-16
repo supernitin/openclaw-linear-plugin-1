@@ -1,0 +1,17 @@
+{
+  "id": "linear",
+  "name": "Linear Agent",
+  "description": "Linear integration with OAuth support, agent pipeline, and webhook-driven AI agent lifecycle",
+  "version": "0.2.0",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "clientId": { "type": "string", "description": "Linear OAuth Client ID" },
+      "clientSecret": { "type": "string", "description": "Linear OAuth Client Secret", "sensitive": true },
+      "redirectUri": { "type": "string", "description": "Linear OAuth Redirect URI (optional, defaults to gateway URL)" },
+      "accessToken": { "type": "string", "description": "Linear API access token for agent activities", "sensitive": true },
+      "defaultAgentId": { "type": "string", "description": "OpenClaw agent ID to use for pipeline stages" },
+      "enableAudit": { "type": "boolean", "description": "Run auditor stage after implementation", "default": true }
+    }
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "name": "@openclaw/linear",
+  "version": "0.2.0",
+  "description": "Linear Agent plugin for OpenClaw — webhook-driven AI pipeline with OAuth, multi-agent routing, and issue triage",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/calltelemetry/openclaw-linear-plugin.git"
+  },
+  "homepage": "https://github.com/calltelemetry/openclaw-linear-plugin#readme",
+  "keywords": [
+    "openclaw",
+    "linear",
+    "agent",
+    "webhook",
+    "oauth",
+    "ai-pipeline",
+    "issue-triage"
+  ],
+  "files": [
+    "index.ts",
+    "src/",
+    "openclaw.plugin.json",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "devDependencies": {
+    "openclaw": "^2026.2.13"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

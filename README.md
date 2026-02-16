@@ -1,0 +1,380 @@
+# Linear Agent Plugin for OpenClaw
+
+Webhook-driven Linear integration with OAuth support, multi-agent routing, and a 3-stage AI pipeline for issue triage and implementation.
+
+## What It Does
+
+- **Issue triage** — When an issue is assigned/delegated to the app user, an agent estimates story points, applies labels, and posts an assessment
+- **Agent sessions** — Full plan-approve-implement-audit pipeline triggered from Linear's agent UI
+- **@mention routing** — Comment mentions like `@qa` or `@infra` route to specific role-based agents with different expertise
+- **App notifications** — Responds to Linear app mentions and assignments via branded comments
+- **Activity tracking** — Emits thought/action/response events visible in Linear's agent session UI
+
+## Prerequisites
+
+- OpenClaw gateway running (systemd service)
+- A Linear workspace with API access
+- A Linear OAuth application (Settings > API > Applications)
+- A public URL for webhook delivery (e.g., Cloudflare tunnel)
+
+## Setup
+
+### 1. Create a Linear OAuth Application
+
+1. Go to **Linear Settings > API > Applications**
+2. Click **Create new application**
+3. Fill in:
+   - **Application name:** your agent's name
+   - **Redirect URI:** `https://<your-domain>/linear/oauth/callback`
+   - **Webhook URL:** `https://<your-domain>/linear/webhook`
+4. Note the **Client ID** and **Client Secret**
+5. Enable the webhook events you need (Agent Sessions, Issues)
+
+### 2. Create a Workspace Webhook
+
+Separately from the OAuth app, create a workspace-level webhook:
+
+1. Go to **Linear Settings > API > Webhooks**
+2. Create a new webhook pointing to `https://<your-domain>/linear/webhook`
+3. Enable these event types: **Comment**, **Issue**, **User**
+
+> **Why two webhooks?** The OAuth app webhook handles `AgentSessionEvent` and `AppUserNotification` events (agent-specific). The workspace webhook handles `Comment` and `Issue` events (workspace-wide). Both must point to the same URL — the plugin routes internally.
+
+### 3. Set Environment Variables
+
+Required:
+```bash
+export LINEAR_CLIENT_ID="your_client_id"
+export LINEAR_CLIENT_SECRET="your_client_secret"
+```
+
+Optional:
+```bash
+export LINEAR_REDIRECT_URI="https://your-domain.com/linear/oauth/callback"
+export OPENCLAW_GATEWAY_PORT="18789"  # if non-default
+```
+
+### 4. Install the Plugin
+
+Add the plugin path to your OpenClaw config (`~/.openclaw/openclaw.json`):
+
+```json
+{
+  "plugins": {
+    "load": {
+      "paths": ["/path/to/claw-extensions/linear"]
+    },
+    "entries": {
+      "linear": {
+        "enabled": true
+      }
+    }
+  }
+}
+```
+
+Restart the gateway to load the plugin:
+
+```bash
+openclaw gateway restart
+```
+
+### 5. Run the OAuth Flow
+
+There are two ways to authorize the plugin with Linear.
+
+#### Option A: CLI Flow (Recommended)
+
+```bash
+openclaw auth linear oauth
+```
+
+This launches the OAuth flow interactively:
+
+1. The plugin constructs the authorization URL with the required scopes
+2. Your browser opens to Linear's authorization page
+3. You approve the permissions
+4. Linear redirects to the callback URL with an authorization code
+5. The plugin exchanges the code for access + refresh tokens
+6. Tokens are stored in `~/.openclaw/auth-profiles.json`
+
+#### Option B: Manual URL
+
+If the CLI flow doesn't work (headless server, tunnel issues), construct the URL yourself:
+
+```
+https://linear.app/oauth/authorize
+  ?client_id=YOUR_CLIENT_ID
+  &redirect_uri=https://your-domain.com/linear/oauth/callback
+  &response_type=code
+  &scope=read,write,app:assignable,app:mentionable
+  &state=random_string
+  &actor=app
+```
+
+Key parameters:
+
+| Parameter | Value | Why |
+|---|---|---|
+| `scope` | `read,write,app:assignable,app:mentionable` | `app:assignable` lets the agent appear in assignment menus. `app:mentionable` lets users @mention the agent. |
+| `actor` | `app` | Makes the token act as the **application identity**, not a personal user. Agent sessions require this. |
+| `redirect_uri` | Your callback URL | Must match what you registered in the OAuth app settings. |
+
+Click the URL, authorize in Linear, and the callback handler at `/linear/oauth/callback` will exchange the code and store the tokens automatically.
+
+#### What Gets Stored
+
+After a successful OAuth flow, `~/.openclaw/auth-profiles.json` will contain:
+
+```json
+{
+  "version": 1,
+  "profiles": {
+    "linear:default": {
+      "type": "oauth",
+      "provider": "linear",
+      "accessToken": "...",
+      "refreshToken": "...",
+      "expiresAt": 1708109280000,
+      "scope": "app:assignable app:mentionable read write"
+    }
+  }
+}
+```
+
+This file should be `chmod 600` (owner-only). The plugin auto-refreshes tokens 60 seconds before expiry and persists the new tokens back to this file.
+
+#### Personal API Key (Fallback)
+
+If you can't use OAuth, you can set a personal API key as a fallback:
+
+```bash
+export LINEAR_ACCESS_TOKEN="your_personal_api_key"
+```
+
+> **Limitation:** Personal API keys lack `app:assignable` and `app:mentionable` scopes, so agent sessions, branded comments, and assignment menus will not work. Only basic comment posting and issue operations are available.
+
+### 6. Configure Agent Profiles
+
+Create `~/.openclaw/agent-profiles.json` to define role-based agents:
+
+```json
+{
+  "agents": {
+    "lead": {
+      "label": "Lead",
+      "mission": "Product owner. Sets direction, makes scope decisions, prioritizes backlog.",
+      "isDefault": true,
+      "mentionAliases": ["lead", "product"],
+      "appAliases": ["myagent"],
+      "avatarUrl": "https://example.com/lead-avatar.png"
+    },
+    "qa": {
+      "label": "QA",
+      "mission": "Test engineer. Quality guardian, test strategy, release confidence.",
+      "mentionAliases": ["qa", "tester"]
+    },
+    "infra": {
+      "label": "Infra",
+      "mission": "Backend and infrastructure engineer. Performance, reliability, observability.",
+      "mentionAliases": ["infra", "backend"]
+    },
+    "ux": {
+      "label": "UX",
+      "mission": "User experience advocate. Accessibility, user journeys, pain points.",
+      "mentionAliases": ["ux", "design"]
+    },
+    "docs": {
+      "label": "Docs",
+      "mission": "Technical writer. Setup guides, API references, release notes.",
+      "mentionAliases": ["docs", "writer"]
+    }
+  }
+}
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `label` | Yes | Display name in Linear comments |
+| `mission` | Yes | Agent's role description (provided as context when dispatched) |
+| `isDefault` | One agent | The default agent handles OAuth app events and assignment triage |
+| `mentionAliases` | Yes | @mention triggers in comments (e.g., `@qa` in a comment routes to the QA agent) |
+| `appAliases` | No | Triggers via OAuth app webhook (default agent only, for app-level @mentions) |
+| `avatarUrl` | No | Avatar displayed on branded comments. Falls back to `[Label]` prefix if not set. |
+
+Each agent ID (the JSON key) must match a configured OpenClaw agent in `openclaw.json`. The plugin dispatches to agents via `openclaw agent --agent <id>`.
+
+### 7. Verify
+
+```bash
+openclaw gateway restart
+openclaw logs | grep -i linear
+# Should show: "Linear agent extension registered (agent: default, token: profile)"
+```
+
+Test the webhook is reachable:
+```bash
+curl -s -X POST https://your-domain.com/linear/webhook \
+  -H "Content-Type: application/json" \
+  -d '{"type":"test","action":"ping"}'
+# Should return: "ok"
+```
+
+## How It Works
+
+### Token Resolution Priority
+
+1. Plugin config `accessToken` (static, for testing)
+2. Auth profile store `linear:default` (OAuth — preferred, has agent scopes)
+3. `LINEAR_ACCESS_TOKEN` / `LINEAR_API_KEY` env var (personal API key, fallback)
+
+OAuth tokens carry a refresh token and use `Bearer` prefix. Personal API keys have no refresh token and are sent as-is. The plugin determines the format automatically.
+
+### Webhook Event Routing
+
+```
+POST /linear/webhook
+  |
+  +-- AgentSessionEvent.created  --> 3-stage pipeline (plan -> implement -> audit)
+  +-- AgentSessionEvent.prompted --> Resume pipeline (user approved plan)
+  +-- AppUserNotification        --> Direct agent response to mention/assignment
+  +-- Comment.create             --> Route @mention to role-based agent
+  +-- Issue.update               --> Triage if assigned/delegated to app user
+```
+
+All handlers respond `200 OK` within 5 seconds (Linear requirement), then process asynchronously.
+
+### Pipeline Stages
+
+Triggered by `AgentSessionEvent.created`:
+
+| Stage | Timeout | What It Does |
+|---|---|---|
+| **Planner** | 5 min | Analyzes issue, generates implementation plan, posts as comment, waits for approval |
+| **Implementor** | 10 min | Follows the approved plan, makes changes, creates commits/PRs |
+| **Auditor** | 5 min | Reviews implementation against plan, posts audit report |
+
+The auditor stage can be disabled via plugin config: `"enableAudit": false`.
+
+### Assignment Triage
+
+When an issue is assigned or delegated to the app user:
+
+1. Fetches full issue details and available team labels
+2. Dispatches the default agent with a triage prompt
+3. Agent returns JSON with story point estimate and label IDs
+4. Plugin applies the estimate and labels to the issue
+5. Posts the assessment as a branded comment
+
+### @Mention Routing
+
+When a comment contains `@qa`, `@infra`, or any configured `mentionAliases`:
+
+1. Plugin matches the alias to an agent profile
+2. Reacts with eyes emoji to acknowledge
+3. Fetches full issue context (description, recent comments, labels, state)
+4. Dispatches the matched agent with the comment context
+5. Posts the agent's response as a branded comment on the issue
+
+The default agent's `mentionAliases` are excluded from comment routing — the default agent is reached via `appAliases` through the OAuth app webhook instead.
+
+### Comment Deduplication
+
+Webhook events are deduplicated for 60 seconds using a key based on:
+- Comment ID (for `Comment.create`)
+- Session ID (for `AgentSessionEvent`)
+- Assignment tuple (for `Issue.update`)
+
+## Plugin Config Schema
+
+Optional settings in `openclaw.json` under the plugin entry:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "linear": {
+        "enabled": true,
+        "clientId": "...",
+        "clientSecret": "...",
+        "redirectUri": "...",
+        "accessToken": "...",
+        "defaultAgentId": "...",
+        "enableAudit": true
+      }
+    }
+  }
+}
+```
+
+All fields are optional — environment variables and auth profiles are the preferred configuration method.
+
+## HTTP Routes
+
+| Route | Method | Purpose |
+|---|---|---|
+| `/linear/webhook` | POST | Primary webhook endpoint |
+| `/hooks/linear` | POST | Backward-compatible webhook endpoint |
+| `/linear/oauth/callback` | GET | OAuth authorization callback |
+
+## Agent Tools
+
+Agents have access to these Linear tools during execution:
+
+| Tool | Description |
+|---|---|
+| `linear_list_issues` | List issues (with optional team filter) |
+| `linear_create_issue` | Create a new issue |
+| `linear_add_comment` | Add a comment to an issue |
+
+## File Structure
+
+```
+linear/
+├── index.ts              # Entry point, registers routes and provider
+├── openclaw.plugin.json  # Plugin metadata and config schema
+├── package.json          # Package definition (zero runtime deps)
+├── README.md
+└── src/
+    ├── agent.ts          # Agent dispatch via openclaw CLI
+    ├── auth.ts           # OAuth provider registration and token refresh
+    ├── client.ts         # Basic GraphQL client (for agent tools)
+    ├── linear-api.ts     # Full GraphQL API wrapper (LinearAgentApi)
+    ├── oauth-callback.ts # OAuth callback handler
+    ├── pipeline.ts       # 3-stage pipeline (plan -> implement -> audit)
+    ├── tools.ts          # Agent tools (list, create, comment)
+    ├── webhook.ts        # Webhook dispatcher (5 event handlers)
+    └── webhook.test.ts   # Tests (vitest)
+```
+
+## Troubleshooting
+
+**Plugin not loading:**
+```bash
+openclaw doctor --fix
+openclaw logs | grep -i "linear\|plugin\|error"
+```
+
+**Webhook not receiving events:**
+- Verify both webhooks (workspace + OAuth app) point to the same URL
+- Check that your tunnel/proxy is forwarding to the gateway port
+- Linear requires `200 OK` within 5 seconds — check for gateway latency
+
+**Agent sessions not working:**
+- OAuth tokens require `app:assignable` and `app:mentionable` scopes
+- Personal API keys cannot create agent sessions — use OAuth
+- Re-run `openclaw auth linear oauth` to get fresh tokens
+
+**"No defaultAgentId" error:**
+- Set `defaultAgentId` in plugin config, OR
+- Mark one agent as `"isDefault": true` in `agent-profiles.json`
+
+**Token refresh failures:**
+- Ensure `LINEAR_CLIENT_ID` and `LINEAR_CLIENT_SECRET` are set
+- Check that the refresh token in `auth-profiles.json` hasn't been revoked
+- Re-run the OAuth flow to get new tokens
+
+**OAuth callback not working:**
+- Verify the redirect URI in Linear's app settings matches your gateway URL
+- If behind a reverse proxy, ensure `X-Forwarded-Proto` and `Host` headers are forwarded
+- For local dev, the callback defaults to `http://localhost:<gateway-port>/linear/oauth/callback`
