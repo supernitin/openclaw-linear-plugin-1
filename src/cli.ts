@@ -1,0 +1,203 @@
+/**
+ * cli.ts — CLI registration for `openclaw openclaw-linear auth` and `openclaw openclaw-linear status`.
+ */
+import type { Command } from "commander";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import { createInterface } from "node:readline";
+import { exec } from "node:child_process";
+import { readFileSync, writeFileSync } from "node:fs";
+import { resolveLinearToken, AUTH_PROFILES_PATH, LINEAR_GRAPHQL_URL } from "./linear-api.js";
+import { LINEAR_OAUTH_AUTH_URL, LINEAR_OAUTH_TOKEN_URL, LINEAR_AGENT_SCOPES } from "./auth.js";
+
+function prompt(question: string): Promise<string> {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    rl.question(question, (answer) => {
+      rl.close();
+      resolve(answer.trim());
+    });
+  });
+}
+
+function openBrowser(url: string): void {
+  const cmd = process.platform === "darwin" ? "open" : "xdg-open";
+  exec(`${cmd} ${JSON.stringify(url)}`, () => {});
+}
+
+export function registerCli(program: Command, api: OpenClawPluginApi): void {
+  const linear = program
+    .command("openclaw-linear")
+    .description("Linear plugin — auth and status");
+
+  // --- openclaw openclaw-linear auth ---
+  linear
+    .command("auth")
+    .description("Run Linear OAuth flow to authorize the agent")
+    .action(async () => {
+      const pluginConfig = (api as any).pluginConfig as Record<string, unknown> | undefined;
+      const clientId = (pluginConfig?.clientId as string) ?? process.env.LINEAR_CLIENT_ID;
+      const clientSecret = (pluginConfig?.clientSecret as string) ?? process.env.LINEAR_CLIENT_SECRET;
+
+      if (!clientId || !clientSecret) {
+        console.error("Error: Linear client ID and secret must be configured.");
+        console.error("Set LINEAR_CLIENT_ID and LINEAR_CLIENT_SECRET env vars, or add clientId/clientSecret to plugin config.");
+        process.exitCode = 1;
+        return;
+      }
+
+      const gatewayPort = process.env.OPENCLAW_GATEWAY_PORT ?? "18789";
+      const redirectUri = (pluginConfig?.redirectUri as string)
+        ?? process.env.LINEAR_REDIRECT_URI
+        ?? `http://localhost:${gatewayPort}/linear/oauth/callback`;
+
+      const state = Math.random().toString(36).substring(7);
+      const authUrl = `${LINEAR_OAUTH_AUTH_URL}?client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=${encodeURIComponent(LINEAR_AGENT_SCOPES)}&state=${state}&actor=app`;
+
+      console.log("\nOpening Linear OAuth authorization page...\n");
+      console.log(`  ${authUrl}\n`);
+      openBrowser(authUrl);
+
+      const code = await prompt("Paste the authorization code from Linear: ");
+      if (!code) {
+        console.error("No code provided. Aborting.");
+        process.exitCode = 1;
+        return;
+      }
+
+      console.log("Exchanging code for token...");
+
+      const response = await fetch(LINEAR_OAUTH_TOKEN_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          client_id: clientId,
+          client_secret: clientSecret,
+          redirect_uri: redirectUri,
+        }),
+      });
+
+      if (!response.ok) {
+        const error = await response.text();
+        console.error(`OAuth token exchange failed (${response.status}): ${error}`);
+        process.exitCode = 1;
+        return;
+      }
+
+      const tokens = await response.json();
+
+      // Store in auth profile store
+      let store: any = { version: 1, profiles: {} };
+      try {
+        const raw = readFileSync(AUTH_PROFILES_PATH, "utf8");
+        store = JSON.parse(raw);
+      } catch {
+        // Fresh store
+      }
+
+      store.profiles = store.profiles ?? {};
+      store.profiles["linear:default"] = {
+        type: "oauth",
+        provider: "linear",
+        accessToken: tokens.access_token,
+        access: tokens.access_token,
+        refreshToken: tokens.refresh_token ?? null,
+        refresh: tokens.refresh_token ?? null,
+        expiresAt: tokens.expires_in ? Date.now() + tokens.expires_in * 1000 : null,
+        expires: tokens.expires_in ? Date.now() + tokens.expires_in * 1000 : null,
+        scope: tokens.scope,
+      };
+
+      writeFileSync(AUTH_PROFILES_PATH, JSON.stringify(store, null, 2), "utf8");
+
+      const expiresIn = tokens.expires_in ? `${Math.round(tokens.expires_in / 3600)}h` : "unknown";
+      console.log(`\nAuthorized! Token stored in auth profile store.`);
+      console.log(`  Scopes:  ${tokens.scope ?? "unknown"}`);
+      console.log(`  Expires: ${expiresIn}`);
+      console.log(`\nRestart the gateway to pick up the new token.`);
+    });
+
+  // --- openclaw openclaw-linear status ---
+  linear
+    .command("status")
+    .description("Show current Linear auth and connection status")
+    .action(async () => {
+      const pluginConfig = (api as any).pluginConfig as Record<string, unknown> | undefined;
+      const tokenInfo = resolveLinearToken(pluginConfig);
+
+      console.log("\nLinear Auth Status");
+      console.log("─".repeat(40));
+      console.log(`  Source:        ${tokenInfo.source}`);
+
+      if (!tokenInfo.accessToken) {
+        console.log(`  Token:         not found`);
+        console.log(`\nRun "openclaw openclaw-linear auth" to authorize.`);
+        return;
+      }
+
+      console.log(`  Token:         ${tokenInfo.accessToken.slice(0, 12)}...`);
+      console.log(`  Refresh token: ${tokenInfo.refreshToken ? "present" : "none"}`);
+
+      if (tokenInfo.expiresAt) {
+        const remaining = tokenInfo.expiresAt - Date.now();
+        if (remaining <= 0) {
+          console.log(`  Expires:       EXPIRED`);
+        } else {
+          const hours = Math.floor(remaining / 3_600_000);
+          const mins = Math.floor((remaining % 3_600_000) / 60_000);
+          console.log(`  Expires:       ${hours}h ${mins}m`);
+        }
+      } else {
+        console.log(`  Expires:       unknown (no expiry set)`);
+      }
+
+      // Try reading scope from profile
+      try {
+        const raw = readFileSync(AUTH_PROFILES_PATH, "utf8");
+        const store = JSON.parse(raw);
+        const scope = store?.profiles?.["linear:default"]?.scope;
+        if (scope) console.log(`  Scopes:        ${scope}`);
+      } catch {}
+
+      // Verify token with API call
+      console.log("\nConnection Test");
+      console.log("─".repeat(40));
+      try {
+        const authHeader = tokenInfo.refreshToken
+          ? `Bearer ${tokenInfo.accessToken}`
+          : tokenInfo.accessToken;
+
+        const res = await fetch(LINEAR_GRAPHQL_URL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: authHeader,
+          },
+          body: JSON.stringify({
+            query: `{ viewer { id name email } organization { name urlKey } }`,
+          }),
+        });
+
+        if (!res.ok) {
+          console.log(`  API response:  ${res.status} ${res.statusText}`);
+          return;
+        }
+
+        const payload = await res.json();
+        if (payload.errors?.length) {
+          console.log(`  API error:     ${payload.errors[0].message}`);
+          return;
+        }
+
+        const { viewer, organization } = payload.data;
+        console.log(`  API:           connected`);
+        console.log(`  User:          ${viewer.name} (${viewer.email})`);
+        console.log(`  Workspace:     ${organization.name} (${organization.urlKey})`);
+      } catch (err) {
+        console.log(`  API:           failed — ${err instanceof Error ? err.message : String(err)}`);
+      }
+
+      console.log();
+    });
+}

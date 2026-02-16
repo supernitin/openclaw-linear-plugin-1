@@ -2,8 +2,8 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { refreshLinearToken } from "./auth.js";
 
-const LINEAR_GRAPHQL_URL = "https://api.linear.app/graphql";
-const AUTH_PROFILES_PATH = join(
+export const LINEAR_GRAPHQL_URL = "https://api.linear.app/graphql";
+export const AUTH_PROFILES_PATH = join(
   process.env.HOME ?? "/home/claw",
   ".openclaw",
   "auth-profiles.json",

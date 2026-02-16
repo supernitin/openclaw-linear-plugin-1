@@ -4,11 +4,11 @@ import type {
   ProviderAuthResult
 } from "openclaw/plugin-sdk";
 
-const LINEAR_OAUTH_AUTH_URL = "https://linear.app/oauth/authorize";
-const LINEAR_OAUTH_TOKEN_URL = "https://api.linear.app/oauth/token";
+export const LINEAR_OAUTH_AUTH_URL = "https://linear.app/oauth/authorize";
+export const LINEAR_OAUTH_TOKEN_URL = "https://api.linear.app/oauth/token";
 
 // Agent scopes: read/write + assignable (appear in assignment menus) + mentionable (respond to @mentions)
-const LINEAR_AGENT_SCOPES = "read,write,app:assignable,app:mentionable";
+export const LINEAR_AGENT_SCOPES = "read,write,app:assignable,app:mentionable";
 
 // Token refresh helper — Linear tokens expire; refresh before they do
 export async function refreshLinearToken(

@@ -1,5 +1,6 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { registerLinearProvider } from "./src/auth.js";
+import { registerCli } from "./src/cli.js";
 import { createLinearTools } from "./src/tools.js";
 import { handleLinearWebhook } from "./src/webhook.js";
 import { handleOAuthCallback } from "./src/oauth-callback.js";
@@ -19,6 +20,11 @@ export default function register(api: OpenClawPluginApi) {
 
   // Register Linear as an auth provider (OAuth flow with agent scopes)
   registerLinearProvider(api);
+
+  // Register CLI commands: openclaw openclaw-linear auth|status
+  api.registerCli(({ program }) => registerCli(program, api), {
+    commands: ["openclaw-linear"],
+  });
 
   // Register Linear tools for the agent
   api.registerTool((ctx) => {
