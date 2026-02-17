@@ -134,6 +134,50 @@ Linear AgentSessionEvent.created
   → Each stage dispatches via the default agent's openclaw.json config
 ```
 
+## Codex Integration
+
+The implementor pipeline stage can delegate coding tasks to OpenAI Codex via the `codex_run` tool.
+
+```
+Agent calls codex_run(prompt, issueIdentifier, agentSessionId)
+      |
+      v
+  Create git worktree from ai-workspace
+  /tmp/codex-{issue}-{ts} on branch codex/{issue}
+      |
+      v
+  spawn: codex exec --full-auto --json --ephemeral -C {worktree}
+      |
+      | stdout: JSONL events (line by line)
+      |
+      +-- item.started (reasoning)     → Linear "thought" activity
+      +-- item.completed (command)     → Linear "action" activity
+      +-- item.completed (file_changes)→ Linear "action" activity
+      +-- item.completed (message)     → collected for final output
+      +-- turn.completed               → session done
+      |
+      v
+  Return { success, output, filesChanged, worktreePath, branch }
+```
+
+Worktrees share git history with the base repo, so Codex has full context. Branches are named `codex/{issue-identifier}` for tracking.
+
+## Agent Orchestration
+
+Agents can delegate to other crew members at any point during their run:
+
+| Tool | Behavior | Use Case |
+|------|----------|----------|
+| `spawn_agent` | Fire-and-forget (non-blocking) | Parallel sub-tasks: "kaylee, investigate DB perf" |
+| `ask_agent` | Synchronous wait for reply | Blocking questions: "wash, would this break tests?" |
+
+Both tools use `runAgent()` under the hood (subprocess via `openclaw agent --json`).
+
+The pipeline makes these available at each stage:
+- **Planner** — no orchestration (single-agent analysis)
+- **Implementor** — `codex_run` + `spawn_agent` + `ask_agent`
+- **Auditor** — `ask_agent` + `spawn_agent` (for specialized reviews)
+
 ## OAuth Flow
 
 ```
@@ -278,14 +322,17 @@ linear/
 │   ├── architecture.md   # This file — internals reference
 │   └── troubleshooting.md  # Diagnostic commands, common issues
 └── src/
-    ├── agent.ts          # Agent dispatch via `openclaw agent` CLI
-    ├── auth.ts           # OAuth provider registration + token refresh
-    ├── cli.ts            # CLI commands: auth, status
-    ├── client.ts         # Basic GraphQL client (used by agent tools)
-    ├── linear-api.ts     # Full GraphQL API wrapper (LinearAgentApi) with auto-refresh
-    ├── oauth-callback.ts # HTTP handler for OAuth redirect callback
-    ├── pipeline.ts       # 3-stage pipeline (plan → implement → audit)
-    ├── tools.ts          # Agent tools (list_issues, create_issue, add_comment)
-    ├── webhook.ts        # Webhook dispatcher — 6 event handlers
-    └── webhook.test.ts   # Vitest tests
+    ├── agent.ts              # Agent dispatch via `openclaw agent` CLI
+    ├── auth.ts               # OAuth provider registration + token refresh
+    ├── cli.ts                # CLI commands: auth, status
+    ├── client.ts             # Basic GraphQL client (used by agent tools)
+    ├── codex-tool.ts         # Codex CLI wrapper — JSONL streaming → Linear activities
+    ├── codex-worktree.ts     # Git worktree create/remove/status/PR helpers
+    ├── linear-api.ts         # Full GraphQL API wrapper (LinearAgentApi) with auto-refresh
+    ├── oauth-callback.ts     # HTTP handler for OAuth redirect callback
+    ├── orchestration-tools.ts # spawn_agent + ask_agent crew delegation tools
+    ├── pipeline.ts           # 3-stage pipeline (plan → implement → audit)
+    ├── tools.ts              # Agent tools (Linear + Codex + orchestration)
+    ├── webhook.ts            # Webhook dispatcher — 6 event handlers
+    └── webhook.test.ts       # Vitest tests
 ```

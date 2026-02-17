@@ -1,84 +1,34 @@
-import type { AnyAgentTool, OpenClawPluginApi, OpenClawPluginToolContext } from "openclaw/plugin-sdk";
-import { jsonResult } from "openclaw/plugin-sdk";
-import { LinearClient } from "./client.js";
-import { resolveLinearToken } from "./linear-api.js";
+import type { AnyAgentTool, OpenClawPluginApi } from "openclaw/plugin-sdk";
+import { createCodeTool } from "./code-tool.js";
+import { createOrchestrationTools } from "./orchestration-tools.js";
 
-export function createLinearTools(api: OpenClawPluginApi, ctx: OpenClawPluginToolContext): AnyAgentTool[] {
-  const getClient = () => {
-    const pluginConfig = (api as any).pluginConfig as Record<string, unknown> | undefined;
-    const resolved = resolveLinearToken(pluginConfig);
-    if (!resolved.accessToken) {
-      throw new Error("Linear access token not found. Run 'openclaw openclaw-linear auth' to authenticate.");
+export function createLinearTools(api: OpenClawPluginApi, ctx: Record<string, unknown>): any[] {
+  const pluginConfig = (api as any).pluginConfig as Record<string, unknown> | undefined;
+
+  // Unified code_run tool — dispatches to configured backend (claude/codex/gemini)
+  const codeTools: AnyAgentTool[] = [];
+  try {
+    codeTools.push(createCodeTool(api, ctx));
+  } catch (err) {
+    api.logger.warn(`code_run tool not available: ${err}`);
+  }
+
+  // Orchestration tools (conditional on config — defaults to enabled)
+  const orchestrationTools: AnyAgentTool[] = [];
+  const enableOrchestration = pluginConfig?.enableOrchestration !== false;
+  if (enableOrchestration) {
+    try {
+      orchestrationTools.push(...createOrchestrationTools(api, ctx));
+    } catch (err) {
+      api.logger.warn(`Orchestration tools not available: ${err}`);
     }
-    return new LinearClient(resolved.accessToken);
-  };
-  
+  }
+
+  // Linear issue management (list, create, update, close, comment, etc.)
+  // is handled by the `linearis` skill — no custom tools needed here.
+
   return [
-    {
-      name: "linear_list_issues",
-      description: "List issues from a Linear workspace",
-      parameters: {
-        type: "object",
-        properties: {
-          limit: { type: "number", description: "Max issues to return", default: 10 },
-          teamId: { type: "string", description: "Filter by team ID" }
-        }
-      },
-      execute: async ({ limit, teamId }) => {
-        const client = getClient();
-        const data = await client.listIssues({ limit, teamId });
-        return jsonResult({ 
-          message: `Found ${data.issues.nodes.length} issues`,
-          issues: data.issues.nodes 
-        });
-      }
-    },
-    {
-      name: "linear_create_issue",
-      description: "Create a new issue in Linear",
-      parameters: {
-        type: "object",
-        properties: {
-          title: { type: "string", description: "Issue title" },
-          description: { type: "string", description: "Issue description" },
-          teamId: { type: "string", description: "Team ID" }
-        },
-        required: ["title", "teamId"]
-      },
-      execute: async ({ title, description, teamId }) => {
-        const client = getClient();
-        const data = await client.createIssue({ title, description, teamId });
-        if (data.issueCreate.success) {
-          return jsonResult({
-            message: "Created issue successfully",
-            issue: data.issueCreate.issue
-          });
-        }
-        return jsonResult({ message: "Failed to create issue" });
-      }
-    },
-    {
-      name: "linear_add_comment",
-      description: "Add a comment to a Linear issue",
-      parameters: {
-        type: "object",
-        properties: {
-          issueId: { type: "string", description: "Issue ID" },
-          body: { type: "string", description: "Comment body" }
-        },
-        required: ["issueId", "body"]
-      },
-      execute: async ({ issueId, body }) => {
-        const client = getClient();
-        const data = await client.addComment({ issueId, body });
-        if (data.commentCreate.success) {
-          return jsonResult({
-            message: "Added comment successfully",
-            commentId: data.commentCreate.comment.id
-          });
-        }
-        return jsonResult({ message: "Failed to add comment" });
-      }
-    }
+    ...codeTools,
+    ...orchestrationTools,
   ];
 }

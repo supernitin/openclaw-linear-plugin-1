@@ -1,0 +1,15 @@
+{
+  "codingTool": "codex",
+  "agentCodingTools": {},
+  "backends": {
+    "claude": {
+      "aliases": ["claude", "claude code", "anthropic"]
+    },
+    "codex": {
+      "aliases": ["codex", "openai"]
+    },
+    "gemini": {
+      "aliases": ["gemini", "google"]
+    }
+  }
+}

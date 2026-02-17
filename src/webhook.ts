@@ -3,7 +3,9 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { LinearAgentApi, resolveLinearToken } from "./linear-api.js";
-import { runFullPipeline, resumePipeline, type PipelineContext } from "./pipeline.js";
+// Pipeline is used from Issue.update delegation handler (not from agent session chat)
+// import { runFullPipeline, resumePipeline, type PipelineContext } from "./pipeline.js";
+import { setActiveSession, clearActiveSession } from "./active-session.js";
 
 // ── Agent profiles (loaded from config, no hardcoded names) ───────
 interface AgentProfile {
@@ -49,8 +51,8 @@ function resolveAgentFromAlias(alias: string, profiles: Record<string, AgentProf
   return null;
 }
 
-// Store active session plans so we can resume after user approval
-const activeSessions = new Map<string, { plan: string; ctx: PipelineContext }>();
+// Track issues with active agent runs to prevent concurrent duplicate runs.
+const activeRuns = new Set<string>();
 
 // Dedup: track recently processed keys to avoid double-handling
 const recentlyProcessed = new Map<string, number>();
@@ -212,6 +214,13 @@ export async function handleLinearWebhook(
         agentSessionId = sessionResult.sessionId;
         if (agentSessionId) {
           api.logger.info(`Created agent session ${agentSessionId} for notification`);
+          setActiveSession({
+            agentSessionId,
+            issueIdentifier: enrichedIssue?.identifier ?? issue.id,
+            issueId: issue.id,
+            agentId,
+            startedAt: Date.now(),
+          });
         } else {
           api.logger.warn(`Could not create agent session for notification: ${sessionResult.error ?? "unknown"}`);
         }
@@ -220,20 +229,11 @@ export async function handleLinearWebhook(
         if (agentSessionId) {
           await linearApi.emitActivity(agentSessionId, {
             type: "thought",
-            body: `Reviewing notification for ${enrichedIssue?.identifier ?? issue.id}...`,
+            body: `Reviewing ${enrichedIssue?.identifier ?? issue.id}...`,
           }).catch(() => {});
         }
 
-        // 3. Emit action
-        if (agentSessionId) {
-          await linearApi.emitActivity(agentSessionId, {
-            type: "action",
-            action: "Processing notification",
-            parameter: notifType ?? "unknown",
-          }).catch(() => {});
-        }
-
-        // 4. Run agent
+        // 3. Run agent with streaming
         const sessionId = `linear-notif-${notification?.type ?? "unknown"}-${Date.now()}`;
         const { runAgent } = await import("./agent.js");
         const result = await runAgent({
@@ -242,6 +242,7 @@ export async function handleLinearWebhook(
           sessionId,
           message,
           timeoutMs: 3 * 60_000,
+          streaming: agentSessionId ? { linearApi, agentSessionId } : undefined,
         });
 
         const responseBody = result.success
@@ -284,13 +285,18 @@ export async function handleLinearWebhook(
             body: `Failed to process notification: ${String(err).slice(0, 500)}`,
           }).catch(() => {});
         }
+      } finally {
+        clearActiveSession(issue.id);
       }
     })();
 
     return true;
   }
 
-  // ── AgentSessionEvent.created — start the pipeline ──────────────
+  // ── AgentSessionEvent.created — direct agent run ─────────────────
+  // User chatted with @ctclaw in Linear's agent session. Run the agent
+  // DIRECTLY with the user's message. The plan→implement→audit pipeline
+  // is only triggered from Issue.update delegation, not from chat.
   if (
     (payload.type === "AgentSessionEvent" && payload.action === "created") ||
     (payload.type === "AgentSession" && payload.action === "create")
@@ -307,7 +313,7 @@ export async function handleLinearWebhook(
       return true;
     }
 
-    // Dedup: skip if we already handled this session (e.g. from Issue.update delegation)
+    // Dedup: skip if we already handled this session
     if (wasRecentlyProcessed(`session:${session.id}`)) {
       api.logger.info(`AgentSession ${session.id} already handled — skipping`);
       return true;
@@ -315,47 +321,147 @@ export async function handleLinearWebhook(
 
     const linearApi = createLinearApi(api);
     if (!linearApi) {
-      api.logger.error("No Linear access token configured — cannot start pipeline. Run OAuth flow or set LINEAR_ACCESS_TOKEN.");
+      api.logger.error("No Linear access token configured");
       return true;
     }
 
     const agentId = resolveAgentId(api);
-
     const previousComments = payload.previousComments ?? [];
     const guidance = payload.guidance;
 
     api.logger.info(`AgentSession created: ${session.id} for issue ${issue?.identifier ?? issue?.id} (comments: ${previousComments.length}, guidance: ${guidance ? "yes" : "no"})`);
 
-    const ctx: PipelineContext = {
-      api,
-      linearApi,
-      agentSessionId: session.id,
-      agentId,
-      issue: {
-        id: issue.id,
-        identifier: issue.identifier ?? issue.id,
-        title: issue.title ?? "(untitled)",
-        description: issue.description,
-      },
-      promptContext: payload.promptContext ?? session.context,
-    };
+    // Guard: skip if an agent run is already active for this issue
+    if (activeRuns.has(issue.id)) {
+      api.logger.info(`Agent already running for ${issue?.identifier ?? issue?.id} — skipping session ${session.id}`);
+      return true;
+    }
 
-    // Run pipeline (non-blocking). Stage 1 emits first thought within 10s.
+    // Extract the user's latest message from previousComments
+    // The last comment is the most recent user message
+    const lastComment = previousComments.length > 0
+      ? previousComments[previousComments.length - 1]
+      : null;
+    const userMessage = lastComment?.body ?? guidance ?? "";
+
+    // Fetch full issue details
+    let enrichedIssue: any = issue;
+    try {
+      enrichedIssue = await linearApi.getIssueDetails(issue.id);
+    } catch (err) {
+      api.logger.warn(`Could not fetch issue details: ${err}`);
+    }
+
+    const description = enrichedIssue?.description ?? issue?.description ?? "(no description)";
+
+    // Build conversation context from previous comments
+    const commentContext = previousComments
+      .slice(-5)
+      .map((c: any) => `**${c.user?.name ?? c.actorName ?? "User"}**: ${(c.body ?? "").slice(0, 300)}`)
+      .join("\n\n");
+
+    const message = [
+      `You are an AI agent responding in a Linear issue session. Your text output will be posted as activities visible to the user.`,
+      `You have access to tools including \`code_run\` for coding tasks, \`spawn_agent\`/\`ask_agent\` for delegation, and standard tools (exec, read, edit, write, web_search, etc.). To manage Linear issues (update status, close, assign, comment, etc.) use the \`linearis\` CLI via exec — e.g. \`linearis issues update API-123 --status done\` to close an issue, \`linearis issues update API-123 --status "In Progress"\` to change status, \`linearis issues list\` to list issues. Run \`linearis usage\` for full command reference.`,
+      ``,
+      `## Issue: ${enrichedIssue?.identifier ?? issue.identifier ?? issue.id} — ${enrichedIssue?.title ?? issue.title ?? "(untitled)"}`,
+      `**Status:** ${enrichedIssue?.state?.name ?? "Unknown"} | **Assignee:** ${enrichedIssue?.assignee?.name ?? "Unassigned"}`,
+      ``,
+      `**Description:**`,
+      description,
+      commentContext ? `\n**Conversation:**\n${commentContext}` : "",
+      userMessage ? `\n**Latest message:**\n> ${userMessage}` : "",
+      ``,
+      `Respond to the user's request. If they ask you to write code or make changes, use the \`code_run\` tool. Be concise and action-oriented.`,
+    ].filter(Boolean).join("\n");
+
+    // Run agent directly (non-blocking)
+    activeRuns.add(issue.id);
     void (async () => {
-      const { runPlannerStage } = await import("./pipeline.js");
-      const plan = await runPlannerStage(ctx).catch((err) => {
-        api.logger.error(`Planner stage error: ${err}`);
-        return null;
+      const profiles = loadAgentProfiles();
+      const defaultProfile = Object.entries(profiles).find(([, p]) => p.isDefault);
+      const label = defaultProfile?.[1]?.label ?? profiles[agentId]?.label ?? agentId;
+
+      // Register active session for tool resolution (code_run, etc.)
+      setActiveSession({
+        agentSessionId: session.id,
+        issueIdentifier: enrichedIssue?.identifier ?? issue.identifier ?? issue.id,
+        issueId: issue.id,
+        agentId,
+        startedAt: Date.now(),
       });
-      if (plan) {
-        activeSessions.set(session.id, { plan, ctx });
+
+      try {
+        // Emit initial thought
+        await linearApi.emitActivity(session.id, {
+          type: "thought",
+          body: `Processing request for ${enrichedIssue?.identifier ?? issue.id}...`,
+        }).catch(() => {});
+
+        // Run agent with streaming to Linear
+        const sessionId = `linear-session-${session.id}`;
+        const { runAgent } = await import("./agent.js");
+        const result = await runAgent({
+          api,
+          agentId,
+          sessionId,
+          message,
+          timeoutMs: 5 * 60_000,
+          streaming: {
+            linearApi,
+            agentSessionId: session.id,
+          },
+        });
+
+        const responseBody = result.success
+          ? result.output
+          : `I encountered an error processing this request. Please try again.`;
+
+        // Post as comment
+        const avatarUrl = defaultProfile?.[1]?.avatarUrl ?? profiles[agentId]?.avatarUrl;
+        const brandingOpts = avatarUrl
+          ? { createAsUser: label, displayIconUrl: avatarUrl }
+          : undefined;
+
+        try {
+          if (brandingOpts) {
+            await linearApi.createComment(issue.id, responseBody, brandingOpts);
+          } else {
+            await linearApi.createComment(issue.id, `**[${label}]** ${responseBody}`);
+          }
+        } catch (brandErr) {
+          api.logger.warn(`Branded comment failed: ${brandErr}`);
+          await linearApi.createComment(issue.id, `**[${label}]** ${responseBody}`);
+        }
+
+        // Emit response (closes session)
+        const truncated = responseBody.length > 2000
+          ? responseBody.slice(0, 2000) + "\u2026"
+          : responseBody;
+        await linearApi.emitActivity(session.id, {
+          type: "response",
+          body: truncated,
+        }).catch(() => {});
+
+        api.logger.info(`Posted agent response to ${enrichedIssue?.identifier ?? issue.id} (session ${session.id})`);
+      } catch (err) {
+        api.logger.error(`AgentSession handler error: ${err}`);
+        await linearApi.emitActivity(session.id, {
+          type: "error",
+          body: `Failed: ${String(err).slice(0, 500)}`,
+        }).catch(() => {});
+      } finally {
+        clearActiveSession(issue.id);
+        activeRuns.delete(issue.id);
       }
     })();
 
     return true;
   }
 
-  // ── AgentSession.prompted — user replied (plan approval) ────────
+  // ── AgentSession.prompted — follow-up user messages in existing sessions
+  // Also fires when we emit activities (feedback loop). Use activeRuns guard
+  // and webhookId dedup to distinguish user follow-ups from our own emissions.
   if (
     (payload.type === "AgentSessionEvent" && payload.action === "prompted") ||
     (payload.type === "AgentSession" && payload.action === "prompted")
@@ -364,55 +470,160 @@ export async function handleLinearWebhook(
     res.end("ok");
 
     const session = payload.agentSession ?? payload.data;
-    if (!session?.id) {
-      api.logger.error("AgentSession.prompted missing session id");
+    const issue = session?.issue ?? payload.issue;
+    const activity = payload.agentActivity;
+
+    if (!session?.id || !issue?.id) {
+      api.logger.info(`AgentSession prompted: missing session or issue — ignoring`);
       return true;
     }
 
-    api.logger.info(`AgentSession prompted: ${session.id}`);
+    // If an agent run is already active for this issue, this is feedback from
+    // our own activity emissions — ignore to prevent loops.
+    if (activeRuns.has(issue.id)) {
+      api.logger.info(`AgentSession prompted: ${session.id} issue=${issue?.identifier ?? issue?.id} — agent active, ignoring (feedback)`);
+      return true;
+    }
 
-    const stored = activeSessions.get(session.id);
-    if (!stored) {
-      api.logger.warn(`No active session found for ${session.id} — may have been restarted`);
+    // Dedup by webhookId
+    const webhookId = payload.webhookId;
+    if (webhookId && wasRecentlyProcessed(`webhook:${webhookId}`)) {
+      api.logger.info(`AgentSession prompted: webhook ${webhookId} already processed — skipping`);
+      return true;
+    }
 
-      // Try to reconstruct context from payload
-      const linearApi = createLinearApi(api);
-      const issue = session?.issue ?? payload.issue;
-      if (!linearApi || !issue?.id) {
-        api.logger.error("Cannot reconstruct pipeline context for prompted session");
-        return true;
+    // Extract user message from the activity or prompt context
+    const promptContext = payload.promptContext;
+    const userMessage =
+      activity?.content?.body ??
+      activity?.body ??
+      promptContext?.message ??
+      promptContext ??
+      "";
+
+    if (!userMessage || typeof userMessage !== "string" || userMessage.trim().length === 0) {
+      api.logger.info(`AgentSession prompted: ${session.id} — no user message found, ignoring`);
+      return true;
+    }
+
+    const linearApi = createLinearApi(api);
+    if (!linearApi) {
+      api.logger.error("No Linear access token configured");
+      return true;
+    }
+
+    api.logger.info(`AgentSession prompted (follow-up): ${session.id} issue=${issue?.identifier ?? issue?.id} message="${userMessage.slice(0, 80)}..."`);
+
+    const agentId = resolveAgentId(api);
+
+    // Run agent for follow-up (non-blocking)
+    activeRuns.add(issue.id);
+    void (async () => {
+      const profiles = loadAgentProfiles();
+      const defaultProfile = Object.entries(profiles).find(([, p]) => p.isDefault);
+      const label = defaultProfile?.[1]?.label ?? profiles[agentId]?.label ?? agentId;
+
+      // Fetch full issue details for context
+      let enrichedIssue: any = issue;
+      try {
+        enrichedIssue = await linearApi.getIssueDetails(issue.id);
+      } catch (err) {
+        api.logger.warn(`Could not fetch issue details: ${err}`);
       }
 
-      const agentId = resolveAgentId(api);
+      const description = enrichedIssue?.description ?? issue?.description ?? "(no description)";
 
-      // The user's reply is the prompt content — treat as approval with context
-      const userReply = session.context?.prompt ?? session.context?.body ?? "";
-      api.logger.info(`Prompted session ${session.id} — treating reply as new request`);
+      // Build context from recent comments
+      const recentComments = enrichedIssue?.comments?.nodes ?? [];
+      const commentContext = recentComments
+        .slice(-5)
+        .map((c: any) => `**${c.user?.name ?? "User"}**: ${(c.body ?? "").slice(0, 300)}`)
+        .join("\n\n");
 
-      const ctx: PipelineContext = {
-        api,
-        linearApi,
+      const message = [
+        `You are an AI agent responding in a Linear issue session. Your text output will be posted as activities visible to the user.`,
+        `You have access to tools including \`code_run\` for coding tasks, \`spawn_agent\`/\`ask_agent\` for delegation, and standard tools (exec, read, edit, write, web_search, etc.). To manage Linear issues (update status, close, assign, comment, etc.) use the \`linearis\` CLI via exec — e.g. \`linearis issues update API-123 --status done\` to close an issue, \`linearis issues update API-123 --status "In Progress"\` to change status, \`linearis issues list\` to list issues. Run \`linearis usage\` for full command reference.`,
+        ``,
+        `## Issue: ${enrichedIssue?.identifier ?? issue.identifier ?? issue.id} — ${enrichedIssue?.title ?? issue.title ?? "(untitled)"}`,
+        `**Status:** ${enrichedIssue?.state?.name ?? "Unknown"} | **Assignee:** ${enrichedIssue?.assignee?.name ?? "Unassigned"}`,
+        ``,
+        `**Description:**`,
+        description,
+        commentContext ? `\n**Recent conversation:**\n${commentContext}` : "",
+        `\n**User's follow-up message:**\n> ${userMessage}`,
+        ``,
+        `Respond to the user's follow-up. Be concise and action-oriented.`,
+      ].filter(Boolean).join("\n");
+
+      setActiveSession({
         agentSessionId: session.id,
+        issueIdentifier: enrichedIssue?.identifier ?? issue.identifier ?? issue.id,
+        issueId: issue.id,
         agentId,
-        issue: {
-          id: issue.id,
-          identifier: issue.identifier ?? issue.id,
-          title: issue.title ?? "(untitled)",
-          description: issue.description,
-        },
-        promptContext: session.context,
-      };
+        startedAt: Date.now(),
+      });
 
-      // Start fresh pipeline since we lost the plan
-      void runFullPipeline(ctx);
-      return true;
-    }
+      try {
+        await linearApi.emitActivity(session.id, {
+          type: "thought",
+          body: `Processing follow-up for ${enrichedIssue?.identifier ?? issue.id}...`,
+        }).catch(() => {});
 
-    // Resume with stored plan
-    api.logger.info(`Resuming pipeline for session ${session.id}`);
-    activeSessions.delete(session.id);
+        const sessionId = `linear-session-${session.id}`;
+        const { runAgent } = await import("./agent.js");
+        const result = await runAgent({
+          api,
+          agentId,
+          sessionId,
+          message,
+          timeoutMs: 5 * 60_000,
+          streaming: {
+            linearApi,
+            agentSessionId: session.id,
+          },
+        });
 
-    void resumePipeline(stored.ctx, stored.plan);
+        const responseBody = result.success
+          ? result.output
+          : `I encountered an error processing this request. Please try again.`;
+
+        const avatarUrl = defaultProfile?.[1]?.avatarUrl ?? profiles[agentId]?.avatarUrl;
+        const brandingOpts = avatarUrl
+          ? { createAsUser: label, displayIconUrl: avatarUrl }
+          : undefined;
+
+        try {
+          if (brandingOpts) {
+            await linearApi.createComment(issue.id, responseBody, brandingOpts);
+          } else {
+            await linearApi.createComment(issue.id, `**[${label}]** ${responseBody}`);
+          }
+        } catch (brandErr) {
+          api.logger.warn(`Branded comment failed: ${brandErr}`);
+          await linearApi.createComment(issue.id, `**[${label}]** ${responseBody}`);
+        }
+
+        const truncated = responseBody.length > 2000
+          ? responseBody.slice(0, 2000) + "\u2026"
+          : responseBody;
+        await linearApi.emitActivity(session.id, {
+          type: "response",
+          body: truncated,
+        }).catch(() => {});
+
+        api.logger.info(`Posted follow-up response to ${enrichedIssue?.identifier ?? issue.id} (session ${session.id})`);
+      } catch (err) {
+        api.logger.error(`AgentSession prompted handler error: ${err}`);
+        await linearApi.emitActivity(session.id, {
+          type: "error",
+          body: `Failed: ${String(err).slice(0, 500)}`,
+        }).catch(() => {});
+      } finally {
+        clearActiveSession(issue.id);
+        activeRuns.delete(issue.id);
+      }
+    })();
+
     return true;
   }
 
@@ -526,6 +737,14 @@ export async function handleLinearWebhook(
         agentSessionId = sessionResult.sessionId;
         if (agentSessionId) {
           api.logger.info(`Created agent session ${agentSessionId} for @${mentionedAgent}`);
+          // Register active session so code_run can resolve it automatically
+          setActiveSession({
+            agentSessionId,
+            issueIdentifier: enrichedIssue.identifier ?? issue.id,
+            issueId: issue.id,
+            agentId: mentionedAgent,
+            startedAt: Date.now(),
+          });
         } else {
           api.logger.warn(`Could not create agent session for @${mentionedAgent}: ${sessionResult.error ?? "unknown"} — falling back to flat comment`);
         }
@@ -534,20 +753,11 @@ export async function handleLinearWebhook(
         if (agentSessionId) {
           await linearApi.emitActivity(agentSessionId, {
             type: "thought",
-            body: `Analyzing ${enrichedIssue.identifier ?? issue.id}...`,
+            body: `Reviewing ${enrichedIssue.identifier ?? issue.id}...`,
           }).catch(() => {});
         }
 
-        // 3. Emit action
-        if (agentSessionId) {
-          await linearApi.emitActivity(agentSessionId, {
-            type: "action",
-            action: "Processing mention",
-            parameter: `@${alias} by ${commentor}`,
-          }).catch(() => {});
-        }
-
-        // 4. Run agent subprocess
+        // 3. Run agent subprocess with streaming
         const sessionId = `linear-comment-${comment.id ?? Date.now()}`;
         const { runAgent } = await import("./agent.js");
         const result = await runAgent({
@@ -556,6 +766,7 @@ export async function handleLinearWebhook(
           sessionId,
           message: taskMessage,
           timeoutMs: 3 * 60_000,
+          streaming: agentSessionId ? { linearApi, agentSessionId } : undefined,
         });
 
         const responseBody = result.success
@@ -592,13 +803,14 @@ export async function handleLinearWebhook(
         api.logger.info(`Posted @${mentionedAgent} response to ${issue.identifier ?? issue.id}`);
       } catch (err) {
         api.logger.error(`Comment mention handler error: ${err}`);
-        // 7. Emit error activity if session exists
         if (agentSessionId) {
           await linearApi.emitActivity(agentSessionId, {
             type: "error",
             body: `Failed to process mention: ${String(err).slice(0, 500)}`,
           }).catch(() => {});
         }
+      } finally {
+        clearActiveSession(issue.id);
       }
     })();
 
@@ -727,9 +939,15 @@ export async function handleLinearWebhook(
         const sessionResult = await linearApi.createSessionOnIssue(issue.id);
         agentSessionId = sessionResult.sessionId;
         if (agentSessionId) {
-          // Mark session as processed so AgentSessionEvent handler skips it
           wasRecentlyProcessed(`session:${agentSessionId}`);
           api.logger.info(`Created agent session ${agentSessionId} for ${trigger}`);
+          setActiveSession({
+            agentSessionId,
+            issueIdentifier: enrichedIssue?.identifier ?? issue.identifier ?? issue.id,
+            issueId: issue.id,
+            agentId,
+            startedAt: Date.now(),
+          });
         } else {
           api.logger.warn(`Could not create agent session for assignment: ${sessionResult.error ?? "unknown"}`);
         }
@@ -757,6 +975,7 @@ export async function handleLinearWebhook(
           sessionId,
           message,
           timeoutMs: 3 * 60_000,
+          streaming: agentSessionId ? { linearApi, agentSessionId } : undefined,
         });
 
         const responseBody = result.success
@@ -838,6 +1057,8 @@ export async function handleLinearWebhook(
             body: `Failed to process assignment: ${String(err).slice(0, 500)}`,
           }).catch(() => {});
         }
+      } finally {
+        clearActiveSession(issue.id);
       }
     })();
 
@@ -904,6 +1125,13 @@ export async function handleLinearWebhook(
         if (agentSessionId) {
           wasRecentlyProcessed(`session:${agentSessionId}`);
           api.logger.info(`Created agent session ${agentSessionId} for Issue.create triage`);
+          setActiveSession({
+            agentSessionId,
+            issueIdentifier: enrichedIssue?.identifier ?? issue.identifier ?? issue.id,
+            issueId: issue.id,
+            agentId,
+            startedAt: Date.now(),
+          });
         }
 
         if (agentSessionId) {
@@ -964,6 +1192,7 @@ export async function handleLinearWebhook(
           sessionId,
           message,
           timeoutMs: 3 * 60_000,
+          streaming: agentSessionId ? { linearApi, agentSessionId } : undefined,
         });
 
         const responseBody = result.success
@@ -1047,6 +1276,8 @@ export async function handleLinearWebhook(
             body: `Failed to triage: ${String(err).slice(0, 500)}`,
           }).catch(() => {});
         }
+      } finally {
+        clearActiveSession(issue.id);
       }
     })();
 

@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { registerLinearProvider } from "./src/auth.js";
 import { registerCli } from "./src/cli.js";
@@ -22,7 +23,7 @@ export default function register(api: OpenClawPluginApi) {
   registerLinearProvider(api);
 
   // Register CLI commands: openclaw openclaw-linear auth|status
-  api.registerCli(({ program }) => registerCli(program, api), {
+  api.registerCli(({ program }) => registerCli(program as any, api), {
     commands: ["openclaw-linear"],
   });
 
@@ -77,8 +78,33 @@ export default function register(api: OpenClawPluginApi) {
     };
   });
 
+  // Check CLI availability (Codex, Claude, Gemini)
+  const cliChecks: Record<string, string> = {};
+  const cliBins: [string, string, string][] = [
+    ["codex", "/home/claw/.npm-global/bin/codex", "npm install -g @openai/codex"],
+    ["claude", "/home/claw/.npm-global/bin/claude", "npm install -g @anthropic-ai/claude-code"],
+    ["gemini", "/home/claw/.npm-global/bin/gemini", "npm install -g @anthropic-ai/gemini-cli"],
+  ];
+  for (const [name, bin, installCmd] of cliBins) {
+    try {
+      const raw = execFileSync(bin, ["--version"], {
+        encoding: "utf8",
+        timeout: 5_000,
+        env: { ...process.env, CLAUDECODE: undefined } as any,
+      }).trim();
+      cliChecks[name] = raw || "unknown";
+    } catch {
+      cliChecks[name] = "not found";
+      api.logger.warn(
+        `${name} CLI not found at ${bin}. The ${name}_run tool will fail. Install with: ${installCmd}`,
+      );
+    }
+  }
+
   const agentId = (pluginConfig?.defaultAgentId as string) ?? "default";
+  const orchestration = pluginConfig?.enableOrchestration !== false ? "enabled" : "disabled";
+  const cliSummary = Object.entries(cliChecks).map(([k, v]) => `${k}: ${v}`).join(", ");
   api.logger.info(
-    `Linear agent extension registered (agent: ${agentId}, token: ${tokenInfo.source !== "none" ? `${tokenInfo.source}` : "missing"})`,
+    `Linear agent extension registered (agent: ${agentId}, token: ${tokenInfo.source !== "none" ? `${tokenInfo.source}` : "missing"}, ${cliSummary}, orchestration: ${orchestration})`,
   );
 }

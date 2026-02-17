@@ -90,4 +90,5 @@ export class LinearClient {
     `;
     return this.request(query, params);
   }
+
 }

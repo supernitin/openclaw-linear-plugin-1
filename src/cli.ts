@@ -8,6 +8,7 @@ import { exec } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import { resolveLinearToken, AUTH_PROFILES_PATH, LINEAR_GRAPHQL_URL } from "./linear-api.js";
 import { LINEAR_OAUTH_AUTH_URL, LINEAR_OAUTH_TOKEN_URL, LINEAR_AGENT_SCOPES } from "./auth.js";
+import { listWorktrees } from "./codex-worktree.js";
 
 function prompt(question: string): Promise<string> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -199,5 +200,43 @@ export function registerCli(program: Command, api: OpenClawPluginApi): void {
       }
 
       console.log();
+    });
+
+  // --- openclaw openclaw-linear worktrees ---
+  linear
+    .command("worktrees")
+    .description("List Codex worktrees (use --prune to remove specific ones)")
+    .option("--prune <path>", "Remove a specific worktree by path")
+    .action(async (opts: { prune?: string }) => {
+      if (opts.prune) {
+        try {
+          const { removeWorktree } = await import("./codex-worktree.js");
+          removeWorktree(opts.prune, { deleteBranch: true });
+          console.log(`\nRemoved: ${opts.prune}\n`);
+        } catch (err) {
+          console.error(`\nFailed to remove ${opts.prune}: ${err}\n`);
+          process.exitCode = 1;
+        }
+        return;
+      }
+
+      const worktrees = listWorktrees();
+
+      if (worktrees.length === 0) {
+        console.log("\nNo Codex worktrees found.\n");
+        return;
+      }
+
+      console.log(`\nCodex Worktrees (${worktrees.length})`);
+      console.log("─".repeat(60));
+
+      for (const wt of worktrees) {
+        const ageH = Math.round(wt.ageMs / 3_600_000 * 10) / 10;
+        const changes = wt.hasChanges ? " (uncommitted changes)" : "";
+        console.log(`  ${wt.path}`);
+        console.log(`    branch: ${wt.branch}  age: ${ageH}h${changes}`);
+      }
+
+      console.log(`\nTo remove one: openclaw openclaw-linear worktrees --prune <path>\n`);
     });
 }

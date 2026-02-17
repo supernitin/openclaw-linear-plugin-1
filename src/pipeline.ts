@@ -1,6 +1,7 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import type { LinearAgentApi, ActivityContent } from "./linear-api.js";
 import { runAgent } from "./agent.js";
+import { setActiveSession, clearActiveSession } from "./active-session.js";
 
 export interface PipelineContext {
   api: OpenClawPluginApi;
@@ -14,12 +15,26 @@ export interface PipelineContext {
     description?: string | null;
   };
   promptContext?: unknown;
+  /** Populated by implementor stage if Codex creates a worktree */
+  worktreePath?: string | null;
+  /** Codex branch name, e.g. codex/UAT-123 */
+  codexBranch?: string | null;
 }
 
 function emit(ctx: PipelineContext, content: ActivityContent): Promise<void> {
   return ctx.linearApi.emitActivity(ctx.agentSessionId, content).catch((err) => {
     ctx.api.logger.error(`Failed to emit activity: ${err}`);
   });
+}
+
+function toolContext(ctx: PipelineContext): string {
+  return [
+    `\n## Tool Context`,
+    `When calling \`code_run\`, you MUST pass these parameters:`,
+    `- \`agentSessionId\`: \`"${ctx.agentSessionId}"\``,
+    `- \`issueIdentifier\`: \`"${ctx.issue.identifier}"\``,
+    `This enables real-time progress streaming to Linear and isolated worktree creation.`,
+  ].join("\n");
 }
 
 // ── Stage 1: Planner ───────────────────────────────────────────────
@@ -54,6 +69,8 @@ ${ctx.promptContext ? `**Additional context:**\n${JSON.stringify(ctx.promptConte
 4. Note any risks or dependencies
 5. Output your plan in markdown format
 
+IMPORTANT: Do NOT call code_run or any coding tools. Your job is ONLY to analyze and write a plan. The implementor stage will execute the plan using code_run after you're done.
+
 Output ONLY the plan, nothing else.`;
 
   await emit(ctx, { type: "action", action: "Planning", parameter: ctx.issue.identifier });
@@ -64,6 +81,7 @@ Output ONLY the plan, nothing else.`;
     sessionId: `linear-plan-${ctx.agentSessionId}`,
     message,
     timeoutMs: 5 * 60_000,
+
   });
 
   if (!result.success) {
@@ -104,14 +122,16 @@ ${plan}
 
 ## Instructions
 1. Follow the plan step by step
-2. Write the code changes
-3. Create commits for each logical change
-4. If the plan involves creating a PR, do so
-5. Report what you did and any files changed
+2. Use \`code_run\` to write code, create files, run tests, and refactor — it works in an isolated git worktree
+3. Use \`spawn_agent\` / \`ask_agent\` to delegate to other crew agents if needed
+4. Create commits for each logical change
+5. If the plan involves creating a PR, do so
+6. Report what you did, any files changed, and the worktree/branch path
+${toolContext(ctx)}
 
 Be thorough but stay within scope of the plan.`;
 
-  await emit(ctx, { type: "action", action: "Implementing", parameter: ctx.issue.identifier });
+  await emit(ctx, { type: "action", action: "Calling coding provider", parameter: "Codex" });
 
   const result = await runAgent({
     api: ctx.api,
@@ -119,6 +139,7 @@ Be thorough but stay within scope of the plan.`;
     sessionId: `linear-impl-${ctx.agentSessionId}`,
     message,
     timeoutMs: 10 * 60_000,
+
   });
 
   if (!result.success) {
@@ -126,7 +147,13 @@ Be thorough but stay within scope of the plan.`;
     return null;
   }
 
-  await emit(ctx, { type: "action", action: "Implementation complete", result: "Proceeding to audit" });
+  // Try to extract worktree info from agent output (Codex results include it)
+  const worktreeMatch = result.output.match(/worktreePath["\s:]+([/\w.-]+)/);
+  const branchMatch = result.output.match(/branch["\s:]+([/\w.-]+)/);
+  if (worktreeMatch) ctx.worktreePath = worktreeMatch[1];
+  if (branchMatch) ctx.codexBranch = branchMatch[1];
+
+  await emit(ctx, { type: "action", action: "Implementation complete", parameter: ctx.issue.identifier });
   return result.output;
 }
 
@@ -139,6 +166,10 @@ export async function runAuditorStage(
 ): Promise<void> {
   await emit(ctx, { type: "thought", body: "Auditing implementation against the plan..." });
 
+  const worktreeInfo = ctx.worktreePath
+    ? `\n## Worktree\nCode changes are at: \`${ctx.worktreePath}\` (branch: \`${ctx.codexBranch ?? "unknown"}\`)\n`
+    : "";
+
   const message = `You are an auditor. Review this implementation against the original plan.
 
 ## Issue: ${ctx.issue.identifier} — ${ctx.issue.title}
@@ -148,13 +179,14 @@ ${plan}
 
 ## Implementation Result:
 ${implResult}
-
+${worktreeInfo}
 ## Instructions
 1. Verify each plan step was completed
-2. Check for any missed items
+2. Check for any missed items — use \`ask_agent\` / \`spawn_agent\` for specialized review if needed
 3. Note any concerns or improvements needed
 4. Provide a pass/fail verdict with reasoning
 5. Output a concise audit summary in markdown
+${toolContext(ctx)}
 
 Output ONLY the audit summary.`;
 
@@ -166,6 +198,7 @@ Output ONLY the audit summary.`;
     sessionId: `linear-audit-${ctx.agentSessionId}`,
     message,
     timeoutMs: 5 * 60_000,
+
   });
 
   const auditSummary = result.success ? result.output : `Audit failed: ${result.output.slice(0, 500)}`;
@@ -184,20 +217,43 @@ Output ONLY the audit summary.`;
 // ── Full Pipeline ─────────────────────────────────────────────────
 
 export async function runFullPipeline(ctx: PipelineContext): Promise<void> {
+  // Register active session so tools (code_run) can resolve it
+  setActiveSession({
+    agentSessionId: ctx.agentSessionId,
+    issueIdentifier: ctx.issue.identifier,
+    issueId: ctx.issue.id,
+    agentId: ctx.agentId,
+    startedAt: Date.now(),
+  });
+
   try {
     // Stage 1: Plan
     const plan = await runPlannerStage(ctx);
-    if (!plan) return;
+    if (!plan) {
+      clearActiveSession(ctx.issue.id);
+      return;
+    }
 
     // Pipeline pauses here — user must reply to approve.
-    // The "prompted" webhook will call resumePipeline().
+    // The "prompted" / "created" webhook will call resumePipeline().
+    // Active session stays registered until resume completes.
   } catch (err) {
+    clearActiveSession(ctx.issue.id);
     ctx.api.logger.error(`Pipeline error: ${err}`);
     await emit(ctx, { type: "error", body: `Pipeline failed: ${String(err).slice(0, 500)}` });
   }
 }
 
 export async function resumePipeline(ctx: PipelineContext, plan: string): Promise<void> {
+  // Register (or update) active session for tool resolution
+  setActiveSession({
+    agentSessionId: ctx.agentSessionId,
+    issueIdentifier: ctx.issue.identifier,
+    issueId: ctx.issue.id,
+    agentId: ctx.agentId,
+    startedAt: Date.now(),
+  });
+
   try {
     // Stage 2: Implement
     const implResult = await runImplementorStage(ctx, plan);
@@ -208,5 +264,7 @@ export async function resumePipeline(ctx: PipelineContext, plan: string): Promis
   } catch (err) {
     ctx.api.logger.error(`Pipeline error: ${err}`);
     await emit(ctx, { type: "error", body: `Pipeline failed: ${String(err).slice(0, 500)}` });
+  } finally {
+    clearActiveSession(ctx.issue.id);
   }
 }

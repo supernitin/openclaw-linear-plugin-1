@@ -1,21 +1,193 @@
+import { randomUUID } from "node:crypto";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import type { LinearAgentApi, ActivityContent } from "./linear-api.js";
+
+// Import extensionAPI for embedded agent runner (internal, not in public SDK)
+let _extensionAPI: typeof import("/home/claw/.npm-global/lib/node_modules/openclaw/dist/extensionAPI.js") | null = null;
+async function getExtensionAPI() {
+  if (!_extensionAPI) {
+    // Dynamic import to avoid blocking module load if unavailable
+    _extensionAPI = await import(
+      "/home/claw/.npm-global/lib/node_modules/openclaw/dist/extensionAPI.js"
+    );
+  }
+  return _extensionAPI;
+}
 
 export interface AgentRunResult {
   success: boolean;
   output: string;
 }
 
+export interface AgentStreamCallbacks {
+  linearApi: LinearAgentApi;
+  agentSessionId: string;
+}
+
+/**
+ * Run an agent using the embedded runner with streaming callbacks.
+ * Falls back to subprocess if the embedded runner is unavailable.
+ */
 export async function runAgent(params: {
   api: OpenClawPluginApi;
   agentId: string;
   sessionId: string;
   message: string;
   timeoutMs?: number;
+  streaming?: AgentStreamCallbacks;
 }): Promise<AgentRunResult> {
-  const { api, agentId, sessionId, message, timeoutMs = 5 * 60_000 } = params;
+  const { api, agentId, sessionId, message, timeoutMs = 5 * 60_000, streaming } = params;
 
   api.logger.info(`Dispatching agent ${agentId} for session ${sessionId}`);
 
+  // Try embedded runner first (has streaming callbacks)
+  if (streaming) {
+    try {
+      return await runEmbedded(api, agentId, sessionId, message, timeoutMs, streaming);
+    } catch (err) {
+      api.logger.warn(`Embedded runner failed, falling back to subprocess: ${err}`);
+    }
+  }
+
+  // Fallback: subprocess (no streaming)
+  return runSubprocess(api, agentId, sessionId, message, timeoutMs);
+}
+
+/**
+ * Embedded agent runner with real-time streaming to Linear.
+ */
+async function runEmbedded(
+  api: OpenClawPluginApi,
+  agentId: string,
+  sessionId: string,
+  message: string,
+  timeoutMs: number,
+  streaming: AgentStreamCallbacks,
+): Promise<AgentRunResult> {
+  const ext = await getExtensionAPI();
+
+  const workspaceDir = ext.resolveAgentWorkspaceDir({ agentId });
+  const sessionFile = ext.resolveSessionFilePath(sessionId);
+  const agentDir = ext.resolveAgentDir({ agentId });
+  const runId = randomUUID();
+
+  // Load config so embedded runner can resolve providers, API keys, etc.
+  const config = await api.runtime.config.loadConfig();
+
+  // Resolve model/provider from config — default is anthropic which requires
+  // a separate API key. Our agents use openrouter.
+  const configAny = config as Record<string, any>;
+  const agentList = configAny?.agents?.list as Array<Record<string, any>> | undefined;
+  const agentEntry = agentList?.find((a) => a.id === agentId);
+  const modelRef: string =
+    agentEntry?.model?.primary ??
+    configAny?.agents?.defaults?.model?.primary ??
+    `${ext.DEFAULT_PROVIDER}/${ext.DEFAULT_MODEL}`;
+
+  // Parse "provider/model-id" format (e.g. "openrouter/moonshotai/kimi-k2.5")
+  const slashIdx = modelRef.indexOf("/");
+  const provider = slashIdx > 0 ? modelRef.slice(0, slashIdx) : ext.DEFAULT_PROVIDER;
+  const model = slashIdx > 0 ? modelRef.slice(slashIdx + 1) : modelRef;
+
+  api.logger.info(`Embedded agent run: agent=${agentId} session=${sessionId} runId=${runId} provider=${provider} model=${model}`);
+
+  const emit = (content: ActivityContent) => {
+    streaming.linearApi.emitActivity(streaming.agentSessionId, content).catch((err) => {
+      api.logger.warn(`Activity emit failed: ${err}`);
+    });
+  };
+
+  // Track last emitted tool to avoid duplicates
+  let lastToolAction = "";
+
+  const result = await ext.runEmbeddedPiAgent({
+    sessionId,
+    sessionFile,
+    workspaceDir,
+    agentDir,
+    prompt: message,
+    agentId,
+    runId,
+    timeoutMs,
+    config,
+    provider,
+    model,
+    shouldEmitToolResult: () => true,
+    shouldEmitToolOutput: () => true,
+
+    // Stream reasoning/thinking to Linear
+    onReasoningStream: (payload) => {
+      const text = payload.text?.trim();
+      if (text && text.length > 10) {
+        emit({ type: "thought", body: text.slice(0, 500) });
+      }
+    },
+
+    // Stream tool results to Linear
+    onToolResult: (payload) => {
+      const text = payload.text?.trim();
+      if (text) {
+        // Truncate tool results for activity display
+        const truncated = text.length > 300 ? text.slice(0, 300) + "..." : text;
+        emit({ type: "action", action: lastToolAction || "Tool result", parameter: truncated });
+      }
+    },
+
+    // Raw agent events — capture tool starts/ends
+    onAgentEvent: (evt) => {
+      const { stream, data } = evt;
+
+      if (stream !== "tool") return;
+
+      const phase = String(data.phase ?? "");
+      const toolName = String(data.name ?? "tool");
+      const meta = typeof data.meta === "string" ? data.meta : "";
+
+      // Tool execution start — emit action with tool name + meta
+      if (phase === "start") {
+        lastToolAction = toolName;
+        emit({ type: "action", action: `Running ${toolName}`, parameter: meta.slice(0, 200) || toolName });
+      }
+
+      // Tool execution result with error
+      if (phase === "result" && data.isError) {
+        emit({ type: "action", action: `${toolName} failed`, parameter: meta.slice(0, 200) || "error" });
+      }
+    },
+
+    // Partial assistant text (for long responses)
+    onPartialReply: (payload) => {
+      // We don't emit every partial chunk to avoid flooding Linear
+      // The final response will be posted as a comment
+    },
+  });
+
+  // Extract output text from payloads
+  const payloads = result.payloads ?? [];
+  const outputText = payloads
+    .map((p) => p.text)
+    .filter(Boolean)
+    .join("\n\n");
+
+  if (result.meta?.error) {
+    api.logger.error(`Embedded agent error: ${result.meta.error.kind}: ${result.meta.error.message}`);
+    return { success: false, output: outputText || result.meta.error.message };
+  }
+
+  api.logger.info(`Embedded agent completed: agent=${agentId} session=${sessionId} duration=${result.meta.durationMs}ms`);
+  return { success: true, output: outputText || "(no output)" };
+}
+
+/**
+ * Subprocess fallback (no streaming, used when no Linear session context).
+ */
+async function runSubprocess(
+  api: OpenClawPluginApi,
+  agentId: string,
+  sessionId: string,
+  message: string,
+  timeoutMs: number,
+): Promise<AgentRunResult> {
   const command = [
     "openclaw",
     "agent",

@@ -46,7 +46,7 @@ export function registerLinearProvider(api: OpenClawPluginApi) {
       {
         id: "oauth",
         label: "OAuth",
-        kind: "oauth",
+        kind: "oauth" as const,
         run: async (ctx: ProviderAuthContext): Promise<ProviderAuthResult> => {
           // This is a placeholder for the actual OAuth flow.
           // In a real implementation, we would use ctx.oauth.createVpsAwareHandlers
@@ -112,8 +112,12 @@ export function registerLinearProvider(api: OpenClawPluginApi) {
               {
                 profileId: "linear:default",
                 credential: {
-                  type: "oauth",
+                  type: "oauth" as const,
                   provider: "linear",
+                  access: tokens.access_token,
+                  refresh: tokens.refresh_token,
+                  expires: Date.now() + (tokens.expires_in * 1000),
+                  // Keep aliases for backward compat with linear-api.ts resolveLinearToken
                   accessToken: tokens.access_token,
                   refreshToken: tokens.refresh_token,
                   expiresAt: Date.now() + (tokens.expires_in * 1000),
