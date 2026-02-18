@@ -57,6 +57,7 @@ export interface ActiveDispatch {
   workerSessionKey?: string;    // session key for current worker sub-agent
   auditSessionKey?: string;     // session key for current audit sub-agent
   stuckReason?: string;         // only set when status === "stuck"
+  issueTitle?: string;          // for artifact summaries and memory headings
 }
 
 export interface CompletedDispatch {

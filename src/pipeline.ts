@@ -34,6 +34,16 @@ import {
   getActiveDispatch,
 } from "./dispatch-state.js";
 import { type NotifyFn } from "./notify.js";
+import {
+  saveWorkerOutput,
+  saveAuditVerdict,
+  appendLog,
+  updateManifest,
+  writeSummary,
+  buildSummaryFromArtifacts,
+  writeDispatchMemory,
+  resolveOrchestratorWorkspace,
+} from "./artifacts.js";
 
 // ---------------------------------------------------------------------------
 // Prompt loading
@@ -264,6 +274,9 @@ export async function triggerAudit(
 
   api.logger.info(`${TAG} worker completed, triggering audit (attempt ${dispatch.attempt})`);
 
+  // Update .claw/ manifest
+  try { updateManifest(dispatch.worktreePath, { status: "auditing", attempts: dispatch.attempt }); } catch {}
+
   // Fetch fresh issue details for audit context
   const issueDetails = await linearApi.getIssueDetails(dispatch.issueId).catch(() => null);
   const issue: IssueContext = {
@@ -371,6 +384,15 @@ export async function processVerdict(
     }
   }
 
+  // Log audit interaction to .claw/
+  try {
+    appendLog(dispatch.worktreePath, {
+      ts: new Date().toISOString(), phase: "audit", attempt: dispatch.attempt,
+      agent: "auditor", prompt: "(audit task)",
+      outputPreview: auditOutput.slice(0, 500), success: event.success,
+    });
+  } catch {}
+
   // Parse verdict
   const verdict = parseVerdict(auditOutput);
   if (!verdict) {
@@ -406,8 +428,12 @@ async function handleAuditPass(
   dispatch: ActiveDispatch,
   verdict: AuditVerdict,
 ): Promise<void> {
-  const { api, linearApi, notify, configPath } = hookCtx;
+  const { api, linearApi, notify, pluginConfig, configPath } = hookCtx;
   const TAG = `[${dispatch.issueIdentifier}]`;
+
+  // Save audit verdict to .claw/
+  try { saveAuditVerdict(dispatch.worktreePath, dispatch.attempt, verdict); } catch {}
+  try { updateManifest(dispatch.worktreePath, { status: "done", attempts: dispatch.attempt + 1 }); } catch {}
 
   // CAS transition: auditing → done
   try {
@@ -428,11 +454,26 @@ async function handleAuditPass(
     project: dispatch.project,
   }, configPath);
 
-  // Post approval comment
+  // Build summary from .claw/ artifacts and write to memory
+  let summary: string | null = null;
+  try {
+    summary = buildSummaryFromArtifacts(dispatch.worktreePath);
+    if (summary) {
+      writeSummary(dispatch.worktreePath, summary);
+      const wsDir = resolveOrchestratorWorkspace(api, pluginConfig);
+      writeDispatchMemory(dispatch.issueIdentifier, summary, wsDir);
+      api.logger.info(`${TAG} .claw/ summary and memory written`);
+    }
+  } catch (err) {
+    api.logger.warn(`${TAG} failed to write summary/memory: ${err}`);
+  }
+
+  // Post approval comment (with summary excerpt if available)
   const criteriaList = verdict.criteria.map((c) => `- ${c}`).join("\n");
+  const summaryExcerpt = summary ? `\n\n**Summary:**\n${summary.slice(0, 2000)}` : "";
   await linearApi.createComment(
     dispatch.issueId,
-    `## Audit Passed\n\n**Criteria verified:**\n${criteriaList}\n\n**Tests:** ${verdict.testResults || "N/A"}\n\n---\n*Attempt ${dispatch.attempt + 1} — audit passed.*`,
+    `## Audit Passed\n\n**Criteria verified:**\n${criteriaList}\n\n**Tests:** ${verdict.testResults || "N/A"}${summaryExcerpt}\n\n---\n*Attempt ${dispatch.attempt + 1} — audit passed. Artifacts: \`${dispatch.worktreePath}/.claw/\`*`,
   ).catch((err) => api.logger.error(`${TAG} failed to post audit pass comment: ${err}`));
 
   api.logger.info(`${TAG} audit PASSED — dispatch completed (attempt ${dispatch.attempt})`);
@@ -458,8 +499,13 @@ async function handleAuditFail(
   const maxAttempts = (pluginConfig?.maxReworkAttempts as number) ?? 2;
   const nextAttempt = dispatch.attempt + 1;
 
+  // Save audit verdict to .claw/ (both escalation and rework paths)
+  try { saveAuditVerdict(dispatch.worktreePath, dispatch.attempt, verdict); } catch {}
+
   if (nextAttempt > maxAttempts) {
     // Escalate — too many failures
+    try { updateManifest(dispatch.worktreePath, { status: "stuck", attempts: nextAttempt }); } catch {}
+
     try {
       await transitionDispatch(
         dispatch.issueIdentifier,
@@ -476,10 +522,20 @@ async function handleAuditFail(
       throw err;
     }
 
+    // Write summary + memory for stuck dispatches too
+    try {
+      const summary = buildSummaryFromArtifacts(dispatch.worktreePath);
+      if (summary) {
+        writeSummary(dispatch.worktreePath, summary);
+        const wsDir = resolveOrchestratorWorkspace(api, pluginConfig);
+        writeDispatchMemory(dispatch.issueIdentifier, summary, wsDir);
+      }
+    } catch {}
+
     const gapsList = verdict.gaps.map((g) => `- ${g}`).join("\n");
     await linearApi.createComment(
       dispatch.issueId,
-      `## Audit Failed — Escalating\n\n**Attempt ${nextAttempt} of ${maxAttempts + 1}**\n\n**Gaps:**\n${gapsList}\n\n**Tests:** ${verdict.testResults || "N/A"}\n\n---\n*Max rework attempts reached. Needs human review.*`,
+      `## Audit Failed — Escalating\n\n**Attempt ${nextAttempt} of ${maxAttempts + 1}**\n\n**Gaps:**\n${gapsList}\n\n**Tests:** ${verdict.testResults || "N/A"}\n\n---\n*Max rework attempts reached. Needs human review. Artifacts: \`${dispatch.worktreePath}/.claw/\`*`,
     ).catch((err) => api.logger.error(`${TAG} failed to post escalation comment: ${err}`));
 
     api.logger.warn(`${TAG} audit FAILED ${nextAttempt}x — escalating to human`);
@@ -608,6 +664,7 @@ export async function spawnWorker(
 
   api.logger.info(`${TAG} spawning worker agent session=${workerSessionId} (attempt ${dispatch.attempt})`);
 
+  const workerStartTime = Date.now();
   const result = await runAgent({
     api,
     agentId: (pluginConfig?.defaultAgentId as string) ?? "default",
@@ -615,6 +672,19 @@ export async function spawnWorker(
     message: `${workerPrompt.system}\n\n${workerPrompt.task}`,
     timeoutMs: (pluginConfig?.codexTimeoutMs as number) ?? 10 * 60_000,
   });
+
+  // Save worker output to .claw/
+  const workerElapsed = Date.now() - workerStartTime;
+  try { saveWorkerOutput(dispatch.worktreePath, dispatch.attempt, result.output); } catch {}
+  try {
+    appendLog(dispatch.worktreePath, {
+      ts: new Date().toISOString(), phase: "worker", attempt: dispatch.attempt,
+      agent: (pluginConfig?.defaultAgentId as string) ?? "default",
+      prompt: workerPrompt.task.slice(0, 200),
+      outputPreview: result.output.slice(0, 500),
+      success: result.success, durationMs: workerElapsed,
+    });
+  } catch {}
 
   // runAgent returns inline — trigger audit directly.
   // Re-read dispatch state since it may have changed during worker run.

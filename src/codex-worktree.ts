@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, statSync, readdirSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
+import { ensureGitignore } from "./artifacts.js";
 
 const DEFAULT_BASE_REPO = "/home/claw/ai-workspace";
 const DEFAULT_WORKTREE_BASE_DIR = path.join(homedir(), ".openclaw", "worktrees");
@@ -90,6 +91,7 @@ export function createWorktree(
     try {
       // Verify it's a valid git worktree
       git(["rev-parse", "--git-dir"], worktreePath);
+      ensureGitignore(worktreePath);
       return { path: worktreePath, branch, resumed: true };
     } catch {
       // Directory exists but isn't a valid worktree — remove and recreate
@@ -105,11 +107,13 @@ export function createWorktree(
   if (branchExists) {
     // Recreate worktree from existing branch — preserves previous work
     git(["worktree", "add", worktreePath, branch], repo);
+    ensureGitignore(worktreePath);
     return { path: worktreePath, branch, resumed: true };
   }
 
   // Fresh start: new branch off HEAD
   git(["worktree", "add", "-b", branch, worktreePath], repo);
+  ensureGitignore(worktreePath);
   return { path: worktreePath, branch, resumed: false };
 }
 

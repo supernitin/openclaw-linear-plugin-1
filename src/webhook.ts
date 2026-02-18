@@ -9,6 +9,7 @@ import { readDispatchState, getActiveDispatch, registerDispatch, updateDispatchS
 import { createDiscordNotifier, createNoopNotifier, type NotifyFn } from "./notify.js";
 import { assessTier } from "./tier-assess.js";
 import { createWorktree, prepareWorkspace } from "./codex-worktree.js";
+import { ensureClawDir, writeManifest } from "./artifacts.js";
 
 // ── Agent profiles (loaded from config, no hardcoded names) ───────
 interface AgentProfile {
@@ -1250,11 +1251,32 @@ async function handleDispatch(
     api.logger.warn(`@dispatch: could not create agent session: ${err}`);
   }
 
+  // 6b. Initialize .claw/ artifact directory
+  try {
+    ensureClawDir(worktree.path);
+    writeManifest(worktree.path, {
+      issueIdentifier: identifier,
+      issueTitle: enrichedIssue.title ?? "(untitled)",
+      issueId: issue.id,
+      tier: assessment.tier,
+      model: assessment.model,
+      dispatchedAt: new Date().toISOString(),
+      worktreePath: worktree.path,
+      branch: worktree.branch,
+      attempts: 0,
+      status: "dispatched",
+      plugin: "openclaw-linear",
+    });
+  } catch (err) {
+    api.logger.warn(`@dispatch: .claw/ init failed: ${err}`);
+  }
+
   // 7. Register dispatch in persistent state
   const now = new Date().toISOString();
   await registerDispatch(identifier, {
     issueId: issue.id,
     issueIdentifier: identifier,
+    issueTitle: enrichedIssue.title ?? "(untitled)",
     worktreePath: worktree.path,
     branch: worktree.branch,
     tier: assessment.tier,
