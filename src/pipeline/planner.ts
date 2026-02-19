@@ -23,6 +23,9 @@ import {
   buildPlanSnapshot,
   auditPlan,
 } from "../tools/planner-tools.js";
+import { runClaude } from "../tools/claude-tool.js";
+import { runCodex } from "../tools/codex-tool.js";
+import { runGemini } from "../tools/gemini-tool.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -39,6 +42,7 @@ interface PlannerPrompts {
   interview: string;
   audit_prompt: string;
   welcome: string;
+  review: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -51,6 +55,7 @@ function loadPlannerPrompts(pluginConfig?: Record<string, unknown>): PlannerProm
     interview: "Project: {{projectName}}\n\nPlan:\n{{planSnapshot}}\n\nUser said: {{userMessage}}\n\nContinue planning.",
     audit_prompt: "Run audit_plan for {{projectName}}.",
     welcome: "Entering planning mode for **{{projectName}}**. What are the main feature areas?",
+    review: "Plan for {{projectName}} passed checks. {{reviewModel}} recommends:\n{{crossModelFeedback}}\n\nReview and suggest changes, then invite the user to approve.",
   };
 
   const parsed = loadRawPromptYaml(pluginConfig);
@@ -60,6 +65,7 @@ function loadPlannerPrompts(pluginConfig?: Record<string, unknown>): PlannerProm
       interview: parsed.planner.interview ?? defaults.interview,
       audit_prompt: parsed.planner.audit_prompt ?? defaults.audit_prompt,
       welcome: parsed.planner.welcome ?? defaults.welcome,
+      review: parsed.planner.review ?? defaults.review,
     };
   }
 
@@ -124,34 +130,18 @@ export async function initiatePlanningSession(
 // Interview turn
 // ---------------------------------------------------------------------------
 
-const FINALIZE_PATTERN = /\b(finalize\s+(the\s+)?plan\b|done\s+planning\b(?!\s+\w)|approve\s+(the\s+)?plan\b|plan\s+looks\s+good\b|ready\s+to\s+finalize\b|let'?s\s+finalize\b)/i;
-const ABANDON_PATTERN = /\b(abandon\s+plan(ning)?|cancel\s+plan(ning)?|stop\s+planning|exit\s+planning|quit\s+planning)\b/i;
-
+/**
+ * Handle a planning conversation turn. Intent detection (finalize/abandon)
+ * is handled by the webhook via intent-classify.ts before calling this function.
+ * This is a pure "continue planning" function.
+ */
 export async function handlePlannerTurn(
   ctx: PlannerContext,
   session: PlanningSession,
   input: { issueId: string; commentBody: string; commentorName: string },
-  opts?: { onApproved?: (projectId: string) => void },
 ): Promise<void> {
   const { api, linearApi, pluginConfig } = ctx;
   const configPath = pluginConfig?.planningStatePath as string | undefined;
-
-  // Detect finalization intent
-  if (FINALIZE_PATTERN.test(input.commentBody)) {
-    await runPlanAudit(ctx, session, { onApproved: opts?.onApproved });
-    return;
-  }
-
-  // Detect abandon intent
-  if (ABANDON_PATTERN.test(input.commentBody)) {
-    await endPlanningSession(session.projectId, "abandoned", configPath);
-    await linearApi.createComment(
-      session.rootIssueId,
-      `Planning mode ended for **${session.projectName}**. Session abandoned.`,
-    );
-    api.logger.info(`Planning: session abandoned for ${session.projectName}`);
-    return;
-  }
 
   // Increment turn count
   const newTurnCount = session.turnCount + 1;
@@ -186,6 +176,8 @@ export async function handlePlannerTurn(
     linearApi,
     projectId: session.projectId,
     teamId: session.teamId,
+    api,
+    pluginConfig,
   });
 
   try {
@@ -217,7 +209,6 @@ export async function handlePlannerTurn(
 export async function runPlanAudit(
   ctx: PlannerContext,
   session: PlanningSession,
-  opts?: { onApproved?: (projectId: string) => void },
 ): Promise<void> {
   const { api, linearApi, pluginConfig } = ctx;
   const configPath = pluginConfig?.planningStatePath as string | undefined;
@@ -229,26 +220,63 @@ export async function runPlanAudit(
   const result = auditPlan(issues);
 
   if (result.pass) {
-    // Build final summary
+    // Transition to plan_review (not approved yet — cross-model review first)
+    await updatePlanningSession(session.projectId, { status: "plan_review" }, configPath);
+
     const snapshot = buildPlanSnapshot(issues);
     const warningsList = result.warnings.length > 0
       ? `\n\n**Warnings:**\n${result.warnings.map((w) => `- ${w}`).join("\n")}`
       : "";
 
+    // Determine review model and post "running review" message
+    const reviewModel = resolveReviewModel(pluginConfig);
+    const reviewModelName = reviewModel.charAt(0).toUpperCase() + reviewModel.slice(1);
+
     await linearApi.createComment(
       session.rootIssueId,
-      `## Plan Approved\n\n` +
-      `The plan for **${session.projectName}** passed all checks.\n\n` +
-      `**${issues.length} issues** created with valid dependency graph.${warningsList}\n\n` +
-      `### Final Plan\n${snapshot}\n\n` +
-      `---\n*Planning mode complete. Project is ready for implementation dispatch.*`,
+      `## Plan Passed Checks\n\n` +
+      `**${issues.length} issues** with valid dependency graph.${warningsList}\n\n` +
+      `Let me have **${reviewModelName}** audit this and make recommendations.`,
     );
 
-    await endPlanningSession(session.projectId, "approved", configPath);
-    api.logger.info(`Planning: session approved for ${session.projectName}`);
+    // Run cross-model review
+    const crossReview = await runCrossModelReview(api, reviewModel, snapshot, pluginConfig);
 
-    // Trigger DAG-based dispatch if callback provided
-    opts?.onApproved?.(session.projectId);
+    // Run planner agent with review prompt + cross-model feedback
+    const prompts = loadPlannerPrompts(pluginConfig);
+    const reviewPrompt = renderTemplate(prompts.review, {
+      projectName: session.projectName,
+      planSnapshot: snapshot,
+      issueCount: String(issues.length),
+      reviewModel: reviewModelName,
+      crossModelFeedback: crossReview,
+    });
+
+    const agentId = (pluginConfig?.defaultAgentId as string) ?? "default";
+
+    setActivePlannerContext({
+      linearApi,
+      projectId: session.projectId,
+      teamId: session.teamId,
+      api,
+      pluginConfig,
+    });
+
+    try {
+      const agentResult = await runAgent({
+        api,
+        agentId,
+        sessionId: `planner-${session.rootIdentifier}-review`,
+        message: `${prompts.system}\n\n${reviewPrompt}`,
+      });
+      if (agentResult.output) {
+        await linearApi.createComment(session.rootIssueId, agentResult.output);
+      }
+    } finally {
+      clearActivePlannerContext();
+    }
+
+    api.logger.info(`Planning: entered plan_review for ${session.projectName} (reviewed by ${reviewModelName})`);
   } else {
     // Post problems and keep planning
     const problemsList = result.problems.map((p) => `- ${p}`).join("\n");
@@ -266,4 +294,42 @@ export async function runPlanAudit(
 
     api.logger.info(`Planning: audit failed for ${session.projectName} (${result.problems.length} problems)`);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-model review
+// ---------------------------------------------------------------------------
+
+export async function runCrossModelReview(
+  api: OpenClawPluginApi,
+  model: "claude" | "codex" | "gemini",
+  planSnapshot: string,
+  pluginConfig?: Record<string, unknown>,
+): Promise<string> {
+  const prompt = `You are reviewing a project plan. Analyze it and suggest specific improvements.\n\n${planSnapshot}\n\nFocus on: missing acceptance criteria, dependency gaps, estimation accuracy, testability, and edge cases. Reference specific issue identifiers. Be concise and actionable.`;
+
+  try {
+    const runner = model === "claude" ? runClaude
+      : model === "codex" ? runCodex
+      : runGemini;
+    const result = await runner(api, { prompt } as any, pluginConfig);
+    return result.success ? (result.output ?? "(no feedback)") : `(${model} review failed: ${result.error})`;
+  } catch (err) {
+    api.logger.warn(`Cross-model review failed: ${err}`);
+    return "(cross-model review unavailable)";
+  }
+}
+
+export function resolveReviewModel(pluginConfig?: Record<string, unknown>): "claude" | "codex" | "gemini" {
+  // User override in config
+  const configured = (pluginConfig as any)?.plannerReviewModel as string | undefined;
+  if (configured && ["claude", "codex", "gemini"].includes(configured)) {
+    return configured as "claude" | "codex" | "gemini";
+  }
+  // Always the opposite of the user's primary model
+  const currentModel = (pluginConfig as any)?.agents?.defaults?.model?.primary as string ?? "";
+  if (currentModel.includes("claude") || currentModel.includes("anthropic")) return "codex";
+  if (currentModel.includes("codex") || currentModel.includes("openai")) return "claude";
+  if (currentModel.includes("gemini") || currentModel.includes("google")) return "claude";
+  return "claude"; // Kimi, Mistral, etc. → Claude reviews
 }

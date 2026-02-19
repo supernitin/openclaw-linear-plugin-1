@@ -11,8 +11,9 @@ Connect Linear to AI agents. Issues get triaged, implemented, and audited — au
 
 - **New issue?** Agent estimates story points, adds labels, sets priority.
 - **Assign to agent?** A worker implements it, an independent auditor verifies it, done.
-- **Comment `@qa review this`?** The QA agent responds with its expertise.
-- **Say "plan this project"?** A planner interviews you and builds your full issue hierarchy.
+- **Comment anything?** The bot understands natural language — no magic commands needed.
+- **Say "let's plan the features"?** A planner interviews you, writes user stories, and builds your full issue hierarchy.
+- **Plan looks good?** A different AI model automatically audits the plan before dispatch.
 - **Agent goes silent?** A watchdog kills it and retries automatically.
 - **Want updates?** Get notified on Discord, Slack, Telegram, or Signal.
 
@@ -284,53 +285,99 @@ If something went wrong, start with `log.jsonl` — it shows every phase, how lo
 
 ---
 
+## Comment Routing — Talk Naturally
+
+You don't need to memorize magic commands. The bot uses an LLM-based intent classifier to understand what you want from any comment.
+
+```
+User comment → Intent Classifier (small model, ~2s) → Route to handler
+                         ↓ (on failure)
+                    Regex fallback → Route to handler
+```
+
+**What the bot understands:**
+
+| What you say | What happens |
+|---|---|
+| "let's plan the features for this" | Starts planning interview |
+| "looks good, ship it" (during planning) | Runs plan audit + cross-model review |
+| "nevermind, cancel this" (during planning) | Exits planning mode |
+| "hey kaylee can you look at this?" | Routes to Kaylee (no `@` needed) |
+| "what can I do here?" | Default agent responds (not silently dropped) |
+| "fix the search bug" | Default agent dispatches work |
+
+`@mentions` still work as a fast path — if you write `@kaylee`, the classifier is skipped entirely for speed.
+
+> **Tip:** Configure `classifierAgentId` to point to a small/fast model agent (like Haiku) for low-latency, low-cost intent classification. The classifier only needs ~300 tokens per call.
+
+---
+
 ## Planning a Project
 
 For larger work, the planner helps you break a project into issues with dependencies, then dispatches them automatically.
 
 ### Start planning
 
-Comment on any issue that belongs to a Linear project:
+Comment on any issue that belongs to a Linear project — use natural language:
 
-> `@ctclaw plan this project`
+> "let's plan out the features for this project"
 
-The planner enters **interview mode** and asks you questions:
+The planner enters **interview mode** and asks you questions one at a time:
 
-> Entering planning mode for **Search Feature**. What are the main feature areas you'd like to build?
+> I'm entering planning mode for **Search Feature**. I'll interview you about the features you want to build, then structure everything into Linear issues.
+>
+> Let's start — what is this project about, and what are the main feature areas?
 
 ### Build the plan
 
-Reply with your ideas. The planner creates issues, sets dependencies, and asks follow-up questions:
+Reply with your ideas. The planner creates issues with **user stories** and **acceptance criteria**, sets dependencies, and asks follow-up questions:
 
 > I've created 3 issues:
 > - **PROJ-2:** Build search API endpoint (3 pts, blocks PROJ-3)
 > - **PROJ-3:** Search results page (2 pts, blocked by PROJ-2)
 > - **PROJ-4:** Autocomplete suggestions (1 pt, independent)
 >
-> Should the autocomplete call a separate endpoint or share the search API?
+> For PROJ-2, here's what I wrote for acceptance criteria:
+> - *Given* a user sends a search query, *When* results exist, *Then* they are returned with pagination
+>
+> Does that cover it? Should the autocomplete call a separate endpoint or share the search API?
+
+The planner proactively asks for:
+- **User stories** — "As a [role], I want [feature] so that [benefit]"
+- **Acceptance criteria** — Given/When/Then format
+- **UAT test scenarios** — How to manually verify the feature
 
 Keep replying until the plan looks right. The planner updates issues in real time.
 
-### Finalize
+### Finalize & Cross-Model Review
 
-When you're happy with the plan, comment:
+When you're happy, say something like "looks good" or "finalize plan". The planner runs a validation check:
+- Every issue has a description (50+ characters) with acceptance criteria
+- Every non-epic issue has an estimate and priority
+- No circular dependencies in the DAG
 
-> `finalize plan`
+**If validation passes, a cross-model review runs automatically:**
 
-The planner runs a validation check:
-- Every issue has a description (50+ characters)
-- Every issue has an estimate
-- Every issue has a priority
-- No circular dependencies
-
-**If validation passes:**
-
-> ## Plan Approved
+> ## Plan Passed Checks
 >
-> The plan for **Search Feature** passed all checks.
-> **3 issues** created with valid dependency graph.
+> **3 issues** with valid dependency graph.
+>
+> Let me have **Codex** audit this and make recommendations.
 
-The project enters **DAG dispatch mode** — issues are assigned to the agent automatically, respecting dependency order. Up to 3 issues run in parallel. As each completes, newly unblocked issues start.
+A different AI model (always the complement of your primary model) reviews the plan for gaps:
+
+| Your primary model | Auto-reviewer |
+|---|---|
+| Claude / Anthropic | Codex |
+| Codex / OpenAI | Claude |
+| Gemini / Google | Claude |
+| Other | Claude |
+
+After the review, the planner summarizes recommendations and asks you to approve:
+
+> Codex suggested adding error handling scenarios to PROJ-2 and noted PROJ-4 could be split into frontend/backend. I've updated PROJ-2's acceptance criteria. The PROJ-4 split is optional — your call.
+>
+> If you're happy with this plan, say **approve plan** to start dispatching.
 
 **If validation fails:**
 
@@ -340,13 +387,16 @@ The project enters **DAG dispatch mode** — issues are assigned to the agent au
 > - PROJ-2: description too short (< 50 chars)
 > - PROJ-3: missing estimate
 >
+> **Warnings:**
+> - PROJ-4: no acceptance criteria found in description
+>
 > Please address these issues, then say "finalize plan" again.
 
-Fix the issues and try again. You can also say `abandon planning` to exit without dispatching.
+Fix the issues and try again. You can also say "cancel" or "stop planning" to exit without dispatching.
 
 ### DAG dispatch progress
 
-As issues complete, you'll get progress notifications:
+After approval, issues are assigned to the agent automatically in dependency order. Up to 3 issues run in parallel.
 
 > `📊 Search Feature: 2/3 complete`
 
@@ -364,11 +414,14 @@ If an issue gets stuck (all retries failed), dependent issues are blocked and yo
 |---|---|
 | Create a new issue | Agent triages — adds estimate, labels, priority |
 | Assign an issue to the agent | Worker → Audit → Done (or retry, or escalate) |
-| Comment `@qa check the tests` | QA agent responds |
-| Comment `@ctclaw plan this project` | Planning interview starts |
-| Reply during planning | Issues created/updated, follow-up questions |
-| Comment `finalize plan` | Validates, then auto-dispatches |
-| Comment `abandon planning` | Exits planning mode |
+| Comment anything on an issue | Intent classifier routes to the right handler |
+| Mention an agent by name (with or without `@`) | That agent responds |
+| Ask a question or request work | Default agent handles it |
+| Say "plan this project" (on a project issue) | Planning interview starts |
+| Reply during planning | Issues created/updated with user stories & AC |
+| Say "looks good" / "finalize plan" | Validates → cross-model review → approval |
+| Say "approve plan" (after review) | Dispatches all issues in dependency order |
+| Say "cancel" / "abandon planning" | Exits planning mode |
 | `/dispatch list` | Shows all active dispatches |
 | `/dispatch retry CT-123` | Re-runs a stuck dispatch |
 | `/dispatch status CT-123` | Detailed dispatch info |
@@ -401,6 +454,8 @@ Add settings under the plugin entry in `openclaw.json`:
 | Key | Type | Default | What it does |
 |---|---|---|---|
 | `defaultAgentId` | string | `"default"` | Which agent runs the pipeline |
+| `classifierAgentId` | string | — | Agent for intent classification (use a small/fast model like Haiku) |
+| `plannerReviewModel` | string | auto | Cross-model plan reviewer: `"claude"`, `"codex"`, or `"gemini"`. Auto-detects the complement of your primary model. |
 | `enableAudit` | boolean | `true` | Run auditor after implementation |
 | `enableOrchestration` | boolean | `true` | Allow `spawn_agent` / `ask_agent` tools |
 | `maxReworkAttempts` | number | `2` | Max audit failures before escalation |
@@ -408,6 +463,7 @@ Add settings under the plugin entry in `openclaw.json`:
 | `worktreeBaseDir` | string | `"~/.openclaw/worktrees"` | Where worktrees are created |
 | `repos` | object | — | Multi-repo map (see [Multi-Repo](#multi-repo)) |
 | `dispatchStatePath` | string | `"~/.openclaw/linear-dispatch-state.json"` | Dispatch state file |
+| `planningStatePath` | string | `"~/.openclaw/linear-planning-state.json"` | Planning session state file |
 | `promptsPath` | string | — | Custom prompts file path |
 | `notifications` | object | — | Notification targets (see [Notifications](#notifications)) |
 | `inactivitySec` | number | `120` | Kill agent if silent this long |
@@ -569,6 +625,10 @@ rework:
 | `{{tier}}` | Complexity tier (junior/medior/senior) |
 | `{{attempt}}` | Current attempt number |
 | `{{gaps}}` | Audit gaps from previous attempt |
+| `{{projectName}}` | Project name (planner prompts) |
+| `{{planSnapshot}}` | Current plan structure (planner prompts) |
+| `{{reviewModel}}` | Name of cross-model reviewer (planner review) |
+| `{{crossModelFeedback}}` | Review recommendations (planner review) |
 
 ### CLI
 
@@ -785,7 +845,7 @@ Every warning and error includes a `→` line telling you what to do. Run `docto
 
 ### Unit tests
 
-422 tests covering the full pipeline — triage, dispatch, audit, planning, notifications, and infrastructure:
+454 tests covering the full pipeline — triage, dispatch, audit, planning, intent classification, cross-model review, notifications, and infrastructure:
 
 ```bash
 cd ~/claw-extensions/linear
@@ -806,6 +866,7 @@ npx tsx scripts/uat-linear.ts
 npx tsx scripts/uat-linear.ts --test dispatch
 npx tsx scripts/uat-linear.ts --test planning
 npx tsx scripts/uat-linear.ts --test mention
+npx tsx scripts/uat-linear.ts --test intent
 ```
 
 **What each scenario does:**
@@ -866,6 +927,25 @@ npx tsx scripts/uat-linear.ts --test mention
 [mention] Posted "@kaylee analyze this issue"
 [mention] ✔ Kaylee responded (18s)
 [mention] Total: 18s
+```
+
+#### `--test intent` (Natural language routing)
+
+1. Creates a test issue and posts a question (no `@mention`)
+2. Verifies the bot responds (not silently dropped)
+3. Posts a comment with an agent name but no `@` prefix
+4. Verifies that agent responds
+5. Tests plan review flow with cross-model audit
+
+**Expected output:**
+
+```
+[intent] Created issue ENG-202
+[intent] Posted "what can I do with this?" — waiting for response...
+[intent] ✔ Bot responded to question (12s)
+[intent] Posted "hey kaylee analyze this" — waiting for response...
+[intent] ✔ Kaylee responded without @mention (15s)
+[intent] Total: 27s
 ```
 
 ### Verify notifications
@@ -947,6 +1027,9 @@ journalctl --user -u openclaw-gateway -f         # Watch live logs
 | Audit always fails | Run `openclaw openclaw-linear prompts validate` to check prompt syntax. |
 | Multi-repo not detected | Markers must be `<!-- repos: name1, name2 -->`. Names must match `repos` config keys. |
 | `/dispatch` not responding | Restart gateway. Check plugin loaded with `openclaw doctor`. |
+| Comments ignored (no response) | Check logs for intent classification results. If classifier fails, regex fallback may not match. |
+| Intent classifier slow | Set `classifierAgentId` to a small model agent (Haiku). Default uses your primary model. |
+| Cross-model review fails | The reviewer model CLI must be installed. Check logs for "cross-model review unavailable". |
 | Rich notifications are plain text | Set `"richFormat": true` in notifications config. |
 | Gateway rejects config keys | Strict validator. Run `openclaw doctor --fix`. |
 

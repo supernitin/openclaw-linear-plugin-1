@@ -2,10 +2,10 @@
  * E2E planning pipeline tests.
  *
  * Exercises the real planning lifecycle: initiatePlanningSession → handlePlannerTurn
- * → runPlanAudit → onApproved → DAG dispatch cascade.
+ * → runPlanAudit → plan_review → (webhook handles approval) → DAG dispatch cascade.
  *
- * Mocked: runAgent, LinearAgentApi. Real: planning-state.ts, planner.ts,
- * planner-tools.ts (auditPlan, buildPlanSnapshot), dag-dispatch.ts.
+ * Mocked: runAgent, LinearAgentApi, CLI tool runners. Real: planning-state.ts,
+ * planner.ts, planner-tools.ts (auditPlan, buildPlanSnapshot), dag-dispatch.ts.
  */
 import { describe, it, expect, beforeEach, vi } from "vitest";
 
@@ -25,6 +25,17 @@ vi.mock("../api/linear-api.js", () => ({}));
 vi.mock("openclaw/plugin-sdk", () => ({}));
 vi.mock("../infra/observability.js", () => ({
   emitDiagnostic: vi.fn(),
+}));
+
+// Mock CLI tool runners for cross-model review
+vi.mock("../tools/claude-tool.js", () => ({
+  runClaude: vi.fn().mockResolvedValue({ success: true, output: "Claude review: looks good" }),
+}));
+vi.mock("../tools/codex-tool.js", () => ({
+  runCodex: vi.fn().mockResolvedValue({ success: true, output: "Codex review: approved" }),
+}));
+vi.mock("../tools/gemini-tool.js", () => ({
+  runGemini: vi.fn().mockResolvedValue({ success: true, output: "Gemini review: no issues" }),
 }));
 
 // ---------------------------------------------------------------------------
@@ -75,21 +86,21 @@ function makePassingIssues() {
   return [
     makeProjectIssue("PROJ-2", {
       title: "Implement search API",
-      description: "Build the search API endpoint with filtering and pagination support for the frontend.",
+      description: "As a user, I want a search API so that I can find content. Given I send a query, When results exist, Then they are returned with pagination.",
       estimate: 3,
       priority: 2,
       labels: ["Epic"],
     }),
     makeProjectIssue("PROJ-3", {
       title: "Build search results page",
-      description: "Create a search results page component that displays results from the search API endpoint.",
+      description: "As a user, I want to see search results in a page. Given I perform a search, When results load, Then I see a paginated list of matching items.",
       estimate: 2,
       priority: 2,
       parentIdentifier: "PROJ-2",
     }),
     makeProjectIssue("PROJ-4", {
       title: "Add search autocomplete",
-      description: "Implement autocomplete suggestions in the search input using the search API typeahead endpoint.",
+      description: "As a user, I want autocomplete suggestions. Given I type in the search box, When 3+ characters entered, Then suggestions appear from the typeahead API.",
       estimate: 1,
       priority: 3,
       parentIdentifier: "PROJ-2",
@@ -111,9 +122,9 @@ describe("E2E planning pipeline", () => {
   });
 
   // =========================================================================
-  // Test 1: Full lifecycle — initiate → interview → approve
+  // Test 1: Full lifecycle — initiate → interview → audit → plan_review
   // =========================================================================
-  it("full lifecycle: initiate → interview turns → finalize → approved", async () => {
+  it("full lifecycle: initiate → interview turns → audit → plan_review", async () => {
     const { ctx, linearApi } = createCtx(configPath);
 
     const rootIssue = { id: "issue-1", identifier: "PROJ-1", title: "Root Issue", team: { id: "team-1" } };
@@ -188,37 +199,34 @@ describe("E2E planning pipeline", () => {
     state = await readPlanningState(configPath);
     expect(state.sessions["proj-1"].turnCount).toBe(2);
 
-    // Step 4: Finalize — with passing issues in the project
+    // Step 4: Audit — with passing issues
+    // Note: finalize intent detection now happens in webhook.ts, not handlePlannerTurn.
+    // We call runPlanAudit directly (as the webhook would after intent classification).
     vi.clearAllMocks();
+    runAgentMock.mockResolvedValue({ success: true, output: "Review complete." });
     linearApi.getProjectIssues.mockResolvedValue(makePassingIssues());
 
     const session3 = { ...session, turnCount: 2 };
-    const onApproved = vi.fn();
+    await runPlanAudit(ctx, session3);
 
-    await handlePlannerTurn(ctx, session3, {
-      issueId: "issue-1",
-      commentBody: "finalize plan",
-      commentorName: "User",
-    }, { onApproved });
-
-    // Verify "Plan Approved" comment
+    // Verify "Plan Passed Checks" comment (not "Approved" — that comes from webhook)
     expect(linearApi.createComment).toHaveBeenCalledWith(
       "issue-1",
-      expect.stringContaining("Plan Approved"),
+      expect.stringContaining("Plan Passed Checks"),
     );
 
-    // Verify session ended as approved
+    // Session transitions to plan_review (awaiting user's "approve plan")
     state = await readPlanningState(configPath);
-    expect(state.sessions["proj-1"].status).toBe("approved");
+    expect(state.sessions["proj-1"].status).toBe("plan_review");
 
-    // Verify onApproved callback fired
-    expect(onApproved).toHaveBeenCalledWith("proj-1");
+    // Cross-model review ran (runAgent called for review prompt)
+    expect(runAgentMock).toHaveBeenCalled();
   });
 
   // =========================================================================
-  // Test 2: Audit fail → re-plan → pass
+  // Test 2: Audit fail → fix issues → re-audit → plan_review
   // =========================================================================
-  it("audit fail → fix issues → re-finalize → approved", async () => {
+  it("audit fail → fix issues → re-audit → plan_review", async () => {
     const { ctx, linearApi } = createCtx(configPath);
     const session = createSession(configPath);
 
@@ -233,7 +241,7 @@ describe("E2E planning pipeline", () => {
       comments: { nodes: [] },
     });
 
-    // First finalize — with issues that fail audit (missing descriptions/estimates)
+    // First audit — with issues that fail (missing descriptions/estimates)
     linearApi.getProjectIssues.mockResolvedValue([
       makeProjectIssue("PROJ-2", {
         title: "Bad issue",
@@ -249,74 +257,89 @@ describe("E2E planning pipeline", () => {
       expect.stringContaining("Plan Audit Failed"),
     );
 
-    // Session should still be interviewing (NOT approved)
+    // Session should still be interviewing (NOT plan_review)
     let state = await readPlanningState(configPath);
     expect(state.sessions["proj-1"].status).toBe("interviewing");
 
-    // Second finalize — with proper issues
+    // Second audit — with proper issues
     vi.clearAllMocks();
+    runAgentMock.mockResolvedValue({ success: true, output: "Review complete." });
     linearApi.getProjectIssues.mockResolvedValue(makePassingIssues());
 
-    const onApproved = vi.fn();
-    await runPlanAudit(ctx, session, { onApproved });
+    await runPlanAudit(ctx, session);
 
-    // Now should be approved
+    // Now should be plan_review (waiting for user approval via webhook)
     expect(linearApi.createComment).toHaveBeenCalledWith(
       "issue-1",
-      expect.stringContaining("Plan Approved"),
+      expect.stringContaining("Plan Passed Checks"),
     );
 
     state = await readPlanningState(configPath);
-    expect(state.sessions["proj-1"].status).toBe("approved");
-    expect(onApproved).toHaveBeenCalledWith("proj-1");
+    expect(state.sessions["proj-1"].status).toBe("plan_review");
   });
 
   // =========================================================================
-  // Test 3: Abandon
+  // Test 3: handlePlannerTurn is pure continue — no intent detection
   // =========================================================================
-  it("abandon: cancel planning ends session", async () => {
+  it("handlePlannerTurn always runs agent regardless of message content", async () => {
     const { ctx, linearApi } = createCtx(configPath);
     const session = createSession(configPath);
 
-    // Register session so endPlanningSession can find it
     const { registerPlanningSession } = await import("./planning-state.js");
     await registerPlanningSession("proj-1", session, configPath);
 
+    linearApi.getProjectIssues.mockResolvedValue([]);
+    linearApi.getIssueDetails.mockResolvedValue({
+      id: "issue-1",
+      identifier: "PROJ-1",
+      title: "Root Issue",
+      comments: { nodes: [] },
+    });
+
+    // Even "finalize plan" goes through the agent (intent detection is in webhook)
     await handlePlannerTurn(ctx, session, {
       issueId: "issue-1",
-      commentBody: "cancel planning",
+      commentBody: "finalize plan",
       commentorName: "User",
     });
 
-    // Verify abandonment comment
-    expect(linearApi.createComment).toHaveBeenCalledWith(
-      "issue-1",
-      expect.stringContaining("Planning mode ended"),
-    );
-
-    // Session ended as abandoned
-    const state = await readPlanningState(configPath);
-    expect(state.sessions["proj-1"].status).toBe("abandoned");
+    expect(runAgentMock).toHaveBeenCalledTimes(1);
+    expect(linearApi.createComment).toHaveBeenCalledWith("issue-1", "Mock planner response");
   });
 
   // =========================================================================
-  // Test 4: onApproved fires
+  // Test 4: Audit with warnings still passes
   // =========================================================================
-  it("onApproved callback fires with projectId on approval", async () => {
+  it("audit passes with warnings (AC warnings do not block)", async () => {
     const { ctx, linearApi } = createCtx(configPath);
     const session = createSession(configPath);
 
-    // Register session so endPlanningSession can update it
     const { registerPlanningSession } = await import("./planning-state.js");
     await registerPlanningSession("proj-1", session, configPath);
 
-    linearApi.getProjectIssues.mockResolvedValue(makePassingIssues());
+    // Issues that pass but lack AC markers → warnings
+    linearApi.getProjectIssues.mockResolvedValue([
+      makeProjectIssue("PROJ-2", {
+        title: "Search feature",
+        description: "Build the search API endpoint with filtering and pagination support for the frontend application.",
+        estimate: 3,
+        priority: 2,
+        labels: ["Epic"],
+      }),
+    ]);
 
-    const onApproved = vi.fn();
-    await runPlanAudit(ctx, session, { onApproved });
+    runAgentMock.mockResolvedValue({ success: true, output: "Review with warnings." });
 
-    expect(onApproved).toHaveBeenCalledTimes(1);
-    expect(onApproved).toHaveBeenCalledWith("proj-1");
+    await runPlanAudit(ctx, session);
+
+    // Still passes (warnings are not problems)
+    expect(linearApi.createComment).toHaveBeenCalledWith(
+      "issue-1",
+      expect.stringContaining("Plan Passed Checks"),
+    );
+
+    const state = await readPlanningState(configPath);
+    expect(state.sessions["proj-1"].status).toBe("plan_review");
   });
 
   // =========================================================================

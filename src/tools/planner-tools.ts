@@ -8,7 +8,7 @@
  * before/after calling runAgent(). Tools read from this module-level context
  * at execution time (same pattern as active-session.ts).
  */
-import type { AnyAgentTool } from "openclaw/plugin-sdk";
+import type { AnyAgentTool, OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { jsonResult } from "openclaw/plugin-sdk";
 import type { LinearAgentApi } from "../api/linear-api.js";
 
@@ -20,6 +20,8 @@ export interface PlannerToolContext {
   linearApi: LinearAgentApi;
   projectId: string;
   teamId: string;
+  api: OpenClawPluginApi;
+  pluginConfig?: Record<string, unknown>;
 }
 
 // ---------------------------------------------------------------------------
@@ -151,6 +153,12 @@ export function auditPlan(issues: ProjectIssue[]): AuditResult {
       if (!issue.priority || issue.priority === 0) {
         problems.push(`${issue.identifier} "${issue.title}": missing priority`);
       }
+
+      // Acceptance criteria check (warning, not failure)
+      const acMarkers = /\b(given|when|then|as a|i want|so that|acceptance criteria|uat|test scenario)\b/i;
+      if (issue.description && !acMarkers.test(issue.description)) {
+        warnings.push(`${issue.identifier} "${issue.title}": no acceptance criteria or test scenarios found in description`);
+      }
     }
   }
 
@@ -262,7 +270,7 @@ export function createPlannerTools(): AnyAgentTool[] {
         type: "object",
         properties: {
           title: { type: "string", description: "Issue title" },
-          description: { type: "string", description: "Issue description with acceptance criteria (min 50 chars)" },
+          description: { type: "string", description: "Issue description including: user story (As a...), acceptance criteria (Given/When/Then), and at least one UAT test scenario (min 50 chars)" },
           parentIdentifier: { type: "string", description: "Parent issue identifier (e.g. PROJ-2) to create as sub-issue" },
           isEpic: { type: "boolean", description: "Mark as epic (high-level feature area)" },
           priority: { type: "number", description: "Priority: 1=Urgent, 2=High, 3=Medium, 4=Low" },

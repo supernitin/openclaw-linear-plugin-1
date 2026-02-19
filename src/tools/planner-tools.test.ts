@@ -30,7 +30,7 @@ function makeIssue(overrides: Partial<ProjectIssue> & { identifier: string; titl
     id: overrides.id ?? overrides.identifier.toLowerCase().replace("-", "_"),
     identifier: overrides.identifier,
     title: overrides.title,
-    description: "description" in overrides ? overrides.description : "A sufficiently long description that is at least fifty characters for validation",
+    description: "description" in overrides ? overrides.description : "As a user, I want this feature so that I can be productive. Given I am logged in, When I click the button, Then the action completes.",
     estimate: "estimate" in overrides ? overrides.estimate : 3,
     priority: "priority" in overrides ? overrides.priority : 2,
     labels: overrides.labels ?? { nodes: [] },

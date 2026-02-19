@@ -11,10 +11,11 @@ import { assessTier } from "./tier-assess.js";
 import { createWorktree, createMultiWorktree, prepareWorkspace } from "../infra/codex-worktree.js";
 import { resolveRepos, isMultiRepo } from "../infra/multi-repo.js";
 import { ensureClawDir, writeManifest, writeDispatchMemory, resolveOrchestratorWorkspace } from "./artifacts.js";
-import { readPlanningState, isInPlanningMode, getPlanningSession } from "./planning-state.js";
-import { initiatePlanningSession, handlePlannerTurn } from "./planner.js";
+import { readPlanningState, isInPlanningMode, getPlanningSession, endPlanningSession } from "./planning-state.js";
+import { initiatePlanningSession, handlePlannerTurn, runPlanAudit } from "./planner.js";
 import { startProjectDispatch } from "./dag-dispatch.js";
 import { emitDiagnostic } from "../infra/observability.js";
+import { classifyIntent } from "./intent-classify.js";
 
 // ── Agent profiles (loaded from config, no hardcoded names) ───────
 interface AgentProfile {
@@ -659,7 +660,7 @@ export async function handleLinearWebhook(
     return true;
   }
 
-  // ── Comment.create — @mention routing to agents ─────────────────
+  // ── Comment.create — intent-based routing ────────────────────────
   if (payload.type === "Comment" && payload.action === "create") {
     res.statusCode = 200;
     res.end("ok");
@@ -668,265 +669,211 @@ export async function handleLinearWebhook(
     const commentBody = comment?.body ?? "";
     const commentor = comment?.user?.name ?? "Unknown";
     const issue = comment?.issue ?? payload.issue;
-
-    // ── Planning mode intercept ──────────────────────────────────
     const pluginConfig = (api as any).pluginConfig as Record<string, unknown> | undefined;
-
-    if (issue?.id) {
-      const linearApiForPlanning = createLinearApi(api);
-      if (linearApiForPlanning) {
-        try {
-          const enriched = await linearApiForPlanning.getIssueDetails(issue.id);
-          const projectId = enriched?.project?.id;
-          const planStatePath = pluginConfig?.planningStatePath as string | undefined;
-
-          if (projectId) {
-            const planState = await readPlanningState(planStatePath);
-
-            // Check if this is a plan initiation request
-            const isPlanRequest = /\b(plan|planning)\s+(this\s+)(project|out)\b/i.test(commentBody) || /\bplan\s+this\s+out\b/i.test(commentBody);
-            if (isPlanRequest && !isInPlanningMode(planState, projectId)) {
-              api.logger.info(`Planning: initiation requested on ${issue.identifier ?? issue.id}`);
-              void initiatePlanningSession(
-                { api, linearApi: linearApiForPlanning, pluginConfig },
-                projectId,
-                { id: issue.id, identifier: enriched.identifier, title: enriched.title, team: enriched.team },
-              ).catch((err) => api.logger.error(`Planning initiation error: ${err}`));
-              return true;
-            }
-
-            // Route to planner if project is in planning mode
-            if (isInPlanningMode(planState, projectId)) {
-              const session = getPlanningSession(planState, projectId);
-              if (!session) {
-                api.logger.error(`Planning: project ${projectId} in planning mode but no session found — state may be corrupted`);
-                await linearApiForPlanning.createComment(
-                  issue.id,
-                  `**Planning mode is active** for this project, but the session state appears corrupted.\n\n**To fix:** Say **"abandon planning"** to exit planning mode, then start fresh with **"plan this project"**.`,
-                ).catch(() => {});
-                return true;
-              }
-              if (comment?.id && !wasRecentlyProcessed(`plan-comment:${comment.id}`)) {
-                api.logger.info(`Planning: routing comment to planner for ${session.projectName}`);
-                void handlePlannerTurn(
-                  { api, linearApi: linearApiForPlanning, pluginConfig },
-                  session,
-                  { issueId: issue.id, commentBody, commentorName: commentor },
-                  {
-                    onApproved: (approvedProjectId) => {
-                      const notify = createNotifierFromConfig(pluginConfig, api.runtime, api);
-                      const hookCtx: HookContext = {
-                        api,
-                        linearApi: linearApiForPlanning,
-                        notify,
-                        pluginConfig,
-                        configPath: pluginConfig?.dispatchStatePath as string | undefined,
-                      };
-                      void startProjectDispatch(hookCtx, approvedProjectId)
-                        .catch((err) => api.logger.error(`Project dispatch start error: ${err}`));
-                    },
-                  },
-                ).catch((err) => api.logger.error(`Planner turn error: ${err}`));
-              }
-              return true;
-            }
-          }
-        } catch (err) {
-          api.logger.warn(`Planning mode check failed: ${err}`);
-        }
-      }
-    }
-
-    // Load agent profiles and build mention pattern dynamically.
-    // Default agent (app mentions) is handled by AgentSessionEvent — never here.
-    const profiles = loadAgentProfiles();
-    const mentionPattern = buildMentionPattern(profiles);
-    if (!mentionPattern) {
-      api.logger.info("Comment webhook: no sub-agent profiles configured, ignoring");
-      return true;
-    }
-
-    const matches = commentBody.match(mentionPattern);
-    if (!matches || matches.length === 0) {
-      api.logger.info("Comment webhook: no sub-agent mentions found, ignoring");
-      return true;
-    }
-
-    const alias = matches[0].replace("@", "");
-    const resolved = resolveAgentFromAlias(alias, profiles);
-    if (!resolved) {
-      api.logger.info(`Comment webhook: alias "${alias}" not found in profiles, ignoring`);
-      return true;
-    }
-
-    const mentionedAgent = resolved.agentId;
 
     if (!issue?.id) {
       api.logger.error("Comment webhook: missing issue data");
       return true;
     }
 
-    const linearApi = createLinearApi(api);
-    if (!linearApi) {
-      api.logger.error("No Linear access token — cannot process comment mention");
-      return true;
-    }
-
-    // Dedup on comment ID — prevent processing same comment twice
+    // Dedup on comment ID
     if (comment?.id && wasRecentlyProcessed(`comment:${comment.id}`)) {
       api.logger.info(`Comment ${comment.id} already processed — skipping`);
       return true;
     }
 
-    api.logger.info(`Comment mention: @${mentionedAgent} on ${issue.identifier ?? issue.id} by ${commentor}`);
-
-    // Guard: skip if an agent run is already active for this issue
-    // (prevents dual-dispatch when both Comment.create and AgentSessionEvent fire)
-    if (activeRuns.has(issue.id)) {
-      api.logger.info(`Comment mention: agent already running for ${issue.identifier ?? issue.id} — skipping`);
+    const linearApi = createLinearApi(api);
+    if (!linearApi) {
+      api.logger.error("No Linear access token — cannot process comment");
       return true;
     }
-    activeRuns.add(issue.id);
 
-    // React with eyes to acknowledge the comment
-    if (comment?.id) {
-      linearApi.createReaction(comment.id, "eyes").catch(() => {});
+    // Skip bot's own comments
+    try {
+      const viewerId = await linearApi.getViewerId();
+      if (viewerId && comment?.user?.id === viewerId) {
+        api.logger.info(`Comment webhook: skipping our own comment on ${issue.identifier ?? issue.id}`);
+        return true;
+      }
+    } catch { /* proceed if viewerId check fails */ }
+
+    // Load agent profiles
+    const profiles = loadAgentProfiles();
+    const agentNames = Object.keys(profiles);
+
+    // ── @mention fast path — skip classifier ────────────────────
+    const mentionPattern = buildMentionPattern(profiles);
+    const mentionMatches = mentionPattern ? commentBody.match(mentionPattern) : null;
+    if (mentionMatches && mentionMatches.length > 0) {
+      const alias = mentionMatches[0].replace("@", "");
+      const resolved = resolveAgentFromAlias(alias, profiles);
+      if (resolved) {
+        api.logger.info(`Comment @mention fast path: @${resolved.agentId} on ${issue.identifier ?? issue.id}`);
+        void dispatchCommentToAgent(api, linearApi, profiles, resolved.agentId, issue, comment, commentBody, commentor, pluginConfig)
+          .catch((err) => api.logger.error(`Comment dispatch error: ${err}`));
+        return true;
+      }
     }
 
-    // Fetch full issue details from Linear API for richer context
-    let enrichedIssue = issue;
-    let recentComments = "";
+    // ── Intent classification ─────────────────────────────────────
+    // Fetch issue details for context
+    let enrichedIssue: any = issue;
     try {
-      const full = await linearApi.getIssueDetails(issue.id);
-      enrichedIssue = { ...issue, ...full };
-      // Include last few comments for context (excluding the triggering comment)
-      const comments = full.comments?.nodes ?? [];
-      const relevant = comments
-        .filter((c: any) => c.body !== commentBody)
-        .slice(-3)
-        .map((c: any) => `  - **${c.user?.name ?? "Unknown"}**: ${c.body.slice(0, 200)}`)
-        .join("\n");
-      if (relevant) recentComments = `\n**Recent Comments:**\n${relevant}\n`;
+      enrichedIssue = await linearApi.getIssueDetails(issue.id);
     } catch (err) {
       api.logger.warn(`Could not fetch issue details: ${err}`);
     }
 
-    const priority = ["No Priority", "Urgent (P1)", "High (P2)", "Medium (P3)", "Low (P4)"][enrichedIssue.priority] ?? "Unknown";
-    const labels = enrichedIssue.labels?.nodes?.map((l: any) => l.name).join(", ") || "None";
-    const state = enrichedIssue.state?.name ?? "Unknown";
-    const assignee = enrichedIssue.assignee?.name ?? "Unassigned";
+    const projectId = enrichedIssue?.project?.id;
+    const planStatePath = pluginConfig?.planningStatePath as string | undefined;
 
-    const taskMessage = [
-      `You are an orchestrator responding to a Linear issue comment. Your text output will be automatically posted as a comment on the issue (do NOT post a comment yourself — the handler does it).`,
-      ``,
-      `**Tool access:**`,
-      `- \`linearis\` CLI: READ ONLY. You can read issues (\`linearis issues read ${enrichedIssue.identifier ?? "API-XXX"}\`), list issues (\`linearis issues list\`), and search (\`linearis issues search "..."\`). Do NOT use linearis to update, close, comment, or modify issues.`,
-      `- \`code_run\`: Dispatch coding work to a worker. Workers return text — they cannot access linearis.`,
-      `- Standard tools: exec, read, edit, write, web_search, etc.`,
-      ``,
-      `**Your role:** You are the dispatcher. For any coding or implementation work, use \`code_run\` to dispatch it. Workers return text output. You summarize results. You do NOT update issue status or post linearis comments — the audit system handles lifecycle transitions.`,
-      ``,
-      `**Issue:** ${enrichedIssue.identifier ?? enrichedIssue.id} — ${enrichedIssue.title ?? "(untitled)"}`,
-      `**Status:** ${state} | **Priority:** ${priority} | **Assignee:** ${assignee} | **Labels:** ${labels}`,
-      `**URL:** ${enrichedIssue.url ?? "N/A"}`,
-      ``,
-      enrichedIssue.description ? `**Description:**\n${enrichedIssue.description}\n` : "",
-      recentComments,
-      `**${commentor} wrote:**`,
-      `> ${commentBody}`,
-      ``,
-      `Respond to their message. Be concise and direct. For work requests, dispatch via \`code_run\` and summarize the result.`,
-    ].filter(Boolean).join("\n");
-
-    // Dispatch to agent with full session lifecycle (non-blocking)
-    void (async () => {
-      const label = resolved.label;
-      const profile = profiles[mentionedAgent];
-      let agentSessionId: string | null = null;
-
+    // Determine planning state
+    let isPlanning = false;
+    let planSession: any = null;
+    if (projectId) {
       try {
-        // 1. Create agent session (non-fatal if fails)
-        const sessionResult = await linearApi.createSessionOnIssue(issue.id);
-        agentSessionId = sessionResult.sessionId;
-        if (agentSessionId) {
-          api.logger.info(`Created agent session ${agentSessionId} for @${mentionedAgent}`);
-          // Register active session so code_run can resolve it automatically
-          setActiveSession({
-            agentSessionId,
-            issueIdentifier: enrichedIssue.identifier ?? issue.id,
-            issueId: issue.id,
-            agentId: mentionedAgent,
-            startedAt: Date.now(),
-          });
-        } else {
-          api.logger.warn(`Could not create agent session for @${mentionedAgent}: ${sessionResult.error ?? "unknown"} — falling back to flat comment`);
+        const planState = await readPlanningState(planStatePath);
+        isPlanning = isInPlanningMode(planState, projectId);
+        if (isPlanning) {
+          planSession = getPlanningSession(planState, projectId);
         }
+      } catch { /* proceed without planning context */ }
+    }
 
-        // 2. Emit thought
-        if (agentSessionId) {
-          await linearApi.emitActivity(agentSessionId, {
-            type: "thought",
-            body: `Reviewing ${enrichedIssue.identifier ?? issue.id}...`,
-          }).catch(() => {});
+    const intentResult = await classifyIntent(api, {
+      commentBody,
+      issueTitle: enrichedIssue?.title ?? "(untitled)",
+      issueStatus: enrichedIssue?.state?.name,
+      isPlanning,
+      agentNames,
+      hasProject: !!projectId,
+    }, pluginConfig);
+
+    api.logger.info(`Comment intent: ${intentResult.intent}${intentResult.agentId ? ` (agent: ${intentResult.agentId})` : ""} — ${intentResult.reasoning} (fallback: ${intentResult.fromFallback})`);
+
+    // ── Route by intent ────────────────────────────────────────────
+
+    switch (intentResult.intent) {
+      case "plan_start": {
+        if (!projectId) {
+          api.logger.info("Comment intent plan_start but no project — ignoring");
+          break;
         }
-
-        // 3. Run agent subprocess with streaming
-        const sessionId = `linear-comment-${comment.id ?? Date.now()}`;
-        const { runAgent } = await import("../agent/agent.js");
-        const result = await runAgent({
-          api,
-          agentId: mentionedAgent,
-          sessionId,
-          message: taskMessage,
-          timeoutMs: 3 * 60_000,
-          streaming: agentSessionId ? { linearApi, agentSessionId } : undefined,
-        });
-
-        const responseBody = result.success
-          ? result.output
-          : `Something went wrong while processing this. If this keeps happening, run \`openclaw openclaw-linear doctor\` to check for issues.`;
-
-        // 5. Post branded comment (fall back to [Label] prefix if branding fails)
-        const brandingOpts = profile?.avatarUrl
-          ? { createAsUser: label, displayIconUrl: profile.avatarUrl }
-          : undefined;
-
-        try {
-          if (brandingOpts) {
-            await linearApi.createComment(issue.id, responseBody, brandingOpts);
-          } else {
-            await linearApi.createComment(issue.id, `**[${label}]** ${responseBody}`);
+        if (isPlanning) {
+          api.logger.info("Comment intent plan_start but already planning — treating as plan_continue");
+          // Fall through to plan_continue
+          if (planSession) {
+            void handlePlannerTurn(
+              { api, linearApi, pluginConfig },
+              planSession,
+              { issueId: issue.id, commentBody, commentorName: commentor },
+            ).catch((err) => api.logger.error(`Planner turn error: ${err}`));
           }
-        } catch (brandErr) {
-          api.logger.warn(`Branded comment failed, falling back to prefix: ${brandErr}`);
-          await linearApi.createComment(issue.id, `**[${label}]** ${responseBody}`);
+          break;
         }
-
-        // 6. Emit response activity (closes the session)
-        if (agentSessionId) {
-          const truncated = responseBody.length > 2000
-            ? responseBody.slice(0, 2000) + "\u2026"
-            : responseBody;
-          await linearApi.emitActivity(agentSessionId, {
-            type: "response",
-            body: truncated,
-          }).catch(() => {});
-        }
-
-        api.logger.info(`Posted @${mentionedAgent} response to ${issue.identifier ?? issue.id}`);
-      } catch (err) {
-        api.logger.error(`Comment mention handler error: ${err}`);
-        if (agentSessionId) {
-          await linearApi.emitActivity(agentSessionId, {
-            type: "error",
-            body: `Failed to process mention: ${String(err).slice(0, 500)}`,
-          }).catch(() => {});
-        }
-      } finally {
-        clearActiveSession(issue.id);
-        activeRuns.delete(issue.id);
+        api.logger.info(`Planning: initiation requested on ${issue.identifier ?? issue.id}`);
+        void initiatePlanningSession(
+          { api, linearApi, pluginConfig },
+          projectId,
+          { id: issue.id, identifier: enrichedIssue.identifier, title: enrichedIssue.title, team: enrichedIssue.team },
+        ).catch((err) => api.logger.error(`Planning initiation error: ${err}`));
+        break;
       }
-    })();
+
+      case "plan_finalize": {
+        if (!isPlanning || !planSession) {
+          api.logger.info("Comment intent plan_finalize but not in planning mode — ignoring");
+          break;
+        }
+        if (planSession.status === "plan_review") {
+          // Already passed audit + cross-model review — approve directly
+          api.logger.info(`Planning: approving plan for ${planSession.projectName} (from plan_review)`);
+          void (async () => {
+            try {
+              await endPlanningSession(planSession.projectId, "approved", planStatePath);
+              await linearApi.createComment(
+                planSession.rootIssueId,
+                `## Plan Approved\n\nPlan for **${planSession.projectName}** has been approved. Dispatching to workers.`,
+              );
+              // Trigger DAG dispatch
+              const notify = createNotifierFromConfig(pluginConfig, api.runtime, api);
+              const hookCtx: HookContext = {
+                api, linearApi, notify, pluginConfig,
+                configPath: pluginConfig?.dispatchStatePath as string | undefined,
+              };
+              await startProjectDispatch(hookCtx, planSession.projectId);
+            } catch (err) {
+              api.logger.error(`Plan approval error: ${err}`);
+            }
+          })();
+        } else {
+          // Still interviewing — run audit (which transitions to plan_review)
+          void runPlanAudit(
+            { api, linearApi, pluginConfig },
+            planSession,
+          ).catch((err) => api.logger.error(`Plan audit error: ${err}`));
+        }
+        break;
+      }
+
+      case "plan_abandon": {
+        if (!isPlanning || !planSession) {
+          api.logger.info("Comment intent plan_abandon but not in planning mode — ignoring");
+          break;
+        }
+        void (async () => {
+          try {
+            await endPlanningSession(planSession.projectId, "abandoned", planStatePath);
+            await linearApi.createComment(
+              planSession.rootIssueId,
+              `Planning mode ended for **${planSession.projectName}**. Session abandoned.`,
+            );
+            api.logger.info(`Planning: session abandoned for ${planSession.projectName}`);
+          } catch (err) {
+            api.logger.error(`Plan abandon error: ${err}`);
+          }
+        })();
+        break;
+      }
+
+      case "plan_continue": {
+        if (!isPlanning || !planSession) {
+          // Not in planning mode — treat as general
+          api.logger.info("Comment intent plan_continue but not in planning mode — dispatching to default agent");
+          void dispatchCommentToAgent(api, linearApi, profiles, resolveAgentId(api), issue, comment, commentBody, commentor, pluginConfig)
+            .catch((err) => api.logger.error(`Comment dispatch error: ${err}`));
+          break;
+        }
+        void handlePlannerTurn(
+          { api, linearApi, pluginConfig },
+          planSession,
+          { issueId: issue.id, commentBody, commentorName: commentor },
+        ).catch((err) => api.logger.error(`Planner turn error: ${err}`));
+        break;
+      }
+
+      case "ask_agent": {
+        const targetAgent = intentResult.agentId ?? resolveAgentId(api);
+        api.logger.info(`Comment intent ask_agent: routing to ${targetAgent}`);
+        void dispatchCommentToAgent(api, linearApi, profiles, targetAgent, issue, comment, commentBody, commentor, pluginConfig)
+          .catch((err) => api.logger.error(`Comment dispatch error: ${err}`));
+        break;
+      }
+
+      case "request_work":
+      case "question": {
+        const defaultAgent = resolveAgentId(api);
+        api.logger.info(`Comment intent ${intentResult.intent}: routing to default agent ${defaultAgent}`);
+        void dispatchCommentToAgent(api, linearApi, profiles, defaultAgent, issue, comment, commentBody, commentor, pluginConfig)
+          .catch((err) => api.logger.error(`Comment dispatch error: ${err}`));
+        break;
+      }
+
+      case "general":
+      default:
+        api.logger.info(`Comment intent general: no action taken for ${issue.identifier ?? issue.id}`);
+        break;
+    }
 
     return true;
   }
@@ -1009,6 +956,7 @@ export async function handleLinearWebhook(
 
     api.logger.info(`Issue.create: ${issue.identifier ?? issue.id} — ${issue.title ?? "(untitled)"}`);
 
+    const pluginConfig = (api as any).pluginConfig as Record<string, unknown> | undefined;
     const linearApi = createLinearApi(api);
     if (!linearApi) {
       api.logger.error("No Linear access token — cannot triage new issue");
@@ -1235,6 +1183,154 @@ export async function handleLinearWebhook(
   res.statusCode = 200;
   res.end("ok");
   return true;
+}
+
+// ── Comment dispatch helper ───────────────────────────────────────
+//
+// Dispatches a comment to a specific agent. Used by intent-based routing
+// and @mention fast path.
+
+async function dispatchCommentToAgent(
+  api: OpenClawPluginApi,
+  linearApi: LinearAgentApi,
+  profiles: Record<string, AgentProfile>,
+  agentId: string,
+  issue: any,
+  comment: any,
+  commentBody: string,
+  commentor: string,
+  pluginConfig?: Record<string, unknown>,
+): Promise<void> {
+  const profile = profiles[agentId];
+  const label = profile?.label ?? agentId;
+  const avatarUrl = profile?.avatarUrl;
+
+  // Guard: prevent concurrent runs on same issue
+  if (activeRuns.has(issue.id)) {
+    api.logger.info(`dispatchCommentToAgent: ${issue.identifier ?? issue.id} has active run — skipping`);
+    return;
+  }
+
+  // Fetch full issue details
+  let enrichedIssue: any = issue;
+  try {
+    enrichedIssue = await linearApi.getIssueDetails(issue.id);
+  } catch (err) {
+    api.logger.warn(`Could not fetch issue details: ${err}`);
+  }
+
+  const description = enrichedIssue?.description ?? issue?.description ?? "(no description)";
+  const comments = enrichedIssue?.comments?.nodes ?? [];
+  const commentSummary = comments
+    .slice(-5)
+    .map((c: any) => `**${c.user?.name ?? "Unknown"}**: ${(c.body ?? "").slice(0, 200)}`)
+    .join("\n");
+
+  const issueRef = enrichedIssue?.identifier ?? issue.identifier ?? issue.id;
+  const message = [
+    `You are an orchestrator responding to a Linear comment. Your text output will be automatically posted as a comment on the issue (do NOT post a comment yourself — the handler does it).`,
+    ``,
+    `**Tool access:**`,
+    `- \`linearis\` CLI: READ ONLY. You can read issues (\`linearis issues read ${issueRef}\`), list, and search. Do NOT use linearis to update, close, comment, or modify issues.`,
+    `- \`code_run\`: Dispatch coding work to a worker. Workers return text — they cannot access linearis.`,
+    `- Standard tools: exec, read, edit, write, web_search, etc.`,
+    ``,
+    `**Your role:** Dispatcher. For work requests, use \`code_run\`. You do NOT update issue status — the audit system handles lifecycle.`,
+    ``,
+    `## Issue: ${issueRef} — ${enrichedIssue?.title ?? issue.title ?? "(untitled)"}`,
+    `**Status:** ${enrichedIssue?.state?.name ?? "Unknown"} | **Assignee:** ${enrichedIssue?.assignee?.name ?? "Unassigned"}`,
+    ``,
+    `**Description:**`,
+    description,
+    commentSummary ? `\n**Recent comments:**\n${commentSummary}` : "",
+    `\n**${commentor} says:**\n> ${commentBody}`,
+    ``,
+    `Respond concisely. For work requests, dispatch via \`code_run\` and summarize the result.`,
+  ].filter(Boolean).join("\n");
+
+  // Dispatch with session lifecycle
+  activeRuns.add(issue.id);
+  let agentSessionId: string | null = null;
+
+  try {
+    // Create agent session (non-fatal)
+    const sessionResult = await linearApi.createSessionOnIssue(issue.id);
+    agentSessionId = sessionResult.sessionId;
+    if (agentSessionId) {
+      wasRecentlyProcessed(`session:${agentSessionId}`);
+      setActiveSession({
+        agentSessionId,
+        issueIdentifier: enrichedIssue?.identifier ?? issue.identifier ?? issue.id,
+        issueId: issue.id,
+        agentId,
+        startedAt: Date.now(),
+      });
+    }
+
+    // Emit thought
+    if (agentSessionId) {
+      await linearApi.emitActivity(agentSessionId, {
+        type: "thought",
+        body: `Processing comment on ${issueRef}...`,
+      }).catch(() => {});
+    }
+
+    // Run agent
+    const sessionId = `linear-comment-${agentId}-${Date.now()}`;
+    const { runAgent } = await import("../agent/agent.js");
+    const result = await runAgent({
+      api,
+      agentId,
+      sessionId,
+      message,
+      timeoutMs: 3 * 60_000,
+      streaming: agentSessionId ? { linearApi, agentSessionId } : undefined,
+    });
+
+    const responseBody = result.success
+      ? result.output
+      : `Something went wrong while processing this. The system will retry automatically if possible.`;
+
+    // Post branded comment
+    const brandingOpts = avatarUrl
+      ? { createAsUser: label, displayIconUrl: avatarUrl }
+      : undefined;
+
+    try {
+      if (brandingOpts) {
+        await linearApi.createComment(issue.id, responseBody, brandingOpts);
+      } else {
+        await linearApi.createComment(issue.id, `**[${label}]** ${responseBody}`);
+      }
+    } catch (brandErr) {
+      api.logger.warn(`Branded comment failed, falling back to prefix: ${brandErr}`);
+      await linearApi.createComment(issue.id, `**[${label}]** ${responseBody}`);
+    }
+
+    // Emit response (closes session)
+    if (agentSessionId) {
+      const truncated = responseBody.length > 2000
+        ? responseBody.slice(0, 2000) + "…"
+        : responseBody;
+      await linearApi.emitActivity(agentSessionId, {
+        type: "response",
+        body: truncated,
+      }).catch(() => {});
+    }
+
+    api.logger.info(`Posted ${agentId} response to ${issueRef}`);
+  } catch (err) {
+    api.logger.error(`dispatchCommentToAgent error: ${err}`);
+    if (agentSessionId) {
+      await linearApi.emitActivity(agentSessionId, {
+        type: "error",
+        body: `Failed to process comment: ${String(err).slice(0, 500)}`,
+      }).catch(() => {});
+    }
+  } finally {
+    clearActiveSession(issue.id);
+    activeRuns.delete(issue.id);
+  }
 }
 
 // ── @dispatch handler ─────────────────────────────────────────────
