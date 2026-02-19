@@ -13,6 +13,13 @@ import { resolveLinearToken, AUTH_PROFILES_PATH, LINEAR_GRAPHQL_URL } from "../a
 import { LINEAR_OAUTH_AUTH_URL, LINEAR_OAUTH_TOKEN_URL, LINEAR_AGENT_SCOPES } from "../api/auth.js";
 import { listWorktrees } from "./codex-worktree.js";
 import { loadPrompts, clearPromptCache } from "../pipeline/pipeline.js";
+import {
+  formatMessage,
+  parseNotificationsConfig,
+  sendToTarget,
+  type NotifyKind,
+  type NotifyPayload,
+} from "./notify.js";
 
 function prompt(question: string): Promise<string> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -339,6 +346,186 @@ export function registerCli(program: Command, api: OpenClawPluginApi): void {
         }
       } catch (err) {
         console.error(`\nFailed to load prompts: ${err}\n`);
+        process.exitCode = 1;
+      }
+    });
+
+  // --- openclaw openclaw-linear notify ---
+  const notifyCmd = linear
+    .command("notify")
+    .description("Manage dispatch lifecycle notifications");
+
+  notifyCmd
+    .command("status")
+    .description("Show current notification target configuration")
+    .action(async () => {
+      const pluginConfig = (api as any).pluginConfig as Record<string, unknown> | undefined;
+      const config = parseNotificationsConfig(pluginConfig);
+
+      console.log("\nNotification Targets");
+      console.log("─".repeat(50));
+
+      if (!config.targets?.length) {
+        console.log("\n  No notification targets configured.");
+        console.log("  Run 'openclaw openclaw-linear notify setup' to configure.\n");
+        return;
+      }
+
+      for (const t of config.targets) {
+        const acct = t.accountId ? ` (account: ${t.accountId})` : "";
+        console.log(`  ${t.channel}:  ${t.target}${acct}`);
+      }
+
+      // Show event toggles if any are suppressed
+      const suppressed = Object.entries(config.events ?? {})
+        .filter(([, v]) => v === false)
+        .map(([k]) => k);
+      if (suppressed.length > 0) {
+        console.log(`\n  Suppressed events: ${suppressed.join(", ")}`);
+      }
+
+      console.log();
+    });
+
+  notifyCmd
+    .command("test")
+    .description("Send a test notification to all configured targets")
+    .option("--channel <name>", "Test only targets for a specific channel (discord, slack, telegram, etc.)")
+    .action(async (opts: { channel?: string }) => {
+      const pluginConfig = (api as any).pluginConfig as Record<string, unknown> | undefined;
+      const config = parseNotificationsConfig(pluginConfig);
+
+      const testPayload: NotifyPayload = {
+        identifier: "TEST-0",
+        title: "Test notification from Linear plugin",
+        status: "test",
+      };
+      const testKind: NotifyKind = "dispatch";
+      const message = formatMessage(testKind, testPayload);
+
+      console.log("\nSending test notification...\n");
+
+      if (!config.targets?.length) {
+        console.error("  No notification targets configured. Run 'openclaw openclaw-linear notify setup' first.\n");
+        process.exitCode = 1;
+        return;
+      }
+
+      const targets = opts.channel
+        ? config.targets.filter((t) => t.channel === opts.channel)
+        : config.targets;
+
+      if (targets.length === 0) {
+        console.error(`  No targets found for channel "${opts.channel}".\n`);
+        process.exitCode = 1;
+        return;
+      }
+
+      for (const target of targets) {
+        try {
+          await sendToTarget(target, message, api.runtime);
+          console.log(`  ${target.channel}:  SENT to ${target.target}`);
+          console.log(`            "${message}"`);
+        } catch (err) {
+          console.error(`  ${target.channel}:  FAILED — ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+
+      console.log();
+    });
+
+  notifyCmd
+    .command("setup")
+    .description("Interactive setup for notification targets")
+    .action(async () => {
+      const pluginConfig = (api as any).pluginConfig as Record<string, unknown> | undefined;
+      const config = parseNotificationsConfig(pluginConfig);
+
+      console.log("\nNotification Target Setup");
+      console.log("─".repeat(50));
+      console.log("  Dispatch lifecycle notifications can be sent to any OpenClaw channel.");
+      console.log("  Add multiple targets for fan-out delivery.\n");
+
+      // Show current targets
+      if (config.targets?.length) {
+        console.log("  Current targets:");
+        for (const t of config.targets) {
+          const acct = t.accountId ? ` (account: ${t.accountId})` : "";
+          console.log(`    ${t.channel}: ${t.target}${acct}`);
+        }
+        console.log();
+      }
+
+      const newTargets = [...(config.targets ?? [])];
+      const supportedChannels = ["discord", "slack", "telegram", "signal"];
+
+      // Add targets loop
+      let addMore = true;
+      while (addMore) {
+        const channelAnswer = await prompt(
+          `Add notification target? (${supportedChannels.join("/")}) or blank to finish: `,
+        );
+        if (!channelAnswer) {
+          addMore = false;
+          break;
+        }
+
+        const channel = channelAnswer.toLowerCase().trim();
+        const targetId = await prompt(`  ${channel} target ID (channel/group/user): `);
+        if (!targetId) continue;
+
+        let accountId: string | undefined;
+        if (channel === "slack") {
+          const acct = await prompt("  Slack account ID (leave blank for default): ");
+          accountId = acct || undefined;
+        }
+
+        newTargets.push({ channel, target: targetId, ...(accountId ? { accountId } : {}) });
+        console.log(`  Added: ${channel} → ${targetId}\n`);
+      }
+
+      // Summary
+      console.log("\nConfiguration Summary");
+      console.log("─".repeat(50));
+      if (newTargets.length === 0) {
+        console.log("  No targets configured (notifications disabled).");
+      } else {
+        for (const t of newTargets) {
+          const acct = t.accountId ? ` (account: ${t.accountId})` : "";
+          console.log(`  ${t.channel}: ${t.target}${acct}`);
+        }
+      }
+
+      if (JSON.stringify(newTargets) === JSON.stringify(config.targets ?? [])) {
+        console.log("\n  No changes made.\n");
+        return;
+      }
+
+      // Write config
+      const confirmAnswer = await prompt("\nApply these changes? [Y/n]: ");
+      if (confirmAnswer.toLowerCase() === "n") {
+        console.log("  Aborted.\n");
+        return;
+      }
+
+      try {
+        const runtimeConfig = api.runtime.config.loadConfig() as Record<string, any>;
+        const pluginEntries = runtimeConfig.plugins?.entries ?? {};
+        const linearConfig = pluginEntries["openclaw-linear"]?.config ?? {};
+        linearConfig.notifications = {
+          ...linearConfig.notifications,
+          targets: newTargets,
+        };
+        pluginEntries["openclaw-linear"] = {
+          ...pluginEntries["openclaw-linear"],
+          config: linearConfig,
+        };
+        runtimeConfig.plugins = { ...runtimeConfig.plugins, entries: pluginEntries };
+        api.runtime.config.writeConfigFile(runtimeConfig);
+        console.log("\n  Configuration saved. Restart gateway to apply: systemctl --user restart openclaw-gateway\n");
+      } catch (err) {
+        console.error(`\n  Failed to save config: ${err instanceof Error ? err.message : String(err)}`);
+        console.error("  You can manually add these values to openclaw.json → plugins.entries.openclaw-linear.config\n");
         process.exitCode = 1;
       }
     });

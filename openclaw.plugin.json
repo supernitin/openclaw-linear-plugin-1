@@ -2,7 +2,7 @@
   "id": "openclaw-linear",
   "name": "Linear Agent",
   "description": "Linear integration with OAuth support, agent pipeline, and webhook-driven AI agent lifecycle",
-  "version": "0.2.0",
+  "version": "0.7.0",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -20,7 +20,40 @@
       "enableOrchestration": { "type": "boolean", "description": "Allow agents to spawn sub-agents via spawn_agent/ask_agent tools", "default": true },
       "worktreeBaseDir": { "type": "string", "description": "Base directory for persistent git worktrees (default: ~/.openclaw/worktrees)" },
       "dispatchStatePath": { "type": "string", "description": "Path to dispatch state JSON file (default: ~/.openclaw/linear-dispatch-state.json)" },
-      "flowDiscordChannel": { "type": "string", "description": "Discord channel ID for dispatch lifecycle notifications (omit to disable)" },
+      "planningStatePath": { "type": "string", "description": "Path to planning state JSON file (default: ~/.openclaw/linear-planning-state.json)" },
+      "notifications": {
+        "type": "object",
+        "description": "Dispatch lifecycle notification config — fan-out to any combination of channels",
+        "properties": {
+          "targets": {
+            "type": "array",
+            "description": "Notification targets — each routes to an OpenClaw channel",
+            "items": {
+              "type": "object",
+              "required": ["channel", "target"],
+              "properties": {
+                "channel": { "type": "string", "description": "OpenClaw channel name: discord, slack, telegram, signal, etc." },
+                "target": { "type": "string", "description": "Channel/group/user ID to send to" },
+                "accountId": { "type": "string", "description": "Account ID for multi-account channel setups (optional)" }
+              }
+            }
+          },
+          "events": {
+            "type": "object",
+            "description": "Per-event-type toggles (all default true, set false to suppress)",
+            "properties": {
+              "dispatch": { "type": "boolean" },
+              "working": { "type": "boolean" },
+              "auditing": { "type": "boolean" },
+              "audit_pass": { "type": "boolean" },
+              "audit_fail": { "type": "boolean" },
+              "escalation": { "type": "boolean" },
+              "stuck": { "type": "boolean" },
+              "watchdog_kill": { "type": "boolean" }
+            }
+          }
+        }
+      },
       "promptsPath": { "type": "string", "description": "Override path for prompts.yaml (default: ships with plugin)" },
       "maxReworkAttempts": { "type": "number", "description": "Max audit failures before escalation", "default": 2 },
       "inactivitySec": { "type": "number", "description": "Kill sessions with no I/O for this many seconds (default: 120)", "default": 120 },

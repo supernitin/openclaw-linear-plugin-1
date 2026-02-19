@@ -39,8 +39,9 @@ An OpenClaw plugin that connects Linear to AI agents. Issues get triaged automat
 | **Real-time progress** | Agent activity (thinking, acting, responding) streams to Linear's UI |
 | **Unified `code_run`** | One tool, three backends (Codex, Claude Code, Gemini), configurable per agent |
 | **Issue management** | Agents use `linearis` CLI to update status, close issues, add comments |
-| **Customizable prompts** | `prompts.yaml` -- edit worker, audit, and rework prompts without rebuilding |
-| **Discord notifications** | Dispatch lifecycle events posted to a Discord channel |
+| **Project planner** | Interactive interview builds out Linear issue hierarchies with dependency DAGs |
+| **Customizable prompts** | `prompts.yaml` -- edit worker, audit, planner, and rework prompts without rebuilding |
+| **Multi-channel notifications** | Dispatch events fan out to Discord, Slack, Telegram, Signal, or any OpenClaw channel |
 | **Artifact logging** | Every dispatch writes structured logs to `.claw/` in the worktree |
 
 ---
@@ -74,6 +75,12 @@ sequenceDiagram
     Plugin->>Agents: QA agent
     Agents-->>Plugin: Response
     Plugin-->>Linear: Branded comment
+
+    You->>Linear: Comment "@ctclaw plan this project"
+    Linear->>Plugin: Webhook (Comment)
+    Plugin->>Agents: Planner agent
+    Agents-->>Linear: Creates epics + issues + dependency DAG
+    Agents-->>Linear: Interview question
 ```
 
 ---
@@ -122,6 +129,23 @@ stateDiagram-v2
 
 All transitions use compare-and-swap (CAS) to prevent races. `dispatch-state.json` is the canonical source of truth.
 
+### Project Planner Pipeline
+
+When `@ctclaw plan this project` is commented on a root issue, the plugin enters planning mode:
+
+```mermaid
+flowchart TD
+    A["Comment: 'plan this project'"] --> B["INITIATE<br/>Register session, post welcome"]
+    B --> C["INTERVIEW<br/>Agent asks questions,<br/>creates issues + DAG"]
+    C -->|user responds| C
+    C -->|"'finalize plan'"| D["AUDIT<br/>DAG validation, completeness checks"]
+    D -->|Pass| E["APPROVED<br/>Project ready for dispatch"]
+    D -->|Fail| C
+    C -->|"'abandon'"| F["ABANDONED"]
+```
+
+During planning mode, the planner creates epics, sub-issues, and dependency relationships (`blocks`/`blocked_by`) via 5 dedicated tools. Issue dispatch is blocked for projects in planning mode.
+
 ### Webhook Event Router
 
 ```mermaid
@@ -129,7 +153,7 @@ flowchart TD
     A["POST /linear/webhook"] --> B{"Event Type"}
     B --> C["AgentSessionEvent.created → Dispatch pipeline"]
     B --> D["AgentSessionEvent.prompted → Resume session"]
-    B --> E["Comment.create → @mention routing"]
+    B --> E["Comment.create → @mention routing<br/>or planning mode"]
     B --> F["Issue.create → Auto-triage"]
     B --> G["Issue.update → Dispatch if assigned"]
     B --> H["AppUserNotification → Direct response"]
@@ -180,7 +204,9 @@ openclaw-linear/
     |   |-- dispatch-service.ts    Background monitor: stale detection, recovery, cleanup
     |   |-- active-session.ts      In-memory session registry (issueId -> session)
     |   |-- tier-assess.ts         Issue complexity assessment (junior/medior/senior)
-    |   +-- artifacts.ts           .claw/ directory: manifest, logs, verdicts, summaries
+    |   |-- artifacts.ts           .claw/ directory: manifest, logs, verdicts, summaries
+    |   |-- planner.ts             Project planner orchestration (interview, audit)
+    |   +-- planning-state.ts      File-backed planning state (mirrors dispatch-state)
     |
     |-- agent/                 Agent execution & monitoring
     |   |-- agent.ts               Embedded runner + subprocess fallback, retry on watchdog kill
@@ -193,7 +219,8 @@ openclaw-linear/
     |   |-- claude-tool.ts         Claude Code CLI runner (JSONL -> Linear activities)
     |   |-- codex-tool.ts          Codex CLI runner (JSONL -> Linear activities)
     |   |-- gemini-tool.ts         Gemini CLI runner (JSONL -> Linear activities)
-    |   +-- orchestration-tools.ts spawn_agent / ask_agent for multi-agent delegation
+    |   |-- orchestration-tools.ts spawn_agent / ask_agent for multi-agent delegation
+    |   +-- planner-tools.ts       5 planning tools (create/link/update issues, audit DAG)
     |
     |-- api/                   Linear API & auth
     |   |-- linear-api.ts          GraphQL client, token resolution, auto-refresh
@@ -203,7 +230,7 @@ openclaw-linear/
     +-- infra/                 Infrastructure utilities
         |-- cli.ts                 CLI subcommands (auth, status, worktrees, prompts)
         |-- codex-worktree.ts      Git worktree create/remove/status/PR helpers
-        +-- notify.ts              Discord notifier (+ noop fallback)
+        +-- notify.ts              Multi-channel notifier (Discord, Slack, Telegram, Signal)
 ```
 
 ---
@@ -401,6 +428,9 @@ Once set up, the plugin responds to Linear events automatically:
 | Assign an issue to the agent | Worker-audit pipeline runs with watchdog protection |
 | Trigger an agent session | Agent responds directly in the session |
 | Comment `@qa check the tests` | QA agent responds with its expertise |
+| Comment `@ctclaw plan this project` | Planner agent enters interview mode, builds issue DAG |
+| Reply during planning mode | Planner creates/updates issues and asks next question |
+| Comment "finalize plan" | DAG audit runs: cycles, orphans, missing estimates/priorities |
 | Ask "close this issue" | Agent runs `linearis issues update API-123 --status Done` |
 | Ask "use gemini to review" | Agent calls `code_run` with `backend: "gemini"` |
 
@@ -435,7 +465,7 @@ Set in `openclaw.json` under the plugin entry:
 | `codexTimeoutMs` | number | `600000` | Legacy timeout for coding CLIs (ms) |
 | `worktreeBaseDir` | string | `"~/.openclaw/worktrees"` | Base directory for worktrees |
 | `dispatchStatePath` | string | `"~/.openclaw/linear-dispatch-state.json"` | Dispatch state file |
-| `flowDiscordChannel` | string | -- | Discord channel ID for notifications |
+| `notifications` | object | -- | [Notification targets and event toggles](#notifications) |
 | `promptsPath` | string | -- | Override path for `prompts.yaml` |
 | `maxReworkAttempts` | number | `2` | Max audit failures before escalation |
 | `inactivitySec` | number | `120` | Kill sessions with no I/O for this long |
@@ -511,17 +541,78 @@ openclaw openclaw-linear prompts validate   # Validate structure and template va
 
 ## Notifications
 
-Configure `flowDiscordChannel` in plugin config with a Discord channel ID. Events:
+Dispatch lifecycle events fan out to any combination of OpenClaw channels -- Discord, Slack, Telegram, Signal, or any channel the runtime supports.
 
-| Event | Message |
-|---|---|
-| Dispatch | `**API-123** dispatched -- Fix auth bug` |
-| Worker started | `**API-123** worker started (attempt 0)` |
-| Audit in progress | `**API-123** audit in progress` |
-| Audit passed | `**API-123** passed audit. PR ready.` |
-| Audit failed | `**API-123** failed audit (attempt 1). Gaps: ...` |
-| Escalation | `**API-123** needs human review -- audit failed 3x` |
-| Watchdog kill | `**API-123** killed by watchdog (no I/O for 120s). Retrying.` |
+### Configuration
+
+Add a `notifications` object to your plugin config:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "openclaw-linear": {
+        "config": {
+          "notifications": {
+            "targets": [
+              { "channel": "discord", "target": "1471743433566715974" },
+              { "channel": "slack", "target": "C0123456789", "accountId": "my-acct" },
+              { "channel": "telegram", "target": "-1003884997363" }
+            ],
+            "events": {
+              "auditing": false
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+**`targets`** -- Array of notification destinations. Each target specifies:
+
+| Field | Required | Description |
+|---|---|---|
+| `channel` | Yes | OpenClaw channel name: `discord`, `slack`, `telegram`, `signal`, etc. |
+| `target` | Yes | Channel/group/user ID to send to |
+| `accountId` | No | Account ID for multi-account setups (Slack) |
+
+**`events`** -- Per-event-type toggles. All events are enabled by default. Set to `false` to suppress.
+
+### Events
+
+| Event | Kind | Example Message |
+|---|---|---|
+| Dispatch | `dispatch` | `API-123 dispatched -- Fix auth bug` |
+| Worker started | `working` | `API-123 worker started (attempt 0)` |
+| Audit in progress | `auditing` | `API-123 audit in progress` |
+| Audit passed | `audit_pass` | `API-123 passed audit. PR ready.` |
+| Audit failed | `audit_fail` | `API-123 failed audit (attempt 1). Gaps: no tests, missing validation` |
+| Escalation | `escalation` | `API-123 needs human review -- audit failed 3x` |
+| Stale detection | `stuck` | `API-123 stuck -- stale 2h` |
+| Watchdog kill | `watchdog_kill` | `API-123 killed by watchdog (no I/O for 120s). Retrying (attempt 0).` |
+
+### Delivery
+
+Messages route through OpenClaw's native runtime channel API:
+
+- **Discord** -- `runtime.channel.discord.sendMessageDiscord()`
+- **Slack** -- `runtime.channel.slack.sendMessageSlack()` (passes `accountId` for multi-workspace)
+- **Telegram** -- `runtime.channel.telegram.sendMessageTelegram()` (silent mode)
+- **Signal** -- `runtime.channel.signal.sendMessageSignal()`
+- **Other** -- Falls back to `openclaw message send` CLI
+
+Failures are isolated per target -- one channel going down doesn't block the others.
+
+### Notify CLI
+
+```bash
+openclaw openclaw-linear notify status                  # Show configured targets and suppressed events
+openclaw openclaw-linear notify test                    # Send test notification to all targets
+openclaw openclaw-linear notify test --channel discord  # Test only discord targets
+openclaw openclaw-linear notify setup                   # Interactive target setup
+```
 
 ---
 
@@ -649,6 +740,13 @@ openclaw openclaw-linear worktrees --prune <path>  # Remove a worktree
 openclaw openclaw-linear prompts show      # Print current prompts
 openclaw openclaw-linear prompts path      # Print resolved prompts file path
 openclaw openclaw-linear prompts validate  # Validate prompt structure
+openclaw openclaw-linear notify status     # Show notification targets and event toggles
+openclaw openclaw-linear notify test       # Send test notification to all targets
+openclaw openclaw-linear notify test --channel slack  # Test specific channel only
+openclaw openclaw-linear notify setup      # Interactive notification target setup
+openclaw openclaw-linear doctor            # Run comprehensive health checks
+openclaw openclaw-linear doctor --fix      # Auto-fix safe issues
+openclaw openclaw-linear doctor --json     # Output results as JSON
 ```
 
 ---

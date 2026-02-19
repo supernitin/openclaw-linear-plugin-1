@@ -6,10 +6,12 @@ import { LinearAgentApi, resolveLinearToken } from "../api/linear-api.js";
 import { spawnWorker, type HookContext } from "./pipeline.js";
 import { setActiveSession, clearActiveSession } from "./active-session.js";
 import { readDispatchState, getActiveDispatch, registerDispatch, updateDispatchStatus, completeDispatch, removeActiveDispatch } from "./dispatch-state.js";
-import { createDiscordNotifier, createNoopNotifier, type NotifyFn } from "../infra/notify.js";
+import { createNotifierFromConfig, type NotifyFn } from "../infra/notify.js";
 import { assessTier } from "./tier-assess.js";
 import { createWorktree, prepareWorkspace } from "../infra/codex-worktree.js";
 import { ensureClawDir, writeManifest } from "./artifacts.js";
+import { readPlanningState, isInPlanningMode, getPlanningSession } from "./planning-state.js";
+import { initiatePlanningSession, handlePlannerTurn } from "./planner.js";
 
 // ── Agent profiles (loaded from config, no hardcoded names) ───────
 interface AgentProfile {
@@ -663,6 +665,50 @@ export async function handleLinearWebhook(
     const commentor = comment?.user?.name ?? "Unknown";
     const issue = comment?.issue ?? payload.issue;
 
+    // ── Planning mode intercept ──────────────────────────────────
+    if (issue?.id) {
+      const linearApiForPlanning = createLinearApi(api);
+      if (linearApiForPlanning) {
+        try {
+          const enriched = await linearApiForPlanning.getIssueDetails(issue.id);
+          const projectId = enriched?.project?.id;
+          const planStatePath = pluginConfig?.planningStatePath as string | undefined;
+
+          if (projectId) {
+            const planState = await readPlanningState(planStatePath);
+
+            // Check if this is a plan initiation request
+            const isPlanRequest = /\b(plan|planning)\s+(this\s+)?(project|out)\b/i.test(commentBody);
+            if (isPlanRequest && !isInPlanningMode(planState, projectId)) {
+              api.logger.info(`Planning: initiation requested on ${issue.identifier ?? issue.id}`);
+              void initiatePlanningSession(
+                { api, linearApi: linearApiForPlanning, pluginConfig },
+                projectId,
+                { id: issue.id, identifier: enriched.identifier, title: enriched.title, team: enriched.team },
+              ).catch((err) => api.logger.error(`Planning initiation error: ${err}`));
+              return true;
+            }
+
+            // Route to planner if project is in planning mode
+            if (isInPlanningMode(planState, projectId)) {
+              const session = getPlanningSession(planState, projectId);
+              if (session && comment?.id && !wasRecentlyProcessed(`plan-comment:${comment.id}`)) {
+                api.logger.info(`Planning: routing comment to planner for ${session.projectName}`);
+                void handlePlannerTurn(
+                  { api, linearApi: linearApiForPlanning, pluginConfig },
+                  session,
+                  { issueId: issue.id, commentBody, commentorName: commentor },
+                ).catch((err) => api.logger.error(`Planner turn error: ${err}`));
+              }
+              return true;
+            }
+          }
+        } catch (err) {
+          api.logger.warn(`Planning mode check failed: ${err}`);
+        }
+      }
+    }
+
     // Load agent profiles and build mention pattern dynamically.
     // Default agent (app mentions) is handled by AgentSessionEvent — never here.
     const profiles = loadAgentProfiles();
@@ -1161,6 +1207,26 @@ async function handleDispatch(
 
   api.logger.info(`@dispatch: processing ${identifier}`);
 
+  // 0. Check planning mode — prevent dispatch for issues in planning-mode projects
+  try {
+    const enrichedForPlan = await linearApi.getIssueDetails(issue.id ?? issue);
+    const planProjectId = enrichedForPlan?.project?.id;
+    if (planProjectId) {
+      const planStatePath = pluginConfig?.planningStatePath as string | undefined;
+      const planState = await readPlanningState(planStatePath);
+      if (isInPlanningMode(planState, planProjectId)) {
+        api.logger.info(`dispatch: ${identifier} is in planning-mode project — skipping`);
+        await linearApi.createComment(
+          issue.id,
+          "This project is in planning mode. Finalize the plan before dispatching implementation.",
+        );
+        return;
+      }
+    }
+  } catch (err) {
+    api.logger.warn(`dispatch: planning mode check failed for ${identifier}: ${err}`);
+  }
+
   // 1. Check for existing active dispatch — reclaim if stale
   const STALE_DISPATCH_MS = 30 * 60_000; // 30 min without a gateway holding it = stale
   const state = await readDispatchState(statePath);
@@ -1337,22 +1403,8 @@ async function handleDispatch(
   // 11. Run v2 pipeline: worker → audit → verdict (non-blocking)
   activeRuns.add(issue.id);
 
-  // Instantiate notifier
-  const discordBotToken = (() => {
-    try {
-      const config = JSON.parse(
-        require("node:fs").readFileSync(
-          require("node:path").join(process.env.HOME ?? "/home/claw", ".openclaw", "openclaw.json"),
-          "utf8",
-        ),
-      );
-      return config?.channels?.discord?.token as string | undefined;
-    } catch { return undefined; }
-  })();
-  const flowDiscordChannel = pluginConfig?.flowDiscordChannel as string | undefined;
-  const notify: NotifyFn = (discordBotToken && flowDiscordChannel)
-    ? createDiscordNotifier(discordBotToken, flowDiscordChannel)
-    : createNoopNotifier();
+  // Instantiate notifier (Discord, Slack, or both — config-driven)
+  const notify: NotifyFn = createNotifierFromConfig(pluginConfig, api.runtime);
 
   const hookCtx: HookContext = {
     api,

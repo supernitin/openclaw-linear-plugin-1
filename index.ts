@@ -9,7 +9,9 @@ import { LinearAgentApi, resolveLinearToken } from "./src/api/linear-api.js";
 import { createDispatchService } from "./src/pipeline/dispatch-service.js";
 import { readDispatchState, lookupSessionMapping, getActiveDispatch } from "./src/pipeline/dispatch-state.js";
 import { triggerAudit, processVerdict, type HookContext } from "./src/pipeline/pipeline.js";
-import { createDiscordNotifier, createNoopNotifier, type NotifyFn } from "./src/infra/notify.js";
+import { createNotifierFromConfig, type NotifyFn } from "./src/infra/notify.js";
+import { readPlanningState, setPlanningCache } from "./src/pipeline/planning-state.js";
+import { createPlannerTools } from "./src/tools/planner-tools.js";
 
 export default function register(api: OpenClawPluginApi) {
   const pluginConfig = (api as any).pluginConfig as Record<string, unknown> | undefined;
@@ -35,6 +37,9 @@ export default function register(api: OpenClawPluginApi) {
   api.registerTool((ctx) => {
     return createLinearTools(api, ctx);
   });
+
+  // Register planner tools (context injected at runtime via setActivePlannerContext)
+  api.registerTool(() => createPlannerTools());
 
   // Register Linear webhook handler on a dedicated route
   api.registerHttpRoute({
@@ -63,31 +68,22 @@ export default function register(api: OpenClawPluginApi) {
   // Register dispatch monitor service (stale detection, session hydration, cleanup)
   api.registerService(createDispatchService(api));
 
+  // Hydrate planning state on startup
+  readPlanningState(pluginConfig?.planningStatePath as string | undefined).then((state) => {
+    for (const session of Object.values(state.sessions)) {
+      if (session.status === "interviewing" || session.status === "plan_review") {
+        setPlanningCache(session);
+        api.logger.info(`Planning: restored session for ${session.projectName} (${session.rootIdentifier})`);
+      }
+    }
+  }).catch((err) => api.logger.warn(`Planning state hydration failed: ${err}`));
+
   // ---------------------------------------------------------------------------
   // Dispatch pipeline v2: notifier + agent_end lifecycle hook
   // ---------------------------------------------------------------------------
 
-  // Instantiate notifier (Discord if configured, otherwise noop)
-  const discordBotToken = (() => {
-    try {
-      const config = JSON.parse(
-        require("node:fs").readFileSync(
-          require("node:path").join(process.env.HOME ?? "/home/claw", ".openclaw", "openclaw.json"),
-          "utf8",
-        ),
-      );
-      return config?.channels?.discord?.token as string | undefined;
-    } catch { return undefined; }
-  })();
-  const flowDiscordChannel = pluginConfig?.flowDiscordChannel as string | undefined;
-
-  const notify: NotifyFn = (discordBotToken && flowDiscordChannel)
-    ? createDiscordNotifier(discordBotToken, flowDiscordChannel)
-    : createNoopNotifier();
-
-  if (flowDiscordChannel && discordBotToken) {
-    api.logger.info(`Linear dispatch: Discord notifications enabled (channel: ${flowDiscordChannel})`);
-  }
+  // Instantiate notifier (Discord, Slack, or both — config-driven)
+  const notify: NotifyFn = createNotifierFromConfig(pluginConfig, api.runtime);
 
   // Register agent_end hook — safety net for sessions_spawn sub-agents.
   // In the current implementation, the worker→audit→verdict flow runs inline

@@ -205,6 +205,85 @@ Summaries are also written to the orchestrator's `memory/` directory for long-te
 
 ---
 
+## Project Planner Pipeline
+
+Interactive planning mode for building Linear project issue hierarchies with dependency DAGs.
+
+### State Machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> interviewing : "@ctclaw plan this project"
+    interviewing --> interviewing : user comment (interview turn)
+    interviewing --> plan_review : "finalize plan"
+    plan_review --> approved : audit passes
+    plan_review --> interviewing : audit fails
+    interviewing --> abandoned : "abandon" / "cancel planning"
+```
+
+State lives in `~/.openclaw/linear-planning-state.json` (file-backed, same pattern as dispatch-state).
+
+### Planning Flow
+
+```mermaid
+sequenceDiagram
+    participant U as User (Linear)
+    participant W as Webhook Router
+    participant P as Planner (planner.ts)
+    participant T as Planner Tools
+    participant L as Linear API
+
+    U->>W: "@ctclaw plan this project"
+    W->>P: initiatePlanningSession()
+    P->>L: getProject() + getTeamStates()
+    P->>L: createComment(welcome)
+    L-->>U: "What are the main feature areas?"
+
+    U->>W: "Auth, payments, notifications"
+    W->>P: handlePlannerTurn()
+    P->>T: plan_create_issue(Auth, isEpic)
+    T->>L: issueCreate -> PROJ-2
+    P->>T: plan_create_issue(Payments, isEpic)
+    T->>L: issueCreate -> PROJ-3
+    P->>L: createComment(summary + next question)
+    L-->>U: "Created 2 epics. Tell me about Auth..."
+
+    U->>W: "finalize plan"
+    W->>P: runPlanAudit()
+    P->>T: auditPlan(issues)
+    T-->>P: {pass: true}
+    P->>L: createComment("Plan approved!")
+    P->>P: endPlanningSession(approved)
+```
+
+### Planner Tools (5 tools)
+
+| Tool | Action |
+|------|--------|
+| `plan_create_issue` | Create issue/epic in project. Uses `GraphQL-Features: sub_issues` header for sub-issues. |
+| `plan_link_issues` | Create `blocks`/`blocked_by`/`related` relations between issues |
+| `plan_get_project` | Formatted tree snapshot of all project issues with relations |
+| `plan_update_issue` | Update description, estimate, priority, labels on existing issue |
+| `plan_audit` | Deterministic completeness audit (no LLM): descriptions, estimates, priorities, DAG cycles, orphans |
+
+Tools use context injection (`setActivePlannerContext`/`clearActivePlannerContext`) -- set before `runAgent()`, cleared after. Same pattern as `active-session.ts`.
+
+### DAG Audit Checks
+
+The `auditPlan()` function is pure/deterministic (no LLM call):
+
+1. All issues have descriptions >= 50 chars
+2. Non-epic issues have estimates (not null)
+3. Non-epic issues have priority > 0
+4. No cycles in the dependency graph (Kahn's algorithm on blocks/blocked_by)
+5. No orphan issues (everything has a parent or relation link)
+
+### Dispatch Collision Prevention
+
+While a project is in planning mode, the dispatch pipeline skips issues in that project. A comment explains: "This project is in planning mode. Finalize the plan before dispatching implementation."
+
+---
+
 ## @Mention Routing
 
 ```mermaid
@@ -285,7 +364,9 @@ linear/
     |   |-- dispatch-service.ts    Background monitor (stale, recovery, prune)
     |   |-- active-session.ts      In-memory session registry
     |   |-- tier-assess.ts         Complexity assessment (junior/medior/senior)
-    |   +-- artifacts.ts           .claw/ directory artifacts + memory integration
+    |   |-- artifacts.ts           .claw/ directory artifacts + memory integration
+    |   |-- planner.ts             Project planner orchestration (interview, audit)
+    |   +-- planning-state.ts      File-backed planning state (mirrors dispatch-state)
     |
     |-- agent/                 Agent execution & monitoring
     |   |-- agent.ts               Embedded runner + subprocess, watchdog + retry
@@ -298,7 +379,8 @@ linear/
     |   |-- claude-tool.ts         Claude Code runner (JSONL + watchdog)
     |   |-- codex-tool.ts          Codex runner (JSONL + watchdog)
     |   |-- gemini-tool.ts         Gemini runner (JSONL + watchdog)
-    |   +-- orchestration-tools.ts spawn_agent / ask_agent
+    |   |-- orchestration-tools.ts spawn_agent / ask_agent
+    |   +-- planner-tools.ts       5 planning tools + DAG audit + snapshot formatter
     |
     |-- api/                   Linear API & auth
     |   |-- linear-api.ts          GraphQL client, token resolution, auto-refresh
@@ -308,5 +390,5 @@ linear/
     +-- infra/                 Infrastructure utilities
         |-- cli.ts                 CLI subcommands
         |-- codex-worktree.ts      Git worktree management
-        +-- notify.ts              Discord notifier (+ noop fallback)
+        +-- notify.ts              Multi-channel notifier (Discord, Slack, Telegram, Signal)
 ```

@@ -258,12 +258,12 @@ describe("checkConnectivity", () => {
     expect(apiCheck?.severity).toBe("pass");
   });
 
-  it("reports Discord not configured as pass", async () => {
+  it("reports notifications not configured as pass", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("should not be called"); }));
     const checks = await checkConnectivity({});
-    const discordCheck = checks.find((c) => c.label.includes("Discord"));
-    expect(discordCheck?.severity).toBe("pass");
-    expect(discordCheck?.label).toContain("not configured");
+    const notifCheck = checks.find((c) => c.label.includes("Notifications"));
+    expect(notifCheck?.severity).toBe("pass");
+    expect(notifCheck?.label).toContain("not configured");
   });
 
   it("reports webhook skip when gateway not running", async () => {

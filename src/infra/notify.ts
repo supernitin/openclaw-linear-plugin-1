@@ -1,10 +1,14 @@
 /**
- * notify.ts — Simple notification function for dispatch lifecycle events.
+ * notify.ts — Unified notification provider for dispatch lifecycle events.
  *
- * One concrete Discord implementation + noop fallback.
- * No abstract class — add provider abstraction only when a second
- * backend (Slack, email) actually exists.
+ * Uses OpenClaw's native runtime channel API for all providers (Discord, Slack,
+ * Telegram, Signal, etc). One formatter, one send function, config-driven
+ * fan-out with per-event-type toggles.
+ *
+ * Modeled on DevClaw's notify.ts pattern — the runtime handles token resolution,
+ * formatting differences (markdown vs mrkdwn), and delivery per channel.
  */
+import type { PluginRuntime } from "openclaw/plugin-sdk";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -32,58 +36,133 @@ export interface NotifyPayload {
 export type NotifyFn = (kind: NotifyKind, payload: NotifyPayload) => Promise<void>;
 
 // ---------------------------------------------------------------------------
-// Discord implementation
+// Provider config
 // ---------------------------------------------------------------------------
 
-const DISCORD_API = "https://discord.com/api/v10";
+export interface NotifyTarget {
+  /** OpenClaw channel name: "discord", "slack", "telegram", "signal", etc. */
+  channel: string;
+  /** Channel/group/user ID to send to */
+  target: string;
+  /** Optional account ID for multi-account channel setups */
+  accountId?: string;
+}
 
-function formatDiscordMessage(kind: NotifyKind, payload: NotifyPayload): string {
-  const prefix = `**${payload.identifier}**`;
+export interface NotificationsConfig {
+  targets?: NotifyTarget[];
+  events?: Partial<Record<NotifyKind, boolean>>;
+}
+
+// ---------------------------------------------------------------------------
+// Unified message formatter
+// ---------------------------------------------------------------------------
+
+export function formatMessage(kind: NotifyKind, payload: NotifyPayload): string {
+  const id = payload.identifier;
   switch (kind) {
     case "dispatch":
-      return `${prefix} dispatched — ${payload.title}`;
+      return `${id} dispatched — ${payload.title}`;
     case "working":
-      return `${prefix} worker started (attempt ${payload.attempt ?? 0})`;
+      return `${id} worker started (attempt ${payload.attempt ?? 0})`;
     case "auditing":
-      return `${prefix} audit in progress`;
+      return `${id} audit in progress`;
     case "audit_pass":
-      return `${prefix} passed audit. PR ready.`;
+      return `${id} passed audit. PR ready.`;
     case "audit_fail": {
       const gaps = payload.verdict?.gaps?.join(", ") ?? "unspecified";
-      return `${prefix} failed audit (attempt ${payload.attempt ?? 0}). Gaps: ${gaps}`;
+      return `${id} failed audit (attempt ${payload.attempt ?? 0}). Gaps: ${gaps}`;
     }
     case "escalation":
-      return `🚨 ${prefix} needs human review — ${payload.reason ?? "audit failed 2x"}`;
+      return `🚨 ${id} needs human review — ${payload.reason ?? "audit failed 2x"}`;
     case "stuck":
-      return `⏰ ${prefix} stuck — ${payload.reason ?? "stale 2h"}`;
+      return `⏰ ${id} stuck — ${payload.reason ?? "stale 2h"}`;
     case "watchdog_kill":
-      return `⚡ ${prefix} killed by watchdog (${payload.reason ?? "no I/O for 120s"}). ${
+      return `⚡ ${id} killed by watchdog (${payload.reason ?? "no I/O for 120s"}). ${
         payload.attempt != null ? `Retrying (attempt ${payload.attempt}).` : "Will retry."
       }`;
     default:
-      return `${prefix} — ${kind}: ${payload.status}`;
+      return `${id} — ${kind}: ${payload.status}`;
   }
 }
 
-export function createDiscordNotifier(botToken: string, channelId: string): NotifyFn {
+// ---------------------------------------------------------------------------
+// Unified send — routes to OpenClaw runtime channel API
+// ---------------------------------------------------------------------------
+
+export async function sendToTarget(
+  target: NotifyTarget,
+  message: string,
+  runtime: PluginRuntime,
+): Promise<void> {
+  const ch = target.channel;
+  const to = target.target;
+
+  if (ch === "discord") {
+    await runtime.channel.discord.sendMessageDiscord(to, message);
+  } else if (ch === "slack") {
+    await runtime.channel.slack.sendMessageSlack(to, message, {
+      accountId: target.accountId,
+    });
+  } else if (ch === "telegram") {
+    await runtime.channel.telegram.sendMessageTelegram(to, message, { silent: true });
+  } else if (ch === "signal") {
+    await runtime.channel.signal.sendMessageSignal(to, message);
+  } else {
+    // Fallback: use CLI for any channel the runtime doesn't expose directly
+    const { execFileSync } = await import("node:child_process");
+    execFileSync("openclaw", ["message", "send", "--channel", ch, "--target", to, "--message", message, "--json"], {
+      timeout: 30_000,
+      stdio: "ignore",
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Config-driven factory
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse notification config from plugin config.
+ */
+export function parseNotificationsConfig(
+  pluginConfig: Record<string, unknown> | undefined,
+): NotificationsConfig {
+  const raw = pluginConfig?.notifications as NotificationsConfig | undefined;
+  return {
+    targets: raw?.targets ?? [],
+    events: raw?.events ?? {},
+  };
+}
+
+/**
+ * Create a notifier from plugin config. Returns a NotifyFn that:
+ * 1. Checks event toggles (skip suppressed events)
+ * 2. Formats the message
+ * 3. Fans out to all configured targets (failures isolated via Promise.allSettled)
+ */
+export function createNotifierFromConfig(
+  pluginConfig: Record<string, unknown> | undefined,
+  runtime: PluginRuntime,
+): NotifyFn {
+  const config = parseNotificationsConfig(pluginConfig);
+
+  if (!config.targets?.length) return createNoopNotifier();
+
   return async (kind, payload) => {
-    const message = formatDiscordMessage(kind, payload);
-    try {
-      const res = await fetch(`${DISCORD_API}/channels/${channelId}/messages`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bot ${botToken}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ content: message }),
-      });
-      if (!res.ok) {
-        const body = await res.text().catch(() => "");
-        console.error(`Discord notify failed (${res.status}): ${body}`);
-      }
-    } catch (err) {
-      console.error("Discord notify error:", err);
-    }
+    // Check event toggle — default is enabled (true)
+    if (config.events?.[kind] === false) return;
+
+    const message = formatMessage(kind, payload);
+
+    await Promise.allSettled(
+      config.targets!.map(async (target) => {
+        try {
+          await sendToTarget(target, message, runtime);
+        } catch (err) {
+          console.error(`Notify error (${target.channel}:${target.target}):`, err);
+        }
+      }),
+    );
   };
 }
 

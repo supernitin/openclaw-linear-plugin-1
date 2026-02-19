@@ -148,15 +148,22 @@ export class LinearAgentApi {
     return this.refreshToken ? `Bearer ${this.accessToken}` : this.accessToken;
   }
 
-  private async gql<T = unknown>(query: string, variables?: Record<string, unknown>): Promise<T> {
+  private async gql<T = unknown>(
+    query: string,
+    variables?: Record<string, unknown>,
+    extraHeaders?: Record<string, string>,
+  ): Promise<T> {
     await this.ensureValidToken();
+
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      Authorization: this.authHeader(),
+      ...extraHeaders,
+    };
 
     const res = await fetch(LINEAR_GRAPHQL_URL, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: this.authHeader(),
-      },
+      headers,
       body: JSON.stringify({ query, variables }),
     });
 
@@ -165,12 +172,15 @@ export class LinearAgentApi {
       this.expiresAt = 0; // force refresh
       await this.ensureValidToken();
 
+      const retryHeaders: Record<string, string> = {
+        "Content-Type": "application/json",
+        Authorization: this.authHeader(),
+        ...extraHeaders,
+      };
+
       const retry = await fetch(LINEAR_GRAPHQL_URL, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: this.authHeader(),
-        },
+        headers: retryHeaders,
         body: JSON.stringify({ query, variables }),
       });
 
@@ -298,6 +308,9 @@ export class LinearAgentApi {
     labels: { nodes: Array<{ id: string; name: string }> };
     team: { id: string; name: string; issueEstimationType: string };
     comments: { nodes: Array<{ body: string; user: { name: string } | null; createdAt: string }> };
+    project: { id: string; name: string } | null;
+    parent: { id: string; identifier: string } | null;
+    relations: { nodes: Array<{ type: string; relatedIssue: { id: string; identifier: string; title: string } }> };
   }> {
     const data = await this.gql<{ issue: unknown }>(
       `query Issue($id: String!) {
@@ -318,6 +331,9 @@ export class LinearAgentApi {
               createdAt
             }
           }
+          project { id name }
+          parent { id identifier }
+          relations { nodes { type relatedIssue { id identifier title } } }
         }
       }`,
       { id: issueId },
@@ -354,6 +370,161 @@ export class LinearAgentApi {
       { id: teamId },
     );
     return data.team.labels.nodes;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Planning methods
+  // ---------------------------------------------------------------------------
+
+  async createIssue(input: {
+    teamId: string;
+    title: string;
+    description?: string;
+    projectId?: string;
+    parentId?: string;
+    priority?: number;
+    estimate?: number;
+    labelIds?: string[];
+    stateId?: string;
+    assigneeId?: string;
+  }): Promise<{ id: string; identifier: string }> {
+    // Sub-issues require the GraphQL-Features header
+    const extra = input.parentId ? { "GraphQL-Features": "sub_issues" } : undefined;
+    const data = await this.gql<{
+      issueCreate: { success: boolean; issue: { id: string; identifier: string } };
+    }>(
+      `mutation IssueCreate($input: IssueCreateInput!) {
+        issueCreate(input: $input) {
+          success
+          issue { id identifier }
+        }
+      }`,
+      { input },
+      extra,
+    );
+    return data.issueCreate.issue;
+  }
+
+  async createIssueRelation(input: {
+    issueId: string;
+    relatedIssueId: string;
+    type: "blocks" | "blocked_by" | "related" | "duplicate";
+  }): Promise<{ id: string }> {
+    const data = await this.gql<{
+      issueRelationCreate: { success: boolean; issueRelation: { id: string } };
+    }>(
+      `mutation IssueRelationCreate($input: IssueRelationCreateInput!) {
+        issueRelationCreate(input: $input) {
+          success
+          issueRelation { id }
+        }
+      }`,
+      { input },
+    );
+    return data.issueRelationCreate.issueRelation;
+  }
+
+  async getProject(projectId: string): Promise<{
+    id: string;
+    name: string;
+    description: string;
+    state: string;
+    teams: { nodes: Array<{ id: string; name: string }> };
+  }> {
+    const data = await this.gql<{ project: unknown }>(
+      `query Project($id: String!) {
+        project(id: $id) {
+          id
+          name
+          description
+          state
+          teams { nodes { id name } }
+        }
+      }`,
+      { id: projectId },
+    );
+    return data.project as any;
+  }
+
+  async getProjectIssues(projectId: string): Promise<Array<{
+    id: string;
+    identifier: string;
+    title: string;
+    description: string | null;
+    estimate: number | null;
+    priority: number;
+    state: { name: string; type: string };
+    parent: { id: string; identifier: string } | null;
+    labels: { nodes: Array<{ id: string; name: string }> };
+    relations: { nodes: Array<{ type: string; relatedIssue: { id: string; identifier: string; title: string } }> };
+  }>> {
+    const data = await this.gql<{
+      project: { issues: { nodes: unknown[] } };
+    }>(
+      `query ProjectIssues($id: String!) {
+        project(id: $id) {
+          issues {
+            nodes {
+              id
+              identifier
+              title
+              description
+              estimate
+              priority
+              state { name type }
+              parent { id identifier }
+              labels { nodes { id name } }
+              relations { nodes { type relatedIssue { id identifier title } } }
+            }
+          }
+        }
+      }`,
+      { id: projectId },
+    );
+    return data.project.issues.nodes as any;
+  }
+
+  async getTeamStates(teamId: string): Promise<Array<{
+    id: string;
+    name: string;
+    type: string;
+  }>> {
+    const data = await this.gql<{
+      team: { states: { nodes: Array<{ id: string; name: string; type: string }> } };
+    }>(
+      `query TeamStates($id: String!) {
+        team(id: $id) {
+          states: workflowStates { nodes { id name type } }
+        }
+      }`,
+      { id: teamId },
+    );
+    return data.team.states.nodes;
+  }
+
+  async updateIssueExtended(issueId: string, input: {
+    title?: string;
+    description?: string;
+    estimate?: number;
+    labelIds?: string[];
+    stateId?: string;
+    priority?: number;
+    projectId?: string;
+    parentId?: string;
+    assigneeId?: string;
+    dueDate?: string;
+  }): Promise<boolean> {
+    const data = await this.gql<{
+      issueUpdate: { success: boolean };
+    }>(
+      `mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) {
+        issueUpdate(id: $id, input: $input) {
+          success
+        }
+      }`,
+      { id: issueId, input },
+    );
+    return data.issueUpdate.success;
   }
 
   async getAppNotifications(count: number = 5): Promise<Array<{

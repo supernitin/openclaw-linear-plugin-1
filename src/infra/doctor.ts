@@ -530,36 +530,14 @@ export async function checkConnectivity(pluginConfig?: Record<string, unknown>, 
     }
   }
 
-  // Discord notifications
-  const flowDiscordChannel = pluginConfig?.flowDiscordChannel as string | undefined;
-  if (!flowDiscordChannel) {
-    checks.push(pass("Discord notifications: not configured (skipped)"));
+  // Notification targets
+  const notifRaw = pluginConfig?.notifications as { targets?: { channel: string; target: string }[] } | undefined;
+  const notifTargets = notifRaw?.targets ?? [];
+  if (notifTargets.length === 0) {
+    checks.push(pass("Notifications: not configured (skipped)"));
   } else {
-    // Read Discord bot token from openclaw.json
-    let discordBotToken: string | undefined;
-    try {
-      const configPath = join(homedir(), ".openclaw", "openclaw.json");
-      const config = JSON.parse(readFileSync(configPath, "utf8"));
-      discordBotToken = config?.channels?.discord?.token as string | undefined;
-    } catch {
-      // Can't read config
-    }
-
-    if (!discordBotToken) {
-      checks.push(warn("Discord notifications: no bot token found in openclaw.json"));
-    } else {
-      try {
-        const res = await fetch(`https://discord.com/api/v10/channels/${flowDiscordChannel}`, {
-          headers: { Authorization: `Bot ${discordBotToken}` },
-        });
-        if (res.ok) {
-          checks.push(pass("Discord notifications: enabled"));
-        } else {
-          checks.push(warn(`Discord channel check: ${res.status} ${res.statusText}`));
-        }
-      } catch (err) {
-        checks.push(warn(`Discord API unreachable: ${err instanceof Error ? err.message : String(err)}`));
-      }
+    for (const t of notifTargets) {
+      checks.push(pass(`Notifications: ${t.channel} → ${t.target}`));
     }
   }
 
