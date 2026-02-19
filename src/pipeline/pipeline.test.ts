@@ -223,4 +223,73 @@ describe("loadPrompts", () => {
     expect(first).not.toBe(second);
     expect(first).toEqual(second);
   });
+
+  it("merges global overlay with defaults (section-level shallow merge)", () => {
+    // Use promptsPath in pluginConfig to load custom YAML from a temp file
+    const { writeFileSync, mkdtempSync } = require("node:fs");
+    const { join } = require("node:path");
+    const { tmpdir } = require("node:os");
+    const dir = mkdtempSync(join(tmpdir(), "claw-prompt-"));
+    const yamlPath = join(dir, "prompts.yaml");
+    writeFileSync(yamlPath, "worker:\n  system: custom worker system\n");
+
+    clearPromptCache();
+    const prompts = loadPrompts({ promptsPath: yamlPath });
+    // Worker system should be overridden
+    expect(prompts.worker.system).toBe("custom worker system");
+    // Worker task should still be default
+    expect(prompts.worker.task).toContain("{{identifier}}");
+    // Audit should be completely default
+    expect(prompts.audit.system).toContain("auditor");
+    clearPromptCache();
+  });
+
+  it("merges per-project overlay on top of global (three layers)", () => {
+    const { writeFileSync, mkdtempSync, mkdirSync } = require("node:fs");
+    const { join } = require("node:path");
+    const { tmpdir } = require("node:os");
+
+    // Layer 2: global override via promptsPath
+    const globalDir = mkdtempSync(join(tmpdir(), "claw-prompt-global-"));
+    const globalYaml = join(globalDir, "prompts.yaml");
+    writeFileSync(globalYaml, "worker:\n  system: global system\n");
+
+    // Layer 3: per-project override in worktree/.claw/prompts.yaml
+    const worktreeDir = mkdtempSync(join(tmpdir(), "claw-prompt-wt-"));
+    mkdirSync(join(worktreeDir, ".claw"), { recursive: true });
+    writeFileSync(join(worktreeDir, ".claw", "prompts.yaml"), "audit:\n  system: project auditor\n");
+
+    clearPromptCache();
+    const prompts = loadPrompts({ promptsPath: globalYaml }, worktreeDir);
+    // Layer 2: global override
+    expect(prompts.worker.system).toBe("global system");
+    // Layer 3: per-project override
+    expect(prompts.audit.system).toBe("project auditor");
+    // Layer 1: defaults retained where not overridden
+    expect(prompts.rework.addendum).toContain("PREVIOUS AUDIT FAILED");
+    clearPromptCache();
+  });
+
+  it("clearPromptCache clears both global and project caches", () => {
+    const { writeFileSync, mkdtempSync, mkdirSync } = require("node:fs");
+    const { join } = require("node:path");
+    const { tmpdir } = require("node:os");
+
+    // Per-project YAML only (no global — uses defaults for global)
+    const worktreeDir = mkdtempSync(join(tmpdir(), "claw-prompt-cache-"));
+    mkdirSync(join(worktreeDir, ".claw"), { recursive: true });
+    writeFileSync(join(worktreeDir, ".claw", "prompts.yaml"), "worker:\n  system: cached project\n");
+
+    clearPromptCache();
+    const first = loadPrompts(undefined, worktreeDir);
+    expect(first.worker.system).toBe("cached project");
+    // Same ref from cache
+    expect(loadPrompts(undefined, worktreeDir)).toBe(first);
+    // Clear both caches
+    clearPromptCache();
+    const second = loadPrompts(undefined, worktreeDir);
+    expect(second).not.toBe(first);
+    expect(second.worker.system).toBe("cached project");
+    clearPromptCache();
+  });
 });

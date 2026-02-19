@@ -34,6 +34,7 @@ import {
   getActiveDispatch,
 } from "./dispatch-state.js";
 import { type NotifyFn } from "../infra/notify.js";
+import { onProjectIssueCompleted, onProjectIssueStuck } from "./dag-dispatch.js";
 import {
   saveWorkerOutput,
   saveAuditVerdict,
@@ -45,6 +46,7 @@ import {
   resolveOrchestratorWorkspace,
 } from "./artifacts.js";
 import { resolveWatchdogConfig } from "../agent/watchdog.js";
+import { emitDiagnostic } from "../infra/observability.js";
 
 // ---------------------------------------------------------------------------
 // Prompt loading
@@ -70,13 +72,28 @@ const DEFAULT_PROMPTS: PromptTemplates = {
   },
 };
 
-let _cachedPrompts: PromptTemplates | null = null;
+let _cachedGlobalPrompts: PromptTemplates | null = null;
+const _projectPromptCache = new Map<string, PromptTemplates>();
 
-export function loadPrompts(pluginConfig?: Record<string, unknown>): PromptTemplates {
-  if (_cachedPrompts) return _cachedPrompts;
+/**
+ * Merge two prompt layers. Overlay replaces individual fields per section
+ * (shallow section-level merge, not deep).
+ */
+function mergePromptLayers(base: PromptTemplates, overlay: Partial<PromptTemplates>): PromptTemplates {
+  return {
+    worker: { ...base.worker, ...overlay.worker },
+    audit: { ...base.audit, ...overlay.audit },
+    rework: { ...base.rework, ...overlay.rework },
+  };
+}
 
+/**
+ * Load and parse the raw prompts YAML file (global promptsPath or sidecar).
+ * Returns the parsed object, or null if no file found.
+ * Shared by both pipeline and planner prompt loaders.
+ */
+export function loadRawPromptYaml(pluginConfig?: Record<string, unknown>): Record<string, any> | null {
   try {
-    // Try custom path first
     const customPath = pluginConfig?.promptsPath as string | undefined;
     let raw: string;
 
@@ -86,27 +103,66 @@ export function loadPrompts(pluginConfig?: Record<string, unknown>): PromptTempl
         : customPath;
       raw = readFileSync(resolved, "utf-8");
     } else {
-      // Load from plugin directory (sidecar file)
       const pluginRoot = join(dirname(fileURLToPath(import.meta.url)), "../..");
       raw = readFileSync(join(pluginRoot, "prompts.yaml"), "utf-8");
     }
 
-    const parsed = parseYaml(raw) as Partial<PromptTemplates>;
-    _cachedPrompts = {
-      worker: { ...DEFAULT_PROMPTS.worker, ...parsed.worker },
-      audit: { ...DEFAULT_PROMPTS.audit, ...parsed.audit },
-      rework: { ...DEFAULT_PROMPTS.rework, ...parsed.rework },
-    };
+    return parseYaml(raw) as Record<string, any>;
   } catch {
-    _cachedPrompts = DEFAULT_PROMPTS;
+    return null;
+  }
+}
+
+/**
+ * Load global prompts (layers 1+2: hardcoded defaults + global promptsPath override).
+ * Cached after first load.
+ */
+function loadGlobalPrompts(pluginConfig?: Record<string, unknown>): PromptTemplates {
+  if (_cachedGlobalPrompts) return _cachedGlobalPrompts;
+
+  const parsed = loadRawPromptYaml(pluginConfig);
+  if (parsed) {
+    _cachedGlobalPrompts = mergePromptLayers(DEFAULT_PROMPTS, parsed as Partial<PromptTemplates>);
+  } else {
+    _cachedGlobalPrompts = DEFAULT_PROMPTS;
   }
 
-  return _cachedPrompts;
+  return _cachedGlobalPrompts;
+}
+
+/**
+ * Load prompts with three-layer merge:
+ * 1. Built-in defaults (hardcoded DEFAULT_PROMPTS)
+ * 2. Global override (promptsPath or sidecar prompts.yaml)
+ * 3. Per-project override ({worktreePath}/.claw/prompts.yaml) — optional
+ */
+export function loadPrompts(pluginConfig?: Record<string, unknown>, worktreePath?: string): PromptTemplates {
+  const global = loadGlobalPrompts(pluginConfig);
+
+  if (!worktreePath) return global;
+
+  // Check per-project cache
+  const cached = _projectPromptCache.get(worktreePath);
+  if (cached) return cached;
+
+  // Try loading per-project prompts
+  try {
+    const projectPromptsPath = join(worktreePath, ".claw", "prompts.yaml");
+    const raw = readFileSync(projectPromptsPath, "utf-8");
+    const parsed = parseYaml(raw) as Partial<PromptTemplates>;
+    const merged = mergePromptLayers(global, parsed);
+    _projectPromptCache.set(worktreePath, merged);
+    return merged;
+  } catch {
+    // No per-project override — use global
+    return global;
+  }
 }
 
 /** Clear prompt cache (for testing or after config change) */
 export function clearPromptCache(): void {
-  _cachedPrompts = null;
+  _cachedGlobalPrompts = null;
+  _projectPromptCache.clear();
 }
 
 function renderTemplate(template: string, vars: Record<string, string>): string {
@@ -137,7 +193,7 @@ export function buildWorkerTask(
   worktreePath: string,
   opts?: { attempt?: number; gaps?: string[]; pluginConfig?: Record<string, unknown> },
 ): { system: string; task: string } {
-  const prompts = loadPrompts(opts?.pluginConfig);
+  const prompts = loadPrompts(opts?.pluginConfig, worktreePath);
   const vars: Record<string, string> = {
     identifier: issue.identifier,
     title: issue.title,
@@ -167,7 +223,7 @@ export function buildAuditTask(
   worktreePath: string,
   pluginConfig?: Record<string, unknown>,
 ): { system: string; task: string } {
-  const prompts = loadPrompts(pluginConfig);
+  const prompts = loadPrompts(pluginConfig, worktreePath);
   const vars: Record<string, string> = {
     identifier: issue.identifier,
     title: issue.title,
@@ -274,6 +330,7 @@ export async function triggerAudit(
   }
 
   api.logger.info(`${TAG} worker completed, triggering audit (attempt ${dispatch.attempt})`);
+  emitDiagnostic(api, { event: "phase_transition", identifier: dispatch.issueIdentifier, from: "working", to: "auditing", attempt: dispatch.attempt });
 
   // Update .claw/ manifest
   try { updateManifest(dispatch.worktreePath, { status: "auditing", attempts: dispatch.attempt }); } catch {}
@@ -288,7 +345,12 @@ export async function triggerAudit(
   };
 
   // Build audit prompt from YAML templates
-  const auditPrompt = buildAuditTask(issue, dispatch.worktreePath, pluginConfig);
+  // For multi-repo dispatches, render worktreePath as a list of repo→path mappings
+  const effectiveAuditPath = dispatch.worktrees
+    ? dispatch.worktrees.map(w => `${w.repoName}: ${w.path}`).join("\n")
+    : dispatch.worktreePath;
+
+  const auditPrompt = buildAuditTask(issue, effectiveAuditPath, pluginConfig);
 
   // Set Linear label
   await linearApi.emitActivity(dispatch.agentSessionId ?? "", {
@@ -464,7 +526,14 @@ async function handleAuditPass(
     if (summary) {
       writeSummary(dispatch.worktreePath, summary);
       const wsDir = resolveOrchestratorWorkspace(api, pluginConfig);
-      writeDispatchMemory(dispatch.issueIdentifier, summary, wsDir);
+      writeDispatchMemory(dispatch.issueIdentifier, summary, wsDir, {
+        title: dispatch.issueTitle ?? dispatch.issueIdentifier,
+        tier: dispatch.tier,
+        status: "done",
+        project: dispatch.project,
+        attempts: dispatch.attempt + 1,
+        model: dispatch.model,
+      });
       api.logger.info(`${TAG} .claw/ summary and memory written`);
     }
   } catch (err) {
@@ -480,6 +549,7 @@ async function handleAuditPass(
   ).catch((err) => api.logger.error(`${TAG} failed to post audit pass comment: ${err}`));
 
   api.logger.info(`${TAG} audit PASSED — dispatch completed (attempt ${dispatch.attempt})`);
+  emitDiagnostic(api, { event: "verdict_processed", identifier: dispatch.issueIdentifier, phase: "done", attempt: dispatch.attempt });
 
   await notify("audit_pass", {
     identifier: dispatch.issueIdentifier,
@@ -488,6 +558,12 @@ async function handleAuditPass(
     attempt: dispatch.attempt,
     verdict: { pass: true, gaps: [] },
   });
+
+  // DAG cascade: if this issue belongs to a project dispatch, check for newly unblocked issues
+  if (dispatch.project) {
+    void onProjectIssueCompleted(hookCtx, dispatch.project, dispatch.issueIdentifier)
+      .catch((err) => api.logger.error(`${TAG} DAG cascade error: ${err}`));
+  }
 
   clearActiveSession(dispatch.issueId);
 }
@@ -531,7 +607,14 @@ async function handleAuditFail(
       if (summary) {
         writeSummary(dispatch.worktreePath, summary);
         const wsDir = resolveOrchestratorWorkspace(api, pluginConfig);
-        writeDispatchMemory(dispatch.issueIdentifier, summary, wsDir);
+        writeDispatchMemory(dispatch.issueIdentifier, summary, wsDir, {
+          title: dispatch.issueTitle ?? dispatch.issueIdentifier,
+          tier: dispatch.tier,
+          status: "stuck",
+          project: dispatch.project,
+          attempts: nextAttempt,
+          model: dispatch.model,
+        });
       }
     } catch {}
 
@@ -542,6 +625,7 @@ async function handleAuditFail(
     ).catch((err) => api.logger.error(`${TAG} failed to post escalation comment: ${err}`));
 
     api.logger.warn(`${TAG} audit FAILED ${nextAttempt}x — escalating to human`);
+    emitDiagnostic(api, { event: "verdict_processed", identifier: dispatch.issueIdentifier, phase: "stuck", attempt: nextAttempt });
 
     await notify("escalation", {
       identifier: dispatch.issueIdentifier,
@@ -551,6 +635,12 @@ async function handleAuditFail(
       reason: `audit failed ${nextAttempt}x`,
       verdict: { pass: false, gaps: verdict.gaps },
     });
+
+    // DAG cascade: mark this issue as stuck in the project dispatch
+    if (dispatch.project) {
+      void onProjectIssueStuck(hookCtx, dispatch.project, dispatch.issueIdentifier)
+        .catch((err) => api.logger.error(`${TAG} DAG stuck cascade error: ${err}`));
+    }
 
     return;
   }
@@ -579,6 +669,7 @@ async function handleAuditFail(
   ).catch((err) => api.logger.error(`${TAG} failed to post rework comment: ${err}`));
 
   api.logger.info(`${TAG} audit FAILED — rework attempt ${nextAttempt}/${maxAttempts + 1}`);
+  emitDiagnostic(api, { event: "phase_transition", identifier: dispatch.issueIdentifier, from: "auditing", to: "working", attempt: nextAttempt });
 
   await notify("audit_fail", {
     identifier: dispatch.issueIdentifier,
@@ -643,7 +734,12 @@ export async function spawnWorker(
   };
 
   // Build worker prompt from YAML templates
-  const workerPrompt = buildWorkerTask(issue, dispatch.worktreePath, {
+  // For multi-repo dispatches, render worktreePath as a list of repo→path mappings
+  const effectiveWorkerPath = dispatch.worktrees
+    ? dispatch.worktrees.map(w => `${w.repoName}: ${w.path}`).join("\n")
+    : dispatch.worktreePath;
+
+  const workerPrompt = buildWorkerTask(issue, effectiveWorkerPath, {
     attempt: dispatch.attempt,
     gaps: opts?.gaps,
     pluginConfig,
@@ -698,6 +794,7 @@ export async function spawnWorker(
     const thresholdSec = Math.round(wdConfig.inactivityMs / 1000);
 
     api.logger.warn(`${TAG} worker killed by inactivity watchdog 2x — escalating to stuck`);
+    emitDiagnostic(api, { event: "watchdog_kill", identifier: dispatch.issueIdentifier, attempt: dispatch.attempt });
 
     try {
       appendLog(dispatch.worktreePath, {

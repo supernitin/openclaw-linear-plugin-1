@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { refreshLinearToken } from "./auth.js";
+import { withResilience } from "../infra/resilience.js";
 
 export const LINEAR_GRAPHQL_URL = "https://api.linear.app/graphql";
 export const AUTH_PROFILES_PATH = join(
@@ -161,13 +162,15 @@ export class LinearAgentApi {
       ...extraHeaders,
     };
 
-    const res = await fetch(LINEAR_GRAPHQL_URL, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ query, variables }),
-    });
+    const res = await withResilience(() =>
+      fetch(LINEAR_GRAPHQL_URL, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ query, variables }),
+      }),
+    );
 
-    // If 401, try refreshing token once
+    // If 401, try refreshing token once (outside resilience — own retry semantics)
     if (res.status === 401 && this.refreshToken && this.clientId && this.clientSecret) {
       this.expiresAt = 0; // force refresh
       await this.ensureValidToken();
@@ -178,18 +181,18 @@ export class LinearAgentApi {
         ...extraHeaders,
       };
 
-      const retry = await fetch(LINEAR_GRAPHQL_URL, {
+      const retryRes = await fetch(LINEAR_GRAPHQL_URL, {
         method: "POST",
         headers: retryHeaders,
         body: JSON.stringify({ query, variables }),
       });
 
-      if (!retry.ok) {
-        const text = await retry.text();
-        throw new Error(`Linear API ${retry.status} (after refresh): ${text}`);
+      if (!retryRes.ok) {
+        const text = await retryRes.text();
+        throw new Error(`Linear API ${retryRes.status} (after refresh): ${text}`);
       }
 
-      const payload = await retry.json();
+      const payload = await retryRes.json();
       if (payload.errors?.length) {
         throw new Error(`Linear GraphQL: ${JSON.stringify(payload.errors)}`);
       }

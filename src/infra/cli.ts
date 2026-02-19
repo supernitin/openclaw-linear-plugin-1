@@ -5,8 +5,7 @@ import type { Command } from "commander";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { createInterface } from "node:readline";
 import { exec } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
-import { readFileSync as readFileSyncFs, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveLinearToken, AUTH_PROFILES_PATH, LINEAR_GRAPHQL_URL } from "../api/linear-api.js";
@@ -258,33 +257,21 @@ export function registerCli(program: Command, api: OpenClawPluginApi): void {
 
   prompts
     .command("show")
-    .description("Print current prompts.yaml content")
-    .action(async () => {
+    .description("Print resolved prompts (global or per-project)")
+    .option("--worktree <path>", "Show merged prompts for a specific worktree")
+    .action(async (opts: { worktree?: string }) => {
       const pluginConfig = (api as any).pluginConfig as Record<string, unknown> | undefined;
-      const customPath = pluginConfig?.promptsPath as string | undefined;
+      clearPromptCache();
+      const loaded = loadPrompts(pluginConfig, opts.worktree);
 
-      let resolvedPath: string;
-      if (customPath) {
-        resolvedPath = customPath.startsWith("~")
-          ? customPath.replace("~", process.env.HOME ?? "")
-          : customPath;
+      if (opts.worktree) {
+        console.log(`\nResolved prompts for worktree: ${opts.worktree}\n`);
       } else {
-        const pluginRoot = join(dirname(fileURLToPath(import.meta.url)), "../..");
-        resolvedPath = join(pluginRoot, "prompts.yaml");
+        console.log(`\nGlobal resolved prompts\n`);
       }
 
-      console.log(`\nPrompts file: ${resolvedPath}\n`);
-
-      try {
-        const content = readFileSyncFs(resolvedPath, "utf-8");
-        console.log(content);
-      } catch {
-        console.log("(file not found — using built-in defaults)\n");
-        // Show the loaded defaults
-        clearPromptCache();
-        const loaded = loadPrompts(pluginConfig);
-        console.log(JSON.stringify(loaded, null, 2));
-      }
+      console.log(JSON.stringify(loaded, null, 2));
+      console.log();
     });
 
   prompts
@@ -310,13 +297,14 @@ export function registerCli(program: Command, api: OpenClawPluginApi): void {
 
   prompts
     .command("validate")
-    .description("Validate prompts.yaml structure")
-    .action(async () => {
+    .description("Validate prompts.yaml structure (global or per-project)")
+    .option("--worktree <path>", "Validate merged prompts for a specific worktree")
+    .action(async (opts: { worktree?: string }) => {
       const pluginConfig = (api as any).pluginConfig as Record<string, unknown> | undefined;
       clearPromptCache();
 
       try {
-        const loaded = loadPrompts(pluginConfig);
+        const loaded = loadPrompts(pluginConfig, opts.worktree);
         const errors: string[] = [];
 
         if (!loaded.worker?.system) errors.push("Missing worker.system");
@@ -336,17 +324,97 @@ export function registerCli(program: Command, api: OpenClawPluginApi): void {
           }
         }
 
+        const label = opts.worktree ? `worktree ${opts.worktree}` : "global";
         if (errors.length > 0) {
-          console.log("\nValidation FAILED:\n");
+          console.log(`\nValidation FAILED (${label}):\n`);
           for (const e of errors) console.log(`  - ${e}`);
           console.log();
           process.exitCode = 1;
         } else {
-          console.log("\nValidation PASSED — all sections and template variables present.\n");
+          console.log(`\nValidation PASSED (${label}) — all sections and template variables present.\n`);
         }
       } catch (err) {
         console.error(`\nFailed to load prompts: ${err}\n`);
         process.exitCode = 1;
+      }
+    });
+
+  prompts
+    .command("init")
+    .description("Scaffold per-project .claw/prompts.yaml in a worktree")
+    .argument("<worktree-path>", "Path to the worktree")
+    .action(async (worktreePath: string) => {
+      const { mkdirSync, writeFileSync: writeFS } = await import("node:fs");
+      const clawDir = join(worktreePath, ".claw");
+      const promptsFile = join(clawDir, "prompts.yaml");
+
+      if (existsSync(promptsFile)) {
+        console.log(`\n  ${promptsFile} already exists.\n`);
+        return;
+      }
+
+      mkdirSync(clawDir, { recursive: true });
+      writeFS(promptsFile, [
+        "# Per-project prompt overrides for Linear Agent pipeline.",
+        "# Only include sections/fields you want to override.",
+        "# Unspecified fields inherit from the global prompts.yaml.",
+        "#",
+        "# Available sections: worker, audit, rework",
+        "# Template variables: {{identifier}}, {{title}}, {{description}}, {{worktreePath}}, {{tier}}, {{attempt}}, {{gaps}}",
+        "",
+        "# worker:",
+        "#   system: \"Custom system prompt for workers in this project.\"",
+        "#   task: \"Implement issue {{identifier}}: {{title}}\\n\\n{{description}}\\n\\nWorktree: {{worktreePath}}\"",
+        "",
+        "# audit:",
+        "#   system: \"Custom audit system prompt for this project.\"",
+        "",
+        "# rework:",
+        "#   addendum: \"Custom rework addendum for this project.\"",
+        "",
+      ].join("\n"), "utf-8");
+
+      console.log(`\n  Created: ${promptsFile}`);
+      console.log(`  Edit this file to customize prompts for this worktree.\n`);
+    });
+
+  prompts
+    .command("diff")
+    .description("Show differences between global and per-project prompts")
+    .argument("<worktree-path>", "Path to the worktree")
+    .action(async (worktreePath: string) => {
+      const pluginConfig = (api as any).pluginConfig as Record<string, unknown> | undefined;
+      clearPromptCache();
+
+      const global = loadPrompts(pluginConfig);
+      const merged = loadPrompts(pluginConfig, worktreePath);
+
+      const projectFile = join(worktreePath, ".claw", "prompts.yaml");
+      if (!existsSync(projectFile)) {
+        console.log(`\n  No per-project prompts at ${projectFile}`);
+        console.log(`  Run 'openclaw openclaw-linear prompts init ${worktreePath}' to create one.\n`);
+        return;
+      }
+
+      console.log(`\nPrompt diff: global vs ${worktreePath}\n`);
+
+      let hasDiffs = false;
+      for (const section of ["worker", "audit", "rework"] as const) {
+        const globalSection = global[section] as Record<string, string>;
+        const mergedSection = merged[section] as Record<string, string>;
+        for (const [key, val] of Object.entries(mergedSection)) {
+          if (globalSection[key] !== val) {
+            hasDiffs = true;
+            console.log(`  ${section}.${key}:`);
+            console.log(`    global:  ${globalSection[key]?.slice(0, 100)}...`);
+            console.log(`    project: ${val.slice(0, 100)}...`);
+            console.log();
+          }
+        }
+      }
+
+      if (!hasDiffs) {
+        console.log("  No differences — per-project prompts match global.\n");
       }
     });
 

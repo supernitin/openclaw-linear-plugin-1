@@ -337,11 +337,13 @@ describe("buildSummaryFromArtifacts", () => {
 // ---------------------------------------------------------------------------
 
 describe("writeDispatchMemory", () => {
-  it("creates memory/ dir and writes file", () => {
+  it("creates memory/ dir and writes file with frontmatter", () => {
     const tmp = makeTmpDir();
     writeDispatchMemory("API-100", "summary content", tmp);
     const content = readFileSync(join(tmp, "memory", "dispatch-API-100.md"), "utf-8");
-    expect(content).toBe("summary content");
+    expect(content).toContain("---\n");
+    expect(content).toContain('issue: "API-100"');
+    expect(content).toContain("summary content");
   });
 
   it("overwrites on second call", () => {
@@ -349,7 +351,28 @@ describe("writeDispatchMemory", () => {
     writeDispatchMemory("API-100", "first", tmp);
     writeDispatchMemory("API-100", "second", tmp);
     const content = readFileSync(join(tmp, "memory", "dispatch-API-100.md"), "utf-8");
-    expect(content).toBe("second");
+    expect(content).toContain("second");
+    expect(content).not.toContain("first");
+  });
+
+  it("includes custom metadata in frontmatter", () => {
+    const tmp = makeTmpDir();
+    writeDispatchMemory("CT-50", "done summary", tmp, {
+      title: "Fix login bug",
+      tier: "senior",
+      status: "done",
+      project: "Auth",
+      attempts: 2,
+      model: "kimi-k2.5",
+    });
+    const content = readFileSync(join(tmp, "memory", "dispatch-CT-50.md"), "utf-8");
+    expect(content).toContain('title: "Fix login bug"');
+    expect(content).toContain('tier: "senior"');
+    expect(content).toContain('status: "done"');
+    expect(content).toContain('project: "Auth"');
+    expect(content).toContain("attempts: 2");
+    expect(content).toContain('model: "kimi-k2.5"');
+    expect(content).toContain("done summary");
   });
 });
 

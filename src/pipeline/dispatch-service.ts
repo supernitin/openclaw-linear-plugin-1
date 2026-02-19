@@ -23,10 +23,12 @@ import {
   pruneCompleted,
 } from "./dispatch-state.js";
 import { getWorktreeStatus } from "../infra/codex-worktree.js";
+import { emitDiagnostic } from "../infra/observability.js";
 
 const INTERVAL_MS = 5 * 60_000; // 5 minutes
 const STALE_THRESHOLD_MS = 2 * 60 * 60_000; // 2 hours
 const COMPLETED_MAX_AGE_MS = 7 * 24 * 60 * 60_000; // 7 days
+const ZOMBIE_THRESHOLD_MS = 30 * 60_000; // 30 min — session dead but status active
 
 type ServiceContext = {
   logger: { info(msg: string): void; warn(msg: string): void; error(msg: string): void };
@@ -136,12 +138,57 @@ export function createDispatchService(api: OpenClawPluginApi) {
         }
       }
 
-      // 2. Worktree health — verify active dispatches have valid worktrees
+      // 2. Health check triangulation — cross-reference dispatch state, worktree,
+      //    and session mapping to detect zombie dispatches
       for (const [id, dispatch] of Object.entries(state.dispatches.active)) {
+        // Worktree existence check
         if (!existsSync(dispatch.worktreePath)) {
           ctx.logger.warn(
             `linear-dispatch: worktree missing for ${id} at ${dispatch.worktreePath}`
           );
+        }
+
+        // Zombie detection: dispatch says "working" or "auditing" but has been
+        // in that state for >30 min with no session mapping (session died mid-flight)
+        if (
+          (dispatch.status === "working" || dispatch.status === "auditing") &&
+          !stale.includes(dispatch)  // not already caught by stale detection
+        ) {
+          const dispatchAge = Date.now() - new Date(dispatch.dispatchedAt).getTime();
+          const hasSessionKey = dispatch.status === "working"
+            ? !!dispatch.workerSessionKey
+            : !!dispatch.auditSessionKey;
+          const sessionKeyInMap = hasSessionKey && (
+            dispatch.status === "working"
+              ? !!state.sessionMap[dispatch.workerSessionKey!]
+              : !!state.sessionMap[dispatch.auditSessionKey!]
+          );
+
+          // If dispatch is active but session mapping is gone → zombie
+          if (dispatchAge > ZOMBIE_THRESHOLD_MS && hasSessionKey && !sessionKeyInMap) {
+            ctx.logger.warn(
+              `linear-dispatch: zombie detected ${id} — ${dispatch.status} for ` +
+              `${Math.round(dispatchAge / 60_000)}m but session mapping missing`
+            );
+            emitDiagnostic(api, {
+              event: "health_check",
+              identifier: id,
+              phase: dispatch.status,
+              error: "zombie_session",
+            });
+            // Transition to stuck
+            try {
+              await transitionDispatch(
+                id, dispatch.status, "stuck",
+                { stuckReason: "zombie_session" }, statePath,
+              );
+              ctx.logger.info(`linear-dispatch: ${id} → stuck (zombie)`);
+            } catch (err) {
+              if (err instanceof TransitionError) {
+                ctx.logger.info(`linear-dispatch: CAS failed for zombie transition: ${(err as TransitionError).message}`);
+              }
+            }
+          }
         }
       }
 

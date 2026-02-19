@@ -229,22 +229,58 @@ export function buildSummaryFromArtifacts(worktreePath: string): string | null {
 // Memory integration
 // ---------------------------------------------------------------------------
 
+export interface DispatchMemoryMetadata {
+  type: "dispatch";
+  issue: string;
+  title: string;
+  tier: string;
+  status: string;
+  project?: string;
+  attempts: number;
+  model: string;
+  date: string;
+}
+
 /**
- * Write dispatch summary to the orchestrator's memory directory.
+ * Write dispatch summary to the orchestrator's memory directory
+ * with YAML frontmatter for searchable metadata.
  * Auto-indexed by OpenClaw's sqlite+embeddings memory system.
  */
 export function writeDispatchMemory(
   issueIdentifier: string,
   summary: string,
   workspaceDir: string,
+  metadata?: Partial<DispatchMemoryMetadata>,
 ): void {
   const memDir = join(workspaceDir, "memory");
   if (!existsSync(memDir)) {
     mkdirSync(memDir, { recursive: true });
   }
+
+  const fm: DispatchMemoryMetadata = {
+    type: "dispatch",
+    issue: issueIdentifier,
+    title: metadata?.title ?? issueIdentifier,
+    tier: metadata?.tier ?? "unknown",
+    status: metadata?.status ?? "unknown",
+    project: metadata?.project,
+    attempts: metadata?.attempts ?? 0,
+    model: metadata?.model ?? "unknown",
+    date: metadata?.date ?? new Date().toISOString().slice(0, 10),
+  };
+
+  const frontmatter = [
+    "---",
+    ...Object.entries(fm)
+      .filter(([, v]) => v !== undefined)
+      .map(([k, v]) => `${k}: ${typeof v === "string" ? `"${v}"` : v}`),
+    "---",
+    "",
+  ].join("\n");
+
   writeFileSync(
     join(memDir, `dispatch-${issueIdentifier}.md`),
-    summary,
+    frontmatter + summary,
     "utf-8",
   );
 }

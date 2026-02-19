@@ -3,6 +3,7 @@ import { existsSync, statSync, readdirSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { ensureGitignore } from "../pipeline/artifacts.js";
+import type { RepoConfig } from "./multi-repo.js";
 
 const DEFAULT_BASE_REPO = "/home/claw/ai-workspace";
 const DEFAULT_WORKTREE_BASE_DIR = path.join(homedir(), ".openclaw", "worktrees");
@@ -115,6 +116,88 @@ export function createWorktree(
   git(["worktree", "add", "-b", branch, worktreePath], repo);
   ensureGitignore(worktreePath);
   return { path: worktreePath, branch, resumed: false };
+}
+
+export interface MultiWorktreeResult {
+  /** Parent directory containing all repo worktrees for this issue. */
+  parentPath: string;
+  worktrees: Array<{
+    repoName: string;
+    path: string;
+    branch: string;
+    resumed: boolean;
+  }>;
+}
+
+/**
+ * Create worktrees for multiple repos.
+ *
+ * Layout: {baseDir}/{issueIdentifier}/{repoName}/
+ * Branch: codex/{issueIdentifier} (same branch name in each repo)
+ *
+ * Each individual repo worktree follows the same idempotent/resume logic
+ * as createWorktree: if the worktree or branch already exists, it resumes.
+ */
+export function createMultiWorktree(
+  identifier: string,
+  repos: RepoConfig[],
+  opts?: { baseDir?: string },
+): MultiWorktreeResult {
+  const baseDir = resolveBaseDir(opts?.baseDir);
+  const parentPath = path.join(baseDir, identifier);
+
+  // Ensure parent directory exists
+  if (!existsSync(parentPath)) {
+    mkdirSync(parentPath, { recursive: true });
+  }
+
+  const branch = `codex/${identifier}`;
+  const worktrees: MultiWorktreeResult["worktrees"] = [];
+
+  for (const repo of repos) {
+    if (!existsSync(repo.path)) {
+      throw new Error(`Repo not found: ${repo.name} at ${repo.path}`);
+    }
+
+    const worktreePath = path.join(parentPath, repo.name);
+
+    // Fetch latest from origin (best effort)
+    try {
+      git(["fetch", "origin"], repo.path);
+    } catch {
+      // Offline or no remote — continue with local state
+    }
+
+    // Idempotent: if worktree already exists, resume it
+    if (existsSync(worktreePath)) {
+      try {
+        git(["rev-parse", "--git-dir"], worktreePath);
+        ensureGitignore(worktreePath);
+        worktrees.push({ repoName: repo.name, path: worktreePath, branch, resumed: true });
+        continue;
+      } catch {
+        // Directory exists but isn't a valid worktree — remove and recreate
+        try {
+          git(["worktree", "remove", "--force", worktreePath], repo.path);
+        } catch { /* best effort */ }
+      }
+    }
+
+    // Check if branch already exists (resume scenario)
+    const exists = branchExistsInRepo(branch, repo.path);
+
+    if (exists) {
+      git(["worktree", "add", worktreePath, branch], repo.path);
+      ensureGitignore(worktreePath);
+      worktrees.push({ repoName: repo.name, path: worktreePath, branch, resumed: true });
+    } else {
+      git(["worktree", "add", "-b", branch, worktreePath], repo.path);
+      ensureGitignore(worktreePath);
+      worktrees.push({ repoName: repo.name, path: worktreePath, branch, resumed: false });
+    }
+  }
+
+  return { parentPath, worktrees };
 }
 
 /**

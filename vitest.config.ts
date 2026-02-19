@@ -12,6 +12,8 @@ export default defineConfig({
         "src/pipeline/active-session.ts",
         "src/pipeline/planning-state.ts",
         "src/pipeline/planner.ts",
+        "src/pipeline/dag-dispatch.ts",
+        "src/pipeline/webhook.ts",
         "src/tools/planner-tools.ts",
         "src/infra/notify.ts",
         "src/agent/watchdog.ts",

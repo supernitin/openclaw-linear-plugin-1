@@ -15,10 +15,9 @@
       "defaultAgentId": { "type": "string", "description": "OpenClaw agent ID to use for pipeline stages" },
       "enableAudit": { "type": "boolean", "description": "Run auditor stage after implementation", "default": true },
       "codexBaseRepo": { "type": "string", "description": "Path to git repo for Codex worktrees", "default": "/home/claw/ai-workspace" },
-      "codexModel": { "type": "string", "description": "Default Codex model (optional — uses Codex default if omitted)" },
-      "codexTimeoutMs": { "type": "number", "description": "Default Codex timeout in milliseconds", "default": 600000 },
       "enableOrchestration": { "type": "boolean", "description": "Allow agents to spawn sub-agents via spawn_agent/ask_agent tools", "default": true },
       "worktreeBaseDir": { "type": "string", "description": "Base directory for persistent git worktrees (default: ~/.openclaw/worktrees)" },
+      "repos": { "type": "object", "description": "Multi-repo map (name → path, e.g. {\"api\": \"/home/claw/api\", \"frontend\": \"/home/claw/frontend\"})", "additionalProperties": { "type": "string" } },
       "dispatchStatePath": { "type": "string", "description": "Path to dispatch state JSON file (default: ~/.openclaw/linear-dispatch-state.json)" },
       "planningStatePath": { "type": "string", "description": "Path to planning state JSON file (default: ~/.openclaw/linear-planning-state.json)" },
       "notifications": {
@@ -51,7 +50,8 @@
               "stuck": { "type": "boolean" },
               "watchdog_kill": { "type": "boolean" }
             }
-          }
+          },
+          "richFormat": { "type": "boolean", "description": "Send rich embeds (Discord) and HTML (Telegram) instead of plain text", "default": false }
         }
       },
       "promptsPath": { "type": "string", "description": "Override path for prompts.yaml (default: ships with plugin)" },

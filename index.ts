@@ -7,11 +7,15 @@ import { handleLinearWebhook } from "./src/pipeline/webhook.js";
 import { handleOAuthCallback } from "./src/api/oauth-callback.js";
 import { LinearAgentApi, resolveLinearToken } from "./src/api/linear-api.js";
 import { createDispatchService } from "./src/pipeline/dispatch-service.js";
+import { registerDispatchMethods } from "./src/gateway/dispatch-methods.js";
 import { readDispatchState, lookupSessionMapping, getActiveDispatch } from "./src/pipeline/dispatch-state.js";
 import { triggerAudit, processVerdict, type HookContext } from "./src/pipeline/pipeline.js";
 import { createNotifierFromConfig, type NotifyFn } from "./src/infra/notify.js";
 import { readPlanningState, setPlanningCache } from "./src/pipeline/planning-state.js";
 import { createPlannerTools } from "./src/tools/planner-tools.js";
+import { registerDispatchCommands } from "./src/infra/commands.js";
+import { createDispatchHistoryTool } from "./src/tools/dispatch-history-tool.js";
+import { readDispatchState as readStateForHook, listActiveDispatches as listActiveForHook } from "./src/pipeline/dispatch-state.js";
 
 export default function register(api: OpenClawPluginApi) {
   const pluginConfig = (api as any).pluginConfig as Record<string, unknown> | undefined;
@@ -41,6 +45,12 @@ export default function register(api: OpenClawPluginApi) {
   // Register planner tools (context injected at runtime via setActivePlannerContext)
   api.registerTool(() => createPlannerTools());
 
+  // Register dispatch_history tool for agent context
+  api.registerTool(() => createDispatchHistoryTool(api, pluginConfig));
+
+  // Register zero-LLM slash commands for dispatch ops
+  registerDispatchCommands(api);
+
   // Register Linear webhook handler on a dedicated route
   api.registerHttpRoute({
     path: "/linear/webhook",
@@ -68,6 +78,9 @@ export default function register(api: OpenClawPluginApi) {
   // Register dispatch monitor service (stale detection, session hydration, cleanup)
   api.registerService(createDispatchService(api));
 
+  // Register dispatch gateway RPC methods (list, get, retry, escalate, cancel, stats)
+  registerDispatchMethods(api);
+
   // Hydrate planning state on startup
   readPlanningState(pluginConfig?.planningStatePath as string | undefined).then((state) => {
     for (const session of Object.values(state.sessions)) {
@@ -83,7 +96,7 @@ export default function register(api: OpenClawPluginApi) {
   // ---------------------------------------------------------------------------
 
   // Instantiate notifier (Discord, Slack, or both — config-driven)
-  const notify: NotifyFn = createNotifierFromConfig(pluginConfig, api.runtime);
+  const notify: NotifyFn = createNotifierFromConfig(pluginConfig, api.runtime, api);
 
   // Register agent_end hook — safety net for sessions_spawn sub-agents.
   // In the current implementation, the worker→audit→verdict flow runs inline
@@ -156,6 +169,32 @@ export default function register(api: OpenClawPluginApi) {
       }
     } catch (err) {
       api.logger.error(`agent_end hook error: ${err}`);
+    }
+  });
+
+  // Inject recent dispatch history as context for worker/audit agents
+  api.on("before_agent_start", async (event: any, ctx: any) => {
+    try {
+      const sessionKey = ctx?.sessionKey ?? "";
+      if (!sessionKey.startsWith("linear-worker-") && !sessionKey.startsWith("linear-audit-")) return;
+
+      const statePath = pluginConfig?.dispatchStatePath as string | undefined;
+      const state = await readStateForHook(statePath);
+      const active = listActiveForHook(state);
+
+      // Include up to 3 recent active dispatches as context
+      const recent = active.slice(0, 3);
+      if (recent.length === 0) return;
+
+      const lines = recent.map(d =>
+        `- **${d.issueIdentifier}** (${d.tier}): ${d.status}, attempt ${d.attempt}`
+      );
+
+      return {
+        prependContext: `<dispatch-history>\nActive dispatches:\n${lines.join("\n")}\n</dispatch-history>\n\n`,
+      };
+    } catch {
+      // Never block agent start for telemetry
     }
   });
 

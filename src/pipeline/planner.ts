@@ -6,11 +6,8 @@
  * - handlePlannerTurn: processes each user comment during planning
  * - runPlanAudit: validates the plan before finalizing
  */
-import { readFileSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
-import { parse as parseYaml } from "yaml";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import { loadRawPromptYaml } from "./pipeline.js";
 import type { LinearAgentApi } from "../api/linear-api.js";
 import { runAgent } from "../agent/agent.js";
 import {
@@ -56,30 +53,15 @@ function loadPlannerPrompts(pluginConfig?: Record<string, unknown>): PlannerProm
     welcome: "Entering planning mode for **{{projectName}}**. What are the main feature areas?",
   };
 
-  try {
-    const customPath = pluginConfig?.promptsPath as string | undefined;
-    let raw: string;
-
-    if (customPath) {
-      const resolved = customPath.startsWith("~")
-        ? customPath.replace("~", process.env.HOME ?? "")
-        : customPath;
-      raw = readFileSync(resolved, "utf-8");
-    } else {
-      const pluginRoot = join(dirname(fileURLToPath(import.meta.url)), "../..");
-      raw = readFileSync(join(pluginRoot, "prompts.yaml"), "utf-8");
-    }
-
-    const parsed = parseYaml(raw) as any;
-    if (parsed?.planner) {
-      return {
-        system: parsed.planner.system ?? defaults.system,
-        interview: parsed.planner.interview ?? defaults.interview,
-        audit_prompt: parsed.planner.audit_prompt ?? defaults.audit_prompt,
-        welcome: parsed.planner.welcome ?? defaults.welcome,
-      };
-    }
-  } catch { /* use defaults */ }
+  const parsed = loadRawPromptYaml(pluginConfig);
+  if (parsed?.planner) {
+    return {
+      system: parsed.planner.system ?? defaults.system,
+      interview: parsed.planner.interview ?? defaults.interview,
+      audit_prompt: parsed.planner.audit_prompt ?? defaults.audit_prompt,
+      welcome: parsed.planner.welcome ?? defaults.welcome,
+    };
+  }
 
   return defaults;
 }
@@ -149,13 +131,14 @@ export async function handlePlannerTurn(
   ctx: PlannerContext,
   session: PlanningSession,
   input: { issueId: string; commentBody: string; commentorName: string },
+  opts?: { onApproved?: (projectId: string) => void },
 ): Promise<void> {
   const { api, linearApi, pluginConfig } = ctx;
   const configPath = pluginConfig?.planningStatePath as string | undefined;
 
   // Detect finalization intent
   if (FINALIZE_PATTERN.test(input.commentBody)) {
-    await runPlanAudit(ctx, session);
+    await runPlanAudit(ctx, session, { onApproved: opts?.onApproved });
     return;
   }
 
@@ -234,6 +217,7 @@ export async function handlePlannerTurn(
 export async function runPlanAudit(
   ctx: PlannerContext,
   session: PlanningSession,
+  opts?: { onApproved?: (projectId: string) => void },
 ): Promise<void> {
   const { api, linearApi, pluginConfig } = ctx;
   const configPath = pluginConfig?.planningStatePath as string | undefined;
@@ -262,6 +246,9 @@ export async function runPlanAudit(
 
     await endPlanningSession(session.projectId, "approved", configPath);
     api.logger.info(`Planning: session approved for ${session.projectName}`);
+
+    // Trigger DAG-based dispatch if callback provided
+    opts?.onApproved?.(session.projectId);
   } else {
     // Post problems and keep planning
     const problemsList = result.problems.map((p) => `- ${p}`).join("\n");

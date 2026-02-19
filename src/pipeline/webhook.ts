@@ -8,10 +8,13 @@ import { setActiveSession, clearActiveSession } from "./active-session.js";
 import { readDispatchState, getActiveDispatch, registerDispatch, updateDispatchStatus, completeDispatch, removeActiveDispatch } from "./dispatch-state.js";
 import { createNotifierFromConfig, type NotifyFn } from "../infra/notify.js";
 import { assessTier } from "./tier-assess.js";
-import { createWorktree, prepareWorkspace } from "../infra/codex-worktree.js";
-import { ensureClawDir, writeManifest } from "./artifacts.js";
+import { createWorktree, createMultiWorktree, prepareWorkspace } from "../infra/codex-worktree.js";
+import { resolveRepos, isMultiRepo } from "../infra/multi-repo.js";
+import { ensureClawDir, writeManifest, writeDispatchMemory, resolveOrchestratorWorkspace } from "./artifacts.js";
 import { readPlanningState, isInPlanningMode, getPlanningSession } from "./planning-state.js";
 import { initiatePlanningSession, handlePlannerTurn } from "./planner.js";
+import { startProjectDispatch } from "./dag-dispatch.js";
+import { emitDiagnostic } from "../infra/observability.js";
 
 // ── Agent profiles (loaded from config, no hardcoded names) ───────
 interface AgentProfile {
@@ -148,6 +151,7 @@ export async function handleLinearWebhook(
   // Debug: log full payload structure for diagnosing webhook types
   const payloadKeys = Object.keys(payload).join(", ");
   api.logger.info(`Linear webhook received: type=${payload.type} action=${payload.action} keys=[${payloadKeys}]`);
+  emitDiagnostic(api, { event: "webhook_received", webhookType: payload.type, webhookAction: payload.action });
 
 
   // ── AppUserNotification — OAuth app webhook for agent mentions/assignments
@@ -666,6 +670,8 @@ export async function handleLinearWebhook(
     const issue = comment?.issue ?? payload.issue;
 
     // ── Planning mode intercept ──────────────────────────────────
+    const pluginConfig = (api as any).pluginConfig as Record<string, unknown> | undefined;
+
     if (issue?.id) {
       const linearApiForPlanning = createLinearApi(api);
       if (linearApiForPlanning) {
@@ -698,6 +704,20 @@ export async function handleLinearWebhook(
                   { api, linearApi: linearApiForPlanning, pluginConfig },
                   session,
                   { issueId: issue.id, commentBody, commentorName: commentor },
+                  {
+                    onApproved: (approvedProjectId) => {
+                      const notify = createNotifierFromConfig(pluginConfig, api.runtime, api);
+                      const hookCtx: HookContext = {
+                        api,
+                        linearApi: linearApiForPlanning,
+                        notify,
+                        pluginConfig,
+                        configPath: pluginConfig?.dispatchStatePath as string | undefined,
+                      };
+                      void startProjectDispatch(hookCtx, approvedProjectId)
+                        .catch((err) => api.logger.error(`Project dispatch start error: ${err}`));
+                    },
+                  },
                 ).catch((err) => api.logger.error(`Planner turn error: ${err}`));
               }
               return true;
@@ -1273,6 +1293,9 @@ async function handleDispatch(
   const labels = enrichedIssue.labels?.nodes?.map((l: any) => l.name) ?? [];
   const commentCount = enrichedIssue.comments?.nodes?.length ?? 0;
 
+  // Resolve repos for this dispatch (issue body markers, labels, or config default)
+  const repoResolution = resolveRepos(enrichedIssue.description, labels, pluginConfig);
+
   // 4. Assess complexity tier
   const assessment = await assessTier(api, {
     identifier,
@@ -1283,12 +1306,29 @@ async function handleDispatch(
   });
 
   api.logger.info(`@dispatch: ${identifier} assessed as ${assessment.tier} (${assessment.model}) — ${assessment.reasoning}`);
+  emitDiagnostic(api, { event: "dispatch_started", identifier, tier: assessment.tier, issueId: issue.id });
 
-  // 5. Create persistent worktree
-  let worktree;
+  // 5. Create persistent worktree(s)
+  let worktreePath: string;
+  let worktreeBranch: string;
+  let worktreeResumed: boolean;
+  let worktrees: Array<{ repoName: string; path: string; branch: string }> | undefined;
+
   try {
-    worktree = createWorktree(identifier, { baseRepo, baseDir: worktreeBaseDir });
-    api.logger.info(`@dispatch: worktree ${worktree.resumed ? "resumed" : "created"} at ${worktree.path}`);
+    if (isMultiRepo(repoResolution)) {
+      const multi = createMultiWorktree(identifier, repoResolution.repos, { baseDir: worktreeBaseDir });
+      worktreePath = multi.parentPath;
+      worktreeBranch = `codex/${identifier}`;
+      worktreeResumed = multi.worktrees.some(w => w.resumed);
+      worktrees = multi.worktrees.map(w => ({ repoName: w.repoName, path: w.path, branch: w.branch }));
+      api.logger.info(`@dispatch: multi-repo worktrees ${worktreeResumed ? "resumed" : "created"} at ${worktreePath} (${repoResolution.repos.map(r => r.name).join(", ")})`);
+    } else {
+      const single = createWorktree(identifier, { baseRepo, baseDir: worktreeBaseDir });
+      worktreePath = single.path;
+      worktreeBranch = single.branch;
+      worktreeResumed = single.resumed;
+      api.logger.info(`@dispatch: worktree ${worktreeResumed ? "resumed" : "created"} at ${worktreePath}`);
+    }
   } catch (err) {
     api.logger.error(`@dispatch: worktree creation failed: ${err}`);
     await linearApi.createComment(
@@ -1298,14 +1338,21 @@ async function handleDispatch(
     return;
   }
 
-  // 5b. Prepare workspace: pull latest from origin + init submodules
-  const prep = prepareWorkspace(worktree.path, worktree.branch);
-  if (prep.errors.length > 0) {
-    api.logger.warn(`@dispatch: workspace prep had errors: ${prep.errors.join("; ")}`);
+  // 5b. Prepare workspace(s)
+  if (worktrees) {
+    for (const wt of worktrees) {
+      const prep = prepareWorkspace(wt.path, wt.branch);
+      if (prep.errors.length > 0) {
+        api.logger.warn(`@dispatch: workspace prep for ${wt.repoName} had errors: ${prep.errors.join("; ")}`);
+      }
+    }
   } else {
-    api.logger.info(
-      `@dispatch: workspace prepared — pulled=${prep.pulled}, submodules=${prep.submodulesInitialized}`,
-    );
+    const prep = prepareWorkspace(worktreePath, worktreeBranch);
+    if (prep.errors.length > 0) {
+      api.logger.warn(`@dispatch: workspace prep had errors: ${prep.errors.join("; ")}`);
+    } else {
+      api.logger.info(`@dispatch: workspace prepared — pulled=${prep.pulled}, submodules=${prep.submodulesInitialized}`);
+    }
   }
 
   // 6. Create agent session on Linear
@@ -1319,16 +1366,16 @@ async function handleDispatch(
 
   // 6b. Initialize .claw/ artifact directory
   try {
-    ensureClawDir(worktree.path);
-    writeManifest(worktree.path, {
+    ensureClawDir(worktreePath);
+    writeManifest(worktreePath, {
       issueIdentifier: identifier,
       issueTitle: enrichedIssue.title ?? "(untitled)",
       issueId: issue.id,
       tier: assessment.tier,
       model: assessment.model,
       dispatchedAt: new Date().toISOString(),
-      worktreePath: worktree.path,
-      branch: worktree.branch,
+      worktreePath,
+      branch: worktreeBranch,
       attempts: 0,
       status: "dispatched",
       plugin: "openclaw-linear",
@@ -1343,14 +1390,16 @@ async function handleDispatch(
     issueId: issue.id,
     issueIdentifier: identifier,
     issueTitle: enrichedIssue.title ?? "(untitled)",
-    worktreePath: worktree.path,
-    branch: worktree.branch,
+    worktreePath,
+    branch: worktreeBranch,
     tier: assessment.tier,
     model: assessment.model,
     status: "dispatched",
     dispatchedAt: now,
     agentSessionId,
     attempt: 0,
+    project: enrichedIssue?.project?.id,
+    worktrees,
   }, statePath);
 
   // 8. Register active session for tool resolution
@@ -1363,16 +1412,17 @@ async function handleDispatch(
   });
 
   // 9. Post dispatch confirmation comment
-  const prepStatus = prep.errors.length > 0
-    ? `Workspace prep: partial (${prep.errors.join("; ")})`
-    : `Workspace prep: OK (pulled=${prep.pulled}, submodules=${prep.submodulesInitialized})`;
+  const worktreeDesc = worktrees
+    ? worktrees.map(wt => `\`${wt.repoName}\`: \`${wt.path}\``).join("\n")
+    : `\`${worktreePath}\``;
   const statusComment = [
     `**Dispatched** as **${assessment.tier}** (${assessment.model})`,
     `> ${assessment.reasoning}`,
     ``,
-    `Worktree: \`${worktree.path}\` ${worktree.resumed ? "(resumed)" : "(fresh)"}`,
-    `Branch: \`${worktree.branch}\``,
-    prepStatus,
+    worktrees
+      ? `Worktrees ${worktreeResumed ? "(resumed)" : "(fresh)"}:\n${worktreeDesc}`
+      : `Worktree: ${worktreeDesc} ${worktreeResumed ? "(resumed)" : "(fresh)"}`,
+    `Branch: \`${worktreeBranch}\``,
   ].join("\n");
 
   await linearApi.createComment(issue.id, statusComment);
@@ -1404,7 +1454,7 @@ async function handleDispatch(
   activeRuns.add(issue.id);
 
   // Instantiate notifier (Discord, Slack, or both — config-driven)
-  const notify: NotifyFn = createNotifierFromConfig(pluginConfig, api.runtime);
+  const notify: NotifyFn = createNotifierFromConfig(pluginConfig, api.runtime, api);
 
   const hookCtx: HookContext = {
     api,
@@ -1429,6 +1479,18 @@ async function handleDispatch(
     .catch(async (err) => {
       api.logger.error(`@dispatch: pipeline v2 failed for ${identifier}: ${err}`);
       await updateDispatchStatus(identifier, "failed", statePath);
+      // Write memory for failed dispatches so they're searchable in dispatch history
+      try {
+        const wsDir = resolveOrchestratorWorkspace(api, pluginConfig);
+        writeDispatchMemory(identifier, `Pipeline failed: ${String(err).slice(0, 500)}`, wsDir, {
+          title: enrichedIssue.title ?? identifier,
+          tier: assessment.tier,
+          status: "failed",
+          project: enrichedIssue?.project?.id,
+          attempts: 1,
+          model: assessment.model,
+        });
+      } catch { /* best effort */ }
     })
     .finally(() => {
       activeRuns.delete(issue.id);
