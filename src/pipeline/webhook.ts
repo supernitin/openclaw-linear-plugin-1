@@ -155,158 +155,14 @@ export async function handleLinearWebhook(
   emitDiagnostic(api, { event: "webhook_received", webhookType: payload.type, webhookAction: payload.action });
 
 
-  // ── AppUserNotification — OAuth app webhook for agent mentions/assignments
+  // ── AppUserNotification — IGNORED ─────────────────────────────────
+  // AppUserNotification duplicates events already handled by the workspace
+  // webhook (Comment.create for mentions, Issue.update for assignments).
+  // Processing both causes double agent runs. Ack and discard.
   if (payload.type === "AppUserNotification") {
+    api.logger.info(`AppUserNotification ignored (duplicate of workspace webhook): ${payload.notification?.type} appUserId=${payload.appUserId}`);
     res.statusCode = 200;
     res.end("ok");
-
-    const notification = payload.notification;
-    const notifType = notification?.type;
-    api.logger.info(`AppUserNotification: ${notifType} appUserId=${payload.appUserId}`);
-
-    const issue = notification?.issue;
-    const comment = notification?.comment ?? notification?.parentComment;
-
-    if (!issue?.id) {
-      api.logger.error("AppUserNotification missing issue data");
-      return true;
-    }
-
-    const linearApi = createLinearApi(api);
-    if (!linearApi) {
-      api.logger.error("No Linear access token — cannot process agent notification");
-      return true;
-    }
-
-    const agentId = resolveAgentId(api);
-
-    // Fetch full issue details
-    let enrichedIssue: any = issue;
-    try {
-      enrichedIssue = await linearApi.getIssueDetails(issue.id);
-    } catch (err) {
-      api.logger.warn(`Could not fetch issue details: ${err}`);
-    }
-
-    const description = enrichedIssue?.description ?? issue?.description ?? "(no description)";
-    const comments = enrichedIssue?.comments?.nodes ?? [];
-    const commentSummary = comments
-      .slice(-5)
-      .map((c: any) => `  - **${c.user?.name ?? "Unknown"}**: ${c.body?.slice(0, 200)}`)
-      .join("\n");
-
-    const notifIssueRef = enrichedIssue?.identifier ?? issue.id;
-    const message = [
-      `You are an orchestrator responding to a Linear issue notification. Your text output will be automatically posted as a comment on the issue (do NOT post a comment yourself — the handler does it).`,
-      ``,
-      `**Tool access:**`,
-      `- \`linearis\` CLI: READ ONLY. You can read issues (\`linearis issues read ${notifIssueRef}\`), list, and search. Do NOT use linearis to update, close, comment, or modify issues.`,
-      `- \`code_run\`: Dispatch coding work to a worker. Workers return text — they cannot access linearis.`,
-      `- Standard tools: exec, read, edit, write, web_search, etc.`,
-      ``,
-      `**Your role:** Dispatcher. For work requests, use \`code_run\`. You do NOT update issue status — the audit system handles lifecycle.`,
-      ``,
-      `## Issue: ${notifIssueRef} — ${enrichedIssue?.title ?? issue.title ?? "(untitled)"}`,
-      `**Status:** ${enrichedIssue?.state?.name ?? "Unknown"} | **Assignee:** ${enrichedIssue?.assignee?.name ?? "Unassigned"}`,
-      ``,
-      `**Description:**`,
-      description,
-      commentSummary ? `\n**Recent comments:**\n${commentSummary}` : "",
-      comment?.body ? `\n**Triggering comment:**\n> ${comment.body}` : "",
-      ``,
-      `Respond concisely. For work requests, dispatch via \`code_run\` and summarize the result.`,
-    ].filter(Boolean).join("\n");
-
-    // Dispatch agent with session lifecycle (non-blocking)
-    void (async () => {
-      const profiles = loadAgentProfiles();
-      const defaultProfile = Object.entries(profiles).find(([, p]) => p.isDefault);
-      const label = defaultProfile?.[1]?.label ?? profiles[agentId]?.label ?? agentId;
-      const avatarUrl = defaultProfile?.[1]?.avatarUrl ?? profiles[agentId]?.avatarUrl;
-      let agentSessionId: string | null = null;
-
-      try {
-        // 1. Create agent session (non-fatal)
-        const sessionResult = await linearApi.createSessionOnIssue(issue.id);
-        agentSessionId = sessionResult.sessionId;
-        if (agentSessionId) {
-          api.logger.info(`Created agent session ${agentSessionId} for notification`);
-          setActiveSession({
-            agentSessionId,
-            issueIdentifier: enrichedIssue?.identifier ?? issue.id,
-            issueId: issue.id,
-            agentId,
-            startedAt: Date.now(),
-          });
-        } else {
-          api.logger.warn(`Could not create agent session for notification: ${sessionResult.error ?? "unknown"}`);
-        }
-
-        // 2. Emit thought
-        if (agentSessionId) {
-          await linearApi.emitActivity(agentSessionId, {
-            type: "thought",
-            body: `Reviewing ${enrichedIssue?.identifier ?? issue.id}...`,
-          }).catch(() => {});
-        }
-
-        // 3. Run agent with streaming
-        const sessionId = `linear-notif-${notification?.type ?? "unknown"}-${Date.now()}`;
-        const { runAgent } = await import("../agent/agent.js");
-        const result = await runAgent({
-          api,
-          agentId,
-          sessionId,
-          message,
-          timeoutMs: 3 * 60_000,
-          streaming: agentSessionId ? { linearApi, agentSessionId } : undefined,
-        });
-
-        const responseBody = result.success
-          ? result.output
-          : `Something went wrong while processing this. The system will retry automatically if possible. If this keeps happening, run \`openclaw openclaw-linear doctor\` to check for issues.`;
-
-        // 5. Post branded comment (fallback to prefix)
-        const brandingOpts = avatarUrl
-          ? { createAsUser: label, displayIconUrl: avatarUrl }
-          : undefined;
-
-        try {
-          if (brandingOpts) {
-            await linearApi.createComment(issue.id, responseBody, brandingOpts);
-          } else {
-            await linearApi.createComment(issue.id, `**[${label}]** ${responseBody}`);
-          }
-        } catch (brandErr) {
-          api.logger.warn(`Branded comment failed, falling back to prefix: ${brandErr}`);
-          await linearApi.createComment(issue.id, `**[${label}]** ${responseBody}`);
-        }
-
-        // 6. Emit response (closes session)
-        if (agentSessionId) {
-          const truncated = responseBody.length > 2000
-            ? responseBody.slice(0, 2000) + "…"
-            : responseBody;
-          await linearApi.emitActivity(agentSessionId, {
-            type: "response",
-            body: truncated,
-          }).catch(() => {});
-        }
-
-        api.logger.info(`Posted agent response to ${enrichedIssue?.identifier ?? issue.id}`);
-      } catch (err) {
-        api.logger.error(`AppUserNotification handler error: ${err}`);
-        if (agentSessionId) {
-          await linearApi.emitActivity(agentSessionId, {
-            type: "error",
-            body: `Failed to process notification: ${String(err).slice(0, 500)}`,
-          }).catch(() => {});
-        }
-      } finally {
-        clearActiveSession(issue.id);
-      }
-    })();
-
     return true;
   }
 
@@ -965,6 +821,14 @@ export async function handleLinearWebhook(
 
     const agentId = resolveAgentId(api);
 
+    // Guard: prevent duplicate runs on same issue (also blocks AgentSessionEvent
+    // webhooks that arrive from sessions we create during triage)
+    if (activeRuns.has(issue.id)) {
+      api.logger.info(`Issue.create: ${issue.identifier ?? issue.id} already has active run — skipping triage`);
+      return true;
+    }
+    activeRuns.add(issue.id);
+
     // Dispatch triage (non-blocking)
     void (async () => {
       const profiles = loadAgentProfiles();
@@ -1172,6 +1036,7 @@ export async function handleLinearWebhook(
         }
       } finally {
         clearActiveSession(issue.id);
+        activeRuns.delete(issue.id);
       }
     })();
 
@@ -1481,6 +1346,9 @@ async function handleDispatch(
   }
 
   // 6. Create agent session on Linear
+  // Mark active BEFORE session creation so that any AgentSessionEvent.created
+  // webhook arriving from this call is blocked by the activeRuns guard.
+  activeRuns.add(issue.id);
   let agentSessionId: string | undefined;
   try {
     const sessionResult = await linearApi.createSessionOnIssue(issue.id);
@@ -1583,7 +1451,7 @@ async function handleDispatch(
   }
 
   // 11. Run v2 pipeline: worker → audit → verdict (non-blocking)
-  activeRuns.add(issue.id);
+  // (activeRuns already set in step 6 above)
 
   // Instantiate notifier (Discord, Slack, or both — config-driven)
   const notify: NotifyFn = createNotifierFromConfig(pluginConfig, api.runtime, api);
