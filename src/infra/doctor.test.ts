@@ -457,7 +457,7 @@ describe("buildSummary", () => {
 // checkCodeRunDeep
 // ---------------------------------------------------------------------------
 
-describe("checkCodeRunDeep", () => {
+describe.skipIf(process.env.CI)("checkCodeRunDeep", () => {
   // Run a single invocation and share results across assertions to avoid
   // repeated 30s live CLI calls (the live test spawns all 3 backends).
   let sections: Awaited<ReturnType<typeof checkCodeRunDeep>>;

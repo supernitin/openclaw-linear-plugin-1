@@ -30,9 +30,11 @@ jobs:
           mkdir -p ~/.openclaw
           echo '{}' > ~/.openclaw/auth-profiles.json
           echo '{"agents":{"default":{"label":"Default","isDefault":true,"mentionAliases":["default"]}}}' > ~/.openclaw/agent-profiles.json
+          echo '{"active":{"test-1":{"issueId":"TEST-1","status":"working","tier":"small","attempt":0,"createdAt":"2026-01-01T00:00:00Z"}},"completed":{}}' > ~/.openclaw/linear-dispatch-state.json
 
       - run: npx vitest run --coverage --exclude 'src/__test__/smoke-*.test.ts'
         env:
+          CI: "true"
           NODE_OPTIONS: "--max-old-space-size=4096"
 
       - name: Upload coverage to Codecov
