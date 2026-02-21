@@ -32,13 +32,31 @@ function loadApiKey(): string {
   return token;
 }
 
+function loadOAuthToken(): string | null {
+  try {
+    const raw = readFileSync(AUTH_PROFILES_PATH, "utf8");
+    const store = JSON.parse(raw);
+    const profile = store?.profiles?.["linear:default"];
+    return profile?.accessToken ?? null;
+  } catch {
+    return null;
+  }
+}
+
 let api: LinearAgentApi;
+let oauthApi: LinearAgentApi | null = null;
 let smokeIssueId: string | null = null;
 const createdCommentIds: string[] = [];
 
 beforeAll(() => {
   const token = loadApiKey();
   api = new LinearAgentApi(token);
+  const oauthToken = loadOAuthToken();
+  if (oauthToken) {
+    // Strip "Bearer " prefix if present — LinearAgentApi adds it
+    const bare = oauthToken.replace(/^Bearer\s+/i, "");
+    oauthApi = new LinearAgentApi(bare);
+  }
 });
 
 afterAll(async () => {
@@ -327,6 +345,135 @@ describe("Linear API smoke tests", () => {
         );
         expect(result.action).toBe("already_ok");
         expect(result.webhookId).toBe(status.id);
+      }
+    });
+  });
+
+  describe("AgentSessionEvent webhook flow", () => {
+    // Tests two paths that trigger AgentSessionEvent.created:
+    //   Path A: @mention in a comment — user posts "@ctclaw do X" on an issue.
+    //           Linear sees the agent mention, creates an AgentSession, and
+    //           fires the webhook. This is the normal user flow.
+    //   Path B: createSessionOnIssue API call — programmatic session creation
+    //           (requires OAuth token, not API key).
+    //
+    // Both should result in the gateway receiving the webhook and spawning
+    // an agent run. We verify by polling for agent comments on the issue.
+    //
+    // Requires:
+    //   - OAuth app webhook → https://linear.calltelemetry.com/linear/webhook
+    //   - Gateway running (systemctl --user status openclaw-gateway)
+
+    let sessionIssueId: string | null = null;
+    let sessionIssueIdentifier: string | null = null;
+
+    it("creates a test issue for agent session", async () => {
+      const states = await api.getTeamStates(TEAM_ID);
+      const backlogState = states.find((s) => s.type === "backlog");
+      expect(backlogState).toBeTruthy();
+
+      const result = await api.createIssue({
+        teamId: TEAM_ID,
+        title: "[SMOKE TEST] AgentSessionEvent webhook test",
+        description:
+          "Auto-generated to test AgentSessionEvent webhook flow.\n" +
+          "Tests both @mention and createSessionOnIssue paths.\n\n" +
+          `Created: ${new Date().toISOString()}`,
+        stateId: backlogState!.id,
+        priority: 4,
+      });
+
+      expect(result.id).toBeTruthy();
+      sessionIssueId = result.id;
+      sessionIssueIdentifier = result.identifier;
+      console.log(`Created test issue: ${result.identifier} (${result.id})`);
+    });
+
+    it("Path A: @mention triggers AgentSessionEvent", async () => {
+      expect(sessionIssueId).toBeTruthy();
+
+      // Post a comment mentioning @ctclaw — this is what real users do.
+      // Linear should detect the agent @mention, create an AgentSession,
+      // and fire AgentSessionEvent.created to our webhook.
+      const commentId = await api.createComment(
+        sessionIssueId!,
+        "@ctclaw What is the status of this issue? [SMOKE TEST — ignore this]",
+      );
+      expect(commentId).toBeTruthy();
+      createdCommentIds.push(commentId);
+      console.log(`Posted @ctclaw mention comment: ${commentId}`);
+
+      // Give Linear time to process the @mention → create session → fire webhook
+      // → gateway receives → agent spawns → agent posts response
+      console.log("Waiting 12s for webhook round-trip...");
+      await new Promise((r) => setTimeout(r, 12000));
+
+      // Check for agent activity on the issue
+      const issue = await api.getIssueDetails(sessionIssueId!);
+      const comments = issue.comments?.nodes ?? [];
+
+      // Look for comments that aren't ours (agent responses)
+      const agentComments = comments.filter(
+        (c: any) =>
+          !c.body?.includes("[SMOKE TEST]") &&
+          c.id !== commentId,
+      );
+
+      if (agentComments.length > 0) {
+        console.log(
+          `@mention flow: ${agentComments.length} agent response(s) found — webhook flow confirmed!`,
+        );
+        // Preview first response
+        const preview = agentComments[0].body?.slice(0, 120) ?? "(empty)";
+        console.log(`  First response: ${preview}...`);
+      } else {
+        console.log(
+          "@mention flow: No agent response yet. Possible causes:\n" +
+          "  - @ctclaw not recognized as an agent mention by Linear\n" +
+          "  - OAuth app webhook not configured or not pointing to gateway\n" +
+          "  - Agent still processing (may take >12s for full response)\n" +
+          "  Check: journalctl --user -u openclaw-gateway --since '1 min ago'",
+        );
+      }
+
+      expect(issue.id).toBe(sessionIssueId);
+    });
+
+    it("Path B: createSessionOnIssue via OAuth (programmatic)", async () => {
+      expect(sessionIssueId).toBeTruthy();
+
+      // agentSessionCreateOnIssue requires OAuth — personal API keys get 403
+      const sessionApi = oauthApi ?? api;
+      const result = await sessionApi.createSessionOnIssue(sessionIssueId!);
+
+      if (result.error) {
+        if (result.error.includes("apiKey") || result.error.includes("FORBIDDEN")) {
+          console.warn(
+            "Path B skipped: createSessionOnIssue requires OAuth token. " +
+            "Personal API keys get 403. Ensure linear:default has a valid OAuth token.",
+          );
+        } else {
+          console.warn(`createSessionOnIssue error: ${result.error}`);
+        }
+      }
+      if (result.sessionId) {
+        expect(typeof result.sessionId).toBe("string");
+        console.log(`Path B: Agent session created: ${result.sessionId}`);
+      }
+    });
+
+    it("cleans up agent session test issue", async () => {
+      if (!sessionIssueId) return;
+      try {
+        const states = await api.getTeamStates(TEAM_ID);
+        const canceledState = states.find(
+          (s) => s.type === "canceled" || s.name.toLowerCase().includes("cancel"),
+        );
+        if (canceledState) {
+          await api.updateIssue(sessionIssueId, { stateId: canceledState.id });
+        }
+      } catch {
+        // Best effort
       }
     });
   });

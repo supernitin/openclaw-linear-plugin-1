@@ -14,7 +14,7 @@ Connect Linear to AI agents. Issues get triaged, implemented, and audited — au
 
 > **Real human here.** I'm actively building this and beta testing it on real projects.
 > Looking for feedback, bug reports, and fellow mad scientists.
-> [Open an issue](https://github.com/calltelemetry/openclaw-linear-plugin/issues) or reach out on Discord.
+> [Open an issue](https://github.com/calltelemetry/openclaw-linear-plugin/issues) — feedback and bug reports welcome.
 
 ### Project Status
 
