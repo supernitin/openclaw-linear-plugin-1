@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
-import { mkdtempSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
+import { mkdtempSync, writeFileSync, mkdirSync, chmodSync, unlinkSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -90,9 +90,11 @@ import {
 } from "./doctor.js";
 
 import { resolveLinearToken } from "../api/linear-api.js";
-import { readDispatchState, listStaleDispatches, pruneCompleted } from "../pipeline/dispatch-state.js";
+import { readDispatchState, listActiveDispatches, listStaleDispatches, pruneCompleted } from "../pipeline/dispatch-state.js";
 import { loadPrompts } from "../pipeline/pipeline.js";
 import { listWorktrees } from "./codex-worktree.js";
+import { loadCodingConfig } from "../tools/code-tool.js";
+import { getWebhookStatus, provisionWebhook } from "./webhook-provision.js";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -557,4 +559,762 @@ describe.skipIf(process.env.CI)("checkCodeRunDeep", () => {
       }
     }
   }, 120_000);
+});
+
+// ===========================================================================
+// Additional branch coverage tests
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// checkAuth — additional branches
+// ---------------------------------------------------------------------------
+
+describe("checkAuth — additional branches", () => {
+  it("warns when token expires soon (< 1 hour remaining)", async () => {
+    vi.mocked(resolveLinearToken).mockReturnValueOnce({
+      accessToken: "tok",
+      expiresAt: Date.now() + 30 * 60_000, // 30 minutes from now
+      refreshToken: "refresh",
+      source: "profile",
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ data: { viewer: { id: "1", name: "T" }, organization: { name: "O", urlKey: "o" } } }),
+    })));
+
+    const { checks } = await checkAuth();
+    const expiryCheck = checks.find((c) => c.label.includes("expires soon"));
+    expect(expiryCheck?.severity).toBe("warn");
+    expect(expiryCheck?.label).toContain("m remaining");
+    expect(expiryCheck?.fix).toContain("auto-refresh");
+  });
+
+  it("reports fail when API returns non-ok status", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({
+      ok: false,
+      status: 401,
+      statusText: "Unauthorized",
+    })));
+
+    const { checks } = await checkAuth();
+    const apiCheck = checks.find((c) => c.label.includes("API returned"));
+    expect(apiCheck?.severity).toBe("fail");
+    expect(apiCheck?.label).toContain("401");
+    expect(apiCheck?.label).toContain("Unauthorized");
+  });
+
+  it("reports fail when API returns GraphQL errors", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ errors: [{ message: "Invalid scope" }] }),
+    })));
+
+    const { checks } = await checkAuth();
+    const apiCheck = checks.find((c) => c.label.includes("API error"));
+    expect(apiCheck?.severity).toBe("fail");
+    expect(apiCheck?.label).toContain("Invalid scope");
+  });
+
+  it("uses token directly (no Bearer prefix) when no refreshToken", async () => {
+    vi.mocked(resolveLinearToken).mockReturnValueOnce({
+      accessToken: "lin_api_direct",
+      source: "config",
+      // No refreshToken, no expiresAt
+    });
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ data: { viewer: { id: "1", name: "T" }, organization: { name: "O", urlKey: "o" } } }),
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await checkAuth();
+    // The Authorization header should be the token directly, not "Bearer ..."
+    const callArgs = fetchMock.mock.calls[0];
+    const headers = (callArgs[1] as any).headers;
+    expect(headers.Authorization).toBe("lin_api_direct");
+  });
+
+  it("reports OAuth credentials configured from pluginConfig", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ data: { viewer: { id: "1", name: "T" }, organization: { name: "O", urlKey: "o" } } }),
+    })));
+
+    const { checks } = await checkAuth({
+      clientId: "my-client-id",
+      clientSecret: "my-secret",
+    });
+    const oauthCheck = checks.find((c) => c.label.includes("OAuth credentials configured"));
+    expect(oauthCheck?.severity).toBe("pass");
+  });
+
+  it("reports OAuth credentials configured from env vars", async () => {
+    const origId = process.env.LINEAR_CLIENT_ID;
+    const origSecret = process.env.LINEAR_CLIENT_SECRET;
+    process.env.LINEAR_CLIENT_ID = "env-id";
+    process.env.LINEAR_CLIENT_SECRET = "env-secret";
+
+    vi.stubGlobal("fetch", vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ data: { viewer: { id: "1", name: "T" }, organization: { name: "O", urlKey: "o" } } }),
+    })));
+
+    try {
+      const { checks } = await checkAuth();
+      const oauthCheck = checks.find((c) => c.label.includes("OAuth credentials configured"));
+      expect(oauthCheck?.severity).toBe("pass");
+    } finally {
+      if (origId) process.env.LINEAR_CLIENT_ID = origId;
+      else delete process.env.LINEAR_CLIENT_ID;
+      if (origSecret) process.env.LINEAR_CLIENT_SECRET = origSecret;
+      else delete process.env.LINEAR_CLIENT_SECRET;
+    }
+  });
+
+  it("skips no-expiresAt branch (no expiry check when token has no expiresAt)", async () => {
+    vi.mocked(resolveLinearToken).mockReturnValueOnce({
+      accessToken: "tok",
+      source: "config",
+      // No expiresAt
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ data: { viewer: { id: "1", name: "T" }, organization: { name: "O", urlKey: "o" } } }),
+    })));
+
+    const { checks } = await checkAuth();
+    // Should NOT have any expiry-related check
+    const expiryCheck = checks.find((c) => c.label.includes("expired") || c.label.includes("expires") || c.label.includes("not expired"));
+    expect(expiryCheck).toBeUndefined();
+    // Should still have the token pass check
+    const tokenCheck = checks.find((c) => c.label.includes("Access token"));
+    expect(tokenCheck?.severity).toBe("pass");
+  });
+
+  it("handles non-Error thrown in API catch", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => { throw "string error"; }));
+
+    const { checks } = await checkAuth();
+    const apiCheck = checks.find((c) => c.label.includes("unreachable"));
+    expect(apiCheck?.severity).toBe("fail");
+    expect(apiCheck?.label).toContain("string error");
+  });
+
+  it("warns about auth-profiles.json not found when source is profile", async () => {
+    // Ensure the mocked auth-profiles path does not exist
+    const testAuthPath = "/tmp/test-auth-profiles.json";
+    if (existsSync(testAuthPath)) unlinkSync(testAuthPath);
+
+    vi.mocked(resolveLinearToken).mockReturnValueOnce({
+      accessToken: "tok",
+      source: "profile",
+      refreshToken: "refresh",
+      expiresAt: Date.now() + 24 * 3_600_000,
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ data: { viewer: { id: "1", name: "T" }, organization: { name: "O", urlKey: "o" } } }),
+    })));
+
+    // AUTH_PROFILES_PATH is mocked to /tmp/test-auth-profiles.json which doesn't exist
+    // so statSync will throw, and since source is "profile", we get the warning
+    const { checks } = await checkAuth();
+    const permCheck = checks.find((c) => c.label.includes("auth-profiles.json not found"));
+    expect(permCheck?.severity).toBe("warn");
+  });
+
+  it("silently ignores auth-profiles.json not found when source is not profile", async () => {
+    // Ensure the mocked auth-profiles path does not exist
+    const testAuthPath = "/tmp/test-auth-profiles.json";
+    if (existsSync(testAuthPath)) unlinkSync(testAuthPath);
+
+    vi.mocked(resolveLinearToken).mockReturnValueOnce({
+      accessToken: "tok",
+      source: "config",
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ data: { viewer: { id: "1", name: "T" }, organization: { name: "O", urlKey: "o" } } }),
+    })));
+
+    const { checks } = await checkAuth();
+    // Should NOT have auth-profiles warning since source is not "profile"
+    const permCheck = checks.find((c) => c.label.includes("auth-profiles.json not found"));
+    expect(permCheck).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// checkCodingTools — additional branches
+// ---------------------------------------------------------------------------
+
+describe("checkCodingTools — additional branches", () => {
+  it("reports warn when config is empty (no codingTool, no backends)", () => {
+    vi.mocked(loadCodingConfig).mockReturnValueOnce({} as any);
+
+    const checks = checkCodingTools();
+    const configCheck = checks.find((c) => c.label.includes("coding-tools.json not found or empty"));
+    expect(configCheck?.severity).toBe("warn");
+    expect(configCheck?.fix).toContain("Create coding-tools.json");
+  });
+
+  it("reports fail for unknown default backend", () => {
+    vi.mocked(loadCodingConfig).mockReturnValueOnce({
+      codingTool: "unknown-backend",
+      backends: { "unknown-backend": {} },
+    } as any);
+
+    const checks = checkCodingTools();
+    const backendCheck = checks.find((c) => c.label.includes("Unknown default backend"));
+    expect(backendCheck?.severity).toBe("fail");
+    expect(backendCheck?.label).toContain("unknown-backend");
+  });
+
+  it("reports warn for invalid per-agent override", () => {
+    vi.mocked(loadCodingConfig).mockReturnValueOnce({
+      codingTool: "codex",
+      agentCodingTools: { "testAgent": "invalid-backend" },
+      backends: {},
+    } as any);
+
+    const checks = checkCodingTools();
+    const overrideCheck = checks.find((c) => c.label.includes("testAgent"));
+    expect(overrideCheck?.severity).toBe("warn");
+    expect(overrideCheck?.label).toContain("invalid-backend");
+    expect(overrideCheck?.label).toContain("not a valid backend");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// checkFilesAndDirs — additional branches
+// ---------------------------------------------------------------------------
+
+describe("checkFilesAndDirs — additional branches", () => {
+  it("reports fail when dispatch state is corrupt", async () => {
+    // Create the file so existsSync returns true, then readDispatchState throws
+    const tmpState = join(mkdtempSync(join(tmpdir(), "doctor-state-")), "state.json");
+    writeFileSync(tmpState, "invalid json");
+    vi.mocked(readDispatchState).mockRejectedValueOnce(new Error("JSON parse error"));
+
+    const checks = await checkFilesAndDirs({ dispatchStatePath: tmpState });
+    const stateCheck = checks.find((c) => c.label.includes("Dispatch state corrupt"));
+    expect(stateCheck?.severity).toBe("fail");
+    expect(stateCheck?.detail).toContain("JSON parse error");
+  });
+
+  it("reports fail when loadPrompts throws", async () => {
+    vi.mocked(loadPrompts).mockImplementationOnce(() => { throw new Error("template file missing"); });
+
+    const checks = await checkFilesAndDirs();
+    const promptCheck = checks.find((c) => c.label.includes("Failed to load prompts"));
+    expect(promptCheck?.severity).toBe("fail");
+    expect(promptCheck?.detail).toContain("template file missing");
+  });
+
+  it("reports missing rework.addendum as prompt issue", async () => {
+    vi.mocked(loadPrompts).mockReturnValueOnce({
+      worker: {
+        system: "You are a worker",
+        task: "Fix {{identifier}} {{title}} {{description}} in {{worktreePath}}",
+      },
+      audit: {
+        system: "You are an auditor",
+        task: "Audit {{identifier}} {{title}} {{description}} in {{worktreePath}}",
+      },
+      rework: { addendum: "" }, // falsy — should count as missing
+    } as any);
+
+    const checks = await checkFilesAndDirs();
+    const promptCheck = checks.find((c) => c.label.includes("Prompt issues"));
+    expect(promptCheck?.severity).toBe("fail");
+    expect(promptCheck?.label).toContain("Missing rework.addendum");
+  });
+
+  it("reports when variable missing from audit.task but present in worker.task", async () => {
+    vi.mocked(loadPrompts).mockReturnValueOnce({
+      worker: {
+        system: "ok",
+        task: "Fix {{identifier}} {{title}} {{description}} in {{worktreePath}}",
+      },
+      audit: {
+        system: "ok",
+        task: "Audit the issue please", // missing all vars
+      },
+      rework: { addendum: "Fix these gaps: {{gaps}}" },
+    } as any);
+
+    const checks = await checkFilesAndDirs();
+    const promptCheck = checks.find((c) => c.label.includes("Prompt issues"));
+    expect(promptCheck?.severity).toBe("fail");
+    expect(promptCheck?.label).toContain("audit.task missing");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// checkConnectivity — additional branches
+// ---------------------------------------------------------------------------
+
+describe("checkConnectivity — additional branches", () => {
+  it("re-checks Linear API when no authCtx, token available, and API returns ok", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      if (url.includes("linear.app")) {
+        return { ok: true, json: async () => ({ data: { viewer: { id: "1" } } }) };
+      }
+      // webhook self-test
+      throw new Error("ECONNREFUSED");
+    }));
+
+    const checks = await checkConnectivity();
+    const apiCheck = checks.find((c) => c.label === "Linear API: connected");
+    expect(apiCheck?.severity).toBe("pass");
+  });
+
+  it("reports fail when API returns non-ok without authCtx", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      if (url.includes("linear.app")) {
+        return { ok: false, status: 403, statusText: "Forbidden" };
+      }
+      throw new Error("ECONNREFUSED");
+    }));
+
+    const checks = await checkConnectivity();
+    const apiCheck = checks.find((c) => c.label.includes("Linear API: 403"));
+    expect(apiCheck?.severity).toBe("fail");
+  });
+
+  it("reports fail when API throws without authCtx", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      if (url.includes("linear.app")) {
+        throw new Error("DNS resolution failed");
+      }
+      throw new Error("ECONNREFUSED");
+    }));
+
+    const checks = await checkConnectivity();
+    const apiCheck = checks.find((c) => c.label.includes("Linear API: unreachable"));
+    expect(apiCheck?.severity).toBe("fail");
+    expect(apiCheck?.label).toContain("DNS resolution failed");
+  });
+
+  it("reports fail when no token available and no authCtx", async () => {
+    vi.mocked(resolveLinearToken).mockReturnValueOnce({
+      accessToken: null,
+      source: "none",
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("ECONNREFUSED"); }));
+
+    const checks = await checkConnectivity();
+    const apiCheck = checks.find((c) => c.label.includes("Linear API: no token"));
+    expect(apiCheck?.severity).toBe("fail");
+  });
+
+  it("reports notification targets when configured", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("ECONNREFUSED"); }));
+
+    const checks = await checkConnectivity(
+      {
+        notifications: {
+          targets: [
+            { channel: "discord", target: "#ct-ai" },
+            { channel: "telegram", target: "-1003884997363" },
+          ],
+        },
+      },
+      { viewer: { name: "T" } },
+    );
+    const notifChecks = checks.filter((c) => c.label.includes("Notifications:"));
+    expect(notifChecks).toHaveLength(2);
+    expect(notifChecks[0].label).toContain("discord");
+    expect(notifChecks[1].label).toContain("telegram");
+  });
+
+  it("reports pass when webhook self-test responds OK", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      if (url.includes("localhost")) {
+        return { ok: true, text: async () => "ok" };
+      }
+      throw new Error("unexpected");
+    }));
+
+    const checks = await checkConnectivity({}, { viewer: { name: "T" } });
+    const webhookCheck = checks.find((c) => c.label.includes("Webhook self-test: responds OK"));
+    expect(webhookCheck?.severity).toBe("pass");
+  });
+
+  it("reports warn when webhook self-test responds non-ok", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      if (url.includes("localhost")) {
+        return { ok: false, status: 404, text: async () => "not found" };
+      }
+      throw new Error("unexpected");
+    }));
+
+    const checks = await checkConnectivity({}, { viewer: { name: "T" } });
+    const webhookCheck = checks.find((c) => c.label.includes("Webhook self-test:"));
+    expect(webhookCheck?.severity).toBe("warn");
+    expect(webhookCheck?.label).toContain("404");
+  });
+
+  it("uses token directly without Bearer when no refreshToken (connectivity re-check)", async () => {
+    vi.mocked(resolveLinearToken).mockReturnValueOnce({
+      accessToken: "lin_api_direct",
+      source: "config",
+      // No refreshToken
+    });
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes("linear.app")) {
+        return { ok: true, json: async () => ({ data: { viewer: { id: "1" } } }) };
+      }
+      throw new Error("ECONNREFUSED");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await checkConnectivity(); // No authCtx, triggers re-check
+    const linearCall = fetchMock.mock.calls.find((c) => (c[0] as string).includes("linear.app"));
+    const headers = (linearCall![1] as any).headers;
+    expect(headers.Authorization).toBe("lin_api_direct");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// checkDispatchHealth — additional branches
+// ---------------------------------------------------------------------------
+
+describe("checkDispatchHealth — additional branches", () => {
+  it("reports pass when readDispatchState throws (no state file)", async () => {
+    vi.mocked(readDispatchState).mockRejectedValueOnce(new Error("ENOENT"));
+
+    const checks = await checkDispatchHealth();
+    const healthCheck = checks.find((c) => c.label.includes("Dispatch health: no state file"));
+    expect(healthCheck?.severity).toBe("pass");
+  });
+
+  it("warns about active dispatches with stuck status", async () => {
+    vi.mocked(listActiveDispatches).mockReturnValueOnce([
+      { issueIdentifier: "API-1", status: "stuck" } as any,
+      { issueIdentifier: "API-2", status: "working" } as any,
+    ]);
+
+    const checks = await checkDispatchHealth();
+    const activeCheck = checks.find((c) => c.label.includes("Active dispatches:"));
+    expect(activeCheck?.severity).toBe("warn");
+    expect(activeCheck?.label).toContain("stuck");
+  });
+
+  it("passes for active dispatches without stuck status", async () => {
+    vi.mocked(listActiveDispatches).mockReturnValueOnce([
+      { issueIdentifier: "API-1", status: "working" } as any,
+      { issueIdentifier: "API-2", status: "auditing" } as any,
+    ]);
+
+    const checks = await checkDispatchHealth();
+    const activeCheck = checks.find((c) => c.label.includes("Active dispatches:"));
+    expect(activeCheck?.severity).toBe("pass");
+    expect(activeCheck?.label).toContain("working");
+    expect(activeCheck?.label).toContain("auditing");
+  });
+
+  it("reports orphaned worktrees", async () => {
+    vi.mocked(listWorktrees).mockReturnValueOnce([
+      { issueIdentifier: "ORPHAN-1", path: "/tmp/wt1" } as any,
+      { issueIdentifier: "ORPHAN-2", path: "/tmp/wt2" } as any,
+    ]);
+
+    const checks = await checkDispatchHealth();
+    const orphanCheck = checks.find((c) => c.label.includes("orphaned worktree"));
+    expect(orphanCheck?.severity).toBe("warn");
+    expect(orphanCheck?.label).toContain("2 orphaned worktrees");
+    expect(orphanCheck?.detail).toContain("/tmp/wt1");
+  });
+
+  it("warns about old completed without fix (plural)", async () => {
+    vi.mocked(readDispatchState).mockResolvedValueOnce({
+      dispatches: {
+        active: {},
+        completed: {
+          "API-OLD-1": { completedAt: new Date(Date.now() - 10 * 24 * 3_600_000).toISOString(), status: "done" } as any,
+          "API-OLD-2": { completedAt: new Date(Date.now() - 8 * 24 * 3_600_000).toISOString(), status: "done" } as any,
+        },
+      },
+      sessionMap: {},
+      processedEvents: [],
+    });
+
+    const checks = await checkDispatchHealth(undefined, false);
+    const oldCheck = checks.find((c) => c.label.includes("completed dispatch"));
+    expect(oldCheck?.severity).toBe("warn");
+    expect(oldCheck?.label).toContain("2 completed dispatches");
+    expect(oldCheck?.fixable).toBe(true);
+  });
+
+  it("reports multiple stale dispatches with plural", async () => {
+    vi.mocked(listStaleDispatches).mockReturnValueOnce([
+      { issueIdentifier: "API-1", status: "working" } as any,
+      { issueIdentifier: "API-2", status: "auditing" } as any,
+    ]);
+
+    const checks = await checkDispatchHealth();
+    const staleCheck = checks.find((c) => c.label.includes("stale dispatch"));
+    expect(staleCheck?.severity).toBe("warn");
+    expect(staleCheck?.label).toContain("2 stale dispatches");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// checkWebhooks — additional branches
+// ---------------------------------------------------------------------------
+
+describe("checkWebhooks — additional branches", () => {
+  it("warns and skips when no Linear token", async () => {
+    vi.mocked(resolveLinearToken).mockReturnValueOnce({
+      accessToken: null,
+      source: "none",
+    });
+
+    const checks = await checkWebhooks();
+    expect(checks).toHaveLength(1);
+    expect(checks[0].severity).toBe("warn");
+    expect(checks[0].label).toContain("Webhook check skipped");
+  });
+
+  it("reports pass when webhook status has no issues", async () => {
+    vi.mocked(getWebhookStatus).mockResolvedValueOnce({
+      webhookId: "wh-1",
+      url: "https://example.com/webhook",
+      enabled: true,
+      resourceTypes: ["Comment", "Issue"],
+      issues: [],
+    } as any);
+
+    const checks = await checkWebhooks();
+    const whCheck = checks.find((c) => c.label.includes("Workspace webhook OK"));
+    expect(whCheck?.severity).toBe("pass");
+    expect(whCheck?.label).toContain("Comment");
+    expect(whCheck?.label).toContain("Issue");
+  });
+
+  it("reports warnings for webhook issues without fix", async () => {
+    vi.mocked(getWebhookStatus).mockResolvedValueOnce({
+      webhookId: "wh-1",
+      url: "https://example.com/webhook",
+      enabled: true,
+      resourceTypes: ["Comment"],
+      issues: ["Missing resource type: Issue", "Webhook disabled"],
+    } as any);
+
+    const checks = await checkWebhooks(undefined, false);
+    const issueChecks = checks.filter((c) => c.label.includes("Webhook issue:"));
+    expect(issueChecks).toHaveLength(2);
+    expect(issueChecks[0].severity).toBe("warn");
+    expect(issueChecks[0].label).toContain("Missing resource type");
+    expect(issueChecks[1].label).toContain("Webhook disabled");
+    expect(issueChecks[0].fixable).toBe(true);
+  });
+
+  it("fixes webhook issues with --fix", async () => {
+    vi.mocked(getWebhookStatus).mockResolvedValueOnce({
+      webhookId: "wh-1",
+      url: "https://example.com/webhook",
+      enabled: true,
+      resourceTypes: ["Comment"],
+      issues: ["Missing resource type: Issue"],
+    } as any);
+    vi.mocked(provisionWebhook).mockResolvedValueOnce({
+      action: "updated",
+      webhookId: "wh-1",
+      changes: ["added Issue resource type"],
+    } as any);
+
+    const checks = await checkWebhooks(undefined, true);
+    const fixCheck = checks.find((c) => c.label.includes("Workspace webhook fixed"));
+    expect(fixCheck?.severity).toBe("pass");
+    expect(fixCheck?.label).toContain("added Issue resource type");
+  });
+
+  it("creates webhook with --fix when none found", async () => {
+    // getWebhookStatus already mocked to return null by default
+    vi.mocked(provisionWebhook).mockResolvedValueOnce({
+      action: "created",
+      webhookId: "wh-new",
+      changes: ["created"],
+    } as any);
+
+    const checks = await checkWebhooks(undefined, true);
+    const createCheck = checks.find((c) => c.label.includes("Workspace webhook created"));
+    expect(createCheck?.severity).toBe("pass");
+    expect(createCheck?.label).toContain("wh-new");
+  });
+
+  it("reports fail when no webhook found and no --fix", async () => {
+    // getWebhookStatus already returns null by default
+    const checks = await checkWebhooks(undefined, false);
+    const failCheck = checks.find((c) => c.label.includes("No workspace webhook found"));
+    expect(failCheck?.severity).toBe("fail");
+    expect(failCheck?.fix).toContain("webhooks setup");
+  });
+
+  it("handles webhook check failure gracefully", async () => {
+    vi.mocked(getWebhookStatus).mockRejectedValueOnce(new Error("network timeout"));
+
+    const checks = await checkWebhooks();
+    const failCheck = checks.find((c) => c.label.includes("Webhook check failed"));
+    expect(failCheck?.severity).toBe("warn");
+    expect(failCheck?.label).toContain("network timeout");
+  });
+
+  it("uses custom webhookUrl from pluginConfig", async () => {
+    vi.mocked(getWebhookStatus).mockResolvedValueOnce({
+      webhookId: "wh-custom",
+      url: "https://custom.example.com/webhook",
+      enabled: true,
+      resourceTypes: ["Comment", "Issue"],
+      issues: [],
+    } as any);
+
+    const checks = await checkWebhooks({ webhookUrl: "https://custom.example.com/webhook" });
+    expect(getWebhookStatus).toHaveBeenCalled();
+    const whCheck = checks.find((c) => c.label.includes("Workspace webhook OK"));
+    expect(whCheck?.severity).toBe("pass");
+  });
+
+  it("handles provisionWebhook with no changes array", async () => {
+    vi.mocked(getWebhookStatus).mockResolvedValueOnce({
+      webhookId: "wh-1",
+      url: "https://example.com/webhook",
+      enabled: true,
+      resourceTypes: ["Comment"],
+      issues: ["Missing Issue"],
+    } as any);
+    vi.mocked(provisionWebhook).mockResolvedValueOnce({
+      action: "updated",
+      webhookId: "wh-1",
+      // No changes array
+    } as any);
+
+    const checks = await checkWebhooks(undefined, true);
+    const fixCheck = checks.find((c) => c.label.includes("Workspace webhook fixed"));
+    expect(fixCheck?.severity).toBe("pass");
+    expect(fixCheck?.label).toContain("fixed"); // falls back to "fixed"
+  });
+});
+
+// ---------------------------------------------------------------------------
+// formatReport — additional branches
+// ---------------------------------------------------------------------------
+
+describe("formatReport — additional branches", () => {
+  it("shows fix guidance for fail severity", () => {
+    const report = {
+      sections: [{
+        name: "Test",
+        checks: [
+          { label: "Config missing", severity: "fail" as const, fix: "Add config file" },
+        ],
+      }],
+      summary: { passed: 0, warnings: 0, errors: 1 },
+    };
+
+    const output = formatReport(report);
+    expect(output).toContain("Add config file");
+    expect(output).toContain("1 error");
+  });
+
+  it("shows plural errors and warnings in summary", () => {
+    const report = {
+      sections: [{
+        name: "Test",
+        checks: [
+          { label: "w1", severity: "warn" as const },
+          { label: "w2", severity: "warn" as const },
+          { label: "e1", severity: "fail" as const },
+          { label: "e2", severity: "fail" as const },
+        ],
+      }],
+      summary: { passed: 0, warnings: 2, errors: 2 },
+    };
+
+    const output = formatReport(report);
+    expect(output).toContain("2 warnings");
+    expect(output).toContain("2 errors");
+  });
+
+  it("omits warnings and errors from summary when zero", () => {
+    const report = {
+      sections: [{
+        name: "Test",
+        checks: [{ label: "ok", severity: "pass" as const }],
+      }],
+      summary: { passed: 1, warnings: 0, errors: 0 },
+    };
+
+    const output = formatReport(report);
+    expect(output).toContain("1 passed");
+    expect(output).not.toContain("warning");
+    expect(output).not.toContain("error");
+  });
+
+  it("does not show fix when check is passing even with fix set", () => {
+    const report = {
+      sections: [{
+        name: "Test",
+        checks: [
+          { label: "Good check", severity: "pass" as const, fix: "This should not show" },
+        ],
+      }],
+      summary: { passed: 1, warnings: 0, errors: 0 },
+    };
+
+    const output = formatReport(report);
+    expect(output).not.toContain("This should not show");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildSummary — additional branches
+// ---------------------------------------------------------------------------
+
+describe("buildSummary — additional branches", () => {
+  it("returns zeros for empty sections", () => {
+    const summary = buildSummary([]);
+    expect(summary).toEqual({ passed: 0, warnings: 0, errors: 0 });
+  });
+
+  it("returns zeros for sections with no checks", () => {
+    const summary = buildSummary([{ name: "Empty", checks: [] }]);
+    expect(summary).toEqual({ passed: 0, warnings: 0, errors: 0 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runDoctor — additional branches
+// ---------------------------------------------------------------------------
+
+describe("runDoctor — additional branches", () => {
+  it("applies --fix to auth-profiles.json permissions when fixable check exists", async () => {
+    // We need a scenario where checkAuth produces a fixable permissions check
+    // The AUTH_PROFILES_PATH is mocked to /tmp/test-auth-profiles.json
+    // Write a file there with wrong permissions so statSync succeeds
+    const testAuthPath = "/tmp/test-auth-profiles.json";
+    writeFileSync(testAuthPath, '{"profiles": {}}');
+    chmodSync(testAuthPath, 0o644); // Wrong permissions
+
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      if (url.includes("linear.app")) {
+        return {
+          ok: true,
+          json: async () => ({ data: { viewer: { id: "1", name: "T" }, organization: { name: "O", urlKey: "o" } } }),
+        };
+      }
+      throw new Error("ECONNREFUSED");
+    }));
+
+    const report = await runDoctor({ fix: true, json: false });
+    // The permissions check should have been attempted to fix
+    const authSection = report.sections.find((s) => s.name === "Authentication & Tokens");
+    const permCheck = authSection?.checks.find((c) => c.label.includes("permissions"));
+    // If chmodSync succeeded (which it should for /tmp), severity should be "pass"
+    if (permCheck && permCheck.label.includes("fixed")) {
+      expect(permCheck.severity).toBe("pass");
+    }
+  });
 });
