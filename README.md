@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/logo.jpeg" alt="OpenClaw Linear Plugin" width="720" />
+</p>
+
 # @calltelemetry/openclaw-linear
 
 [![CI](https://github.com/calltelemetry/openclaw-linear-plugin/actions/workflows/ci.yml/badge.svg)](https://github.com/calltelemetry/openclaw-linear-plugin/actions/workflows/ci.yml)
@@ -16,60 +20,78 @@ Linear is a great project tracker. But it doesn't orchestrate AI agents — it j
 
 This plugin makes the full lifecycle hands-off:
 
-```mermaid
-sequenceDiagram
-    actor You
-    participant Linear
-    participant Plugin
-    participant Worker as Worker Agent
-    participant Auditor as Auditor Agent
-
-    You->>Linear: Create issue
-    Note over Plugin: auto-triage
-    Linear-->>You: Estimate, labels, priority
-
-    You->>Linear: Assign to agent
-    Plugin->>Worker: dispatch (isolated worktree)
-    Worker-->>Plugin: implementation done
-    Plugin->>Auditor: audit (automatic, hard-enforced)
-    alt Pass
-        Auditor-->>Plugin: ✅ verdict
-        Plugin-->>Linear: Done
-    else Fail (retries left)
-        Auditor-->>Plugin: ❌ gaps
-        Plugin->>Worker: rework (gaps injected)
-    else Fail (no retries)
-        Auditor-->>Plugin: ❌ stuck
-        Plugin-->>You: 🚨 needs your help
-    end
 ```
+  You create an issue
+       │
+       ▼
+  Agent triages it ──── estimate, labels, priority
+       │
+       ▼
+  You assign it
+       │
+       ▼
+  Plugin dispatches ─── picks model tier, creates worktree
+       │
+       ▼
+  Worker implements ─── code, tests, commits
+       │
+       ▼
+  Auditor verifies ─── independent, hard-enforced
+       │
+   ┌───┴───┐
+   ▼       ▼
+  Done    Rework ────── gaps fed back, retry automatic
+```
+
+You work in Linear. The agents handle the rest.
 
 **What Linear can't do on its own — and what this plugin handles:**
 
-| Problem | What the plugin does |
+| Gap | What the plugin does |
 |---|---|
-| **No agent orchestration** | Assigns complexity tiers, picks the right model, creates isolated worktrees, runs workers, triggers audits, processes verdicts — all from a single issue assignment |
+| **No agent orchestration** | Assesses complexity, picks the right model tier, creates isolated worktrees, runs workers, triggers audits, processes verdicts — all from a single issue assignment |
 | **No independent verification** | Hard-enforces a worker → auditor boundary in plugin code. The worker cannot mark its own work done. The audit is not optional and not LLM-mediated. |
-| **No failure recovery** | Watchdog kills hung agents after configurable silence. Retries once automatically. Feeds audit failures back as context for rework. Escalates when retries are exhausted. |
+| **No failure recovery** | Watchdog kills hung agents after configurable silence. Feeds audit failures back as rework context. Escalates when retries are exhausted. |
 | **No multi-agent routing** | Routes `@mentions` and natural language ("hey kaylee look at this") to specific agents. Intent classifier handles plan requests, questions, close commands, and work requests. |
-| **No webhook deduplication** | Linear sends events from two separate webhook systems that can overlap. The plugin deduplicates across session IDs, comment IDs, and assignment events with a 60s sliding window. |
 | **No project-scale planning** | Planner interviews you, creates issues with user stories and acceptance criteria, runs a cross-model review, then dispatches the full dependency graph — up to 3 issues in parallel. |
 
 The end result: you work in Linear. You create issues, assign them, comment in plain English. The agents do the rest — or tell you when they can't.
 
 ---
 
-## What It Does
+## Features
 
-- **New issue?** Agent estimates story points, adds labels, sets priority.
-- **Assign to agent?** A worker implements it, an independent auditor verifies it, done.
-- **Comment anything?** The bot understands natural language — no magic commands needed.
-- **Say "close this" or "mark as done"?** Agent writes a closure report and transitions the issue to completed.
-- **Say "let's plan the features"?** A planner interviews you, writes user stories, and builds your full issue hierarchy.
-- **Plan looks good?** A different AI model automatically audits the plan before dispatch.
-- **Agent goes silent?** A watchdog kills it and retries automatically.
-- **Linear guidance?** Workspace and team-level guidance from Linear flows into every agent prompt — triage, dispatch, worker, audit.
-- **Want updates?** Get notified on Discord, Slack, Telegram, or Signal.
+### Core Pipeline
+
+- **Auto-triage** — New issues get story point estimates, labels, and priority within seconds. Read-only mode — no side effects.
+- **Worker → Auditor pipeline** — Assign an issue and a worker implements it in an isolated git worktree. An independent auditor verifies the work. The worker cannot self-certify — the audit is hard-enforced in plugin code.
+- **Complexity-tier dispatch** — The plugin assesses each issue and picks the right model. Simple typo? Haiku. Multi-service refactor? Opus. Saves cost and latency without manual intervention.
+- **Automatic rework** — Failed audits feed gaps back to the worker as context. Retries up to N times before escalating. No human needed until the agents are stuck.
+
+### Planning & Closure
+
+- **Project planner** — Comment "plan this project" and the agent interviews you, builds user stories with acceptance criteria, creates the full issue hierarchy, and dispatches in dependency order — up to 3 issues in parallel.
+- **Cross-model review** — Plans are automatically audited by a different AI model (Claude ↔ Codex ↔ Gemini) before dispatch. Two perspectives, one plan.
+- **Issue closure** — Say "close this" or "mark as done" and the agent generates a closure report and transitions the issue to completed.
+- **Sub-issue decomposition** — Orchestrators and the planner break complex work into sub-issues via `linear_issues`. Sub-issues inherit team and project from the parent automatically.
+
+### Multi-Agent & Routing
+
+- **Named agents** — Define agents with different roles and expertise. Route work by `@mention` or natural language ("hey kaylee look at this").
+- **Intent classification** — An LLM classifier (~300 tokens, ~2s) understands what you want from any comment. Regex fallback if the classifier fails.
+- **One-time detour** — `@mention` a different agent in a session and it handles that single interaction. The session stays with the original agent.
+
+### Multi-Backend & Multi-Repo
+
+- **Three coding backends** — Codex (OpenAI), Claude (Anthropic), Gemini (Google). Configurable globally or per-agent. The agent writes the prompt; the plugin handles backend selection.
+- **Multi-repo dispatch** — Tag an issue with `<!-- repos: api, frontend -->` and the worker gets isolated worktrees for each repo. One issue, multiple codebases, one agent session.
+
+### Operations
+
+- **Linear Guidance** — Workspace and team-level guidance configured in Linear's admin UI flows into every agent prompt — triage, dispatch, worker, audit. Admins steer agent behavior without touching config files.
+- **Watchdog** — Kills agents that go silent after configurable inactivity. Retries once, then escalates. Covers LLM hangs, API timeouts, and CLI lockups.
+- **Notifications** — Dispatch lifecycle events (started, auditing, done, stuck) to Discord, Slack, Telegram, or Signal. Rich formatting optional.
+- **Webhook deduplication** — Two-tier guard (in-memory set + 60s TTL map) prevents double-processing across Linear's two webhook systems.
 
 ---
 
@@ -81,125 +103,9 @@ The end result: you work in Linear. You create issues, assign them, comment in p
 openclaw plugins install @calltelemetry/openclaw-linear
 ```
 
-### 2. Expose the gateway (Cloudflare Tunnel)
+### 2. Expose the gateway
 
-Linear sends webhook events over the public internet, so the gateway must be reachable via HTTPS. A [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) is the recommended approach — no open ports, no TLS cert management, no static IP required.
-
-```mermaid
-flowchart TB
-    subgraph Internet
-        LW["Linear Webhooks<br/><i>Comment, Issue, AgentSession</i>"]
-        LO["Linear OAuth<br/><i>callback redirect</i>"]
-        You["You<br/><i>browser, curl</i>"]
-    end
-
-    subgraph CF["Cloudflare Edge"]
-        TLS["TLS termination<br/>DDoS protection"]
-    end
-
-    subgraph Server["Your Server"]
-        CD["cloudflared<br/><i>outbound-only tunnel</i>"]
-        GW["openclaw-gateway<br/><i>localhost:18789</i>"]
-    end
-
-    LW -- "POST /linear/webhook" --> TLS
-    LO -- "GET /linear/oauth/callback" --> TLS
-    You -- "HTTPS" --> TLS
-    TLS -- "tunnel" --> CD
-    CD -- "HTTP" --> GW
-```
-
-**How it works:** `cloudflared` opens an outbound connection to Cloudflare's edge and keeps it alive. Cloudflare routes incoming HTTPS requests for your hostname back through the tunnel to `localhost:18789`. No inbound firewall rules needed.
-
-#### Install cloudflared
-
-```bash
-# RHEL / Rocky / Alma
-sudo dnf install -y cloudflared
-
-# Debian / Ubuntu
-curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
-echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared $(lsb_release -cs) main" \
-  | sudo tee /etc/apt/sources.list.d/cloudflared.list
-sudo apt update && sudo apt install -y cloudflared
-
-# macOS
-brew install cloudflare/cloudflare/cloudflared
-```
-
-#### Authenticate with Cloudflare
-
-```bash
-cloudflared tunnel login
-```
-
-This opens your browser. You must:
-1. Log in to your Cloudflare account
-2. **Select the domain** (zone) for the tunnel (e.g., `yourdomain.com`)
-3. Click **Authorize**
-
-Cloudflare writes an origin certificate to `~/.cloudflared/cert.pem`. This cert grants `cloudflared` permission to create tunnels and DNS records under that domain.
-
-> **Prerequisite:** Your domain must already be on Cloudflare (nameservers pointed to Cloudflare). If it's not, add it in the Cloudflare dashboard first.
-
-#### Create a tunnel
-
-```bash
-cloudflared tunnel create openclaw-linear
-```
-
-This outputs a **Tunnel ID** (UUID like `da1f21bf-856e-...`) and writes credentials to `~/.cloudflared/<TUNNEL_ID>.json`.
-
-#### DNS — point your hostname to the tunnel
-
-```bash
-cloudflared tunnel route dns openclaw-linear linear.yourdomain.com
-```
-
-This creates a CNAME record in Cloudflare DNS: `linear.yourdomain.com → <TUNNEL_ID>.cfargotunnel.com`. You can verify it in the Cloudflare dashboard under **DNS > Records**. You can also create this record manually.
-
-The hostname you choose here is what you'll use for **both** webhook URLs and the OAuth redirect URI in Linear. Make sure they all match.
-
-#### Configure the tunnel
-
-Create `/etc/cloudflared/config.yml` (system-wide) or `~/.cloudflared/config.yml` (user):
-
-```yaml
-tunnel: <TUNNEL_ID>
-credentials-file: /home/<user>/.cloudflared/<TUNNEL_ID>.json
-
-ingress:
-  - hostname: linear.yourdomain.com
-    service: http://localhost:18789
-  - service: http_status:404    # catch-all, reject unmatched requests
-```
-
-The `ingress` rule routes all traffic for your hostname to the gateway on localhost. The catch-all `http_status:404` rejects requests for any other hostname.
-
-#### Run as a service
-
-```bash
-# Install as system service (recommended for production)
-sudo cloudflared service install
-sudo systemctl enable --now cloudflared
-```
-
-To test without installing as a service:
-
-```bash
-cloudflared tunnel run openclaw-linear
-```
-
-#### Verify end-to-end
-
-```bash
-curl -s https://linear.yourdomain.com/linear/webhook \
-  -X POST -H "Content-Type: application/json" \
-  -d '{"type":"test","action":"ping"}'
-# Should return: "ok"
-```
-
-> **Tip:** Keep the tunnel running at all times. If `cloudflared` stops, Linear webhook deliveries will fail silently — the gateway won't know about new issues, comments, or agent sessions until the tunnel is restored.
+Linear delivers webhooks over the public internet, so the gateway needs a public HTTPS URL. See [Tunnel Setup (Cloudflare)](#tunnel-setup-cloudflare) for the recommended approach. Any reverse proxy or tunnel that forwards HTTPS to `localhost:18789` will work.
 
 ### 3. Create a Linear OAuth app
 
@@ -266,69 +172,217 @@ That's it. Create an issue in Linear and watch the agent respond.
 
 ---
 
-## How It Works — Step by Step
+## Tunnel Setup (Cloudflare)
 
-Every issue moves through a clear pipeline. Here's the full interaction flow between you, Linear, the plugin, and the agents:
+Linear delivers webhooks over the public internet. The gateway listens on `localhost:18789` and needs a public HTTPS endpoint. A [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) is the recommended approach — no open ports, no TLS cert management, no static IP required.
 
 ```mermaid
-sequenceDiagram
-    participant You
-    participant Linear
-    participant Plugin
-    participant Agents
+flowchart TB
+    subgraph Internet
+        LW["Linear Webhooks<br/><i>Comment, Issue, AgentSession</i>"]
+        LO["Linear OAuth<br/><i>callback redirect</i>"]
+    end
 
-    You->>Linear: Create issue
-    Linear->>Plugin: Webhook (Issue.create)
-    Plugin->>Agents: Triage agent
-    Agents-->>Plugin: Estimate + labels
-    Plugin-->>Linear: Update issue
-    Plugin-->>Linear: Post assessment
+    subgraph CF["Cloudflare Edge"]
+        TLS["TLS termination + DDoS protection"]
+    end
 
-    You->>Linear: Assign to agent
-    Linear->>Plugin: Webhook (Issue.update)
-    Plugin->>Agents: Worker agent
-    Agents-->>Linear: Streaming status
-    Plugin->>Agents: Audit agent (automatic)
-    Agents-->>Plugin: JSON verdict
-    Plugin-->>Linear: Result comment
+    subgraph Server["Your Server"]
+        CD["cloudflared<br/><i>outbound-only tunnel</i>"]
+        GW["openclaw-gateway<br/><i>localhost:18789</i>"]
+    end
 
-    You->>Linear: Comment "@kaylee review"
-    Linear->>Plugin: Webhook (Comment)
-    Plugin->>Agents: Kaylee agent
-    Agents-->>Plugin: Response
-    Plugin-->>Linear: Branded comment
+    LW -- "POST /linear/webhook" --> TLS
+    LO -- "GET /linear/oauth/callback" --> TLS
+    TLS -- "tunnel" --> CD
+    CD -- "HTTP" --> GW
 ```
 
-Here's what each stage does, and what you'll see in Linear:
+**How it works:** `cloudflared` opens an outbound connection to Cloudflare's edge and keeps it alive. Cloudflare routes incoming HTTPS requests for your hostname back through the tunnel to `localhost:18789`. No inbound firewall rules needed.
+
+### Install cloudflared
+
+```bash
+# RHEL / Rocky / Alma
+sudo dnf install -y cloudflared
+
+# Debian / Ubuntu
+curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared $(lsb_release -cs) main" \
+  | sudo tee /etc/apt/sources.list.d/cloudflared.list
+sudo apt update && sudo apt install -y cloudflared
+
+# macOS
+brew install cloudflare/cloudflare/cloudflared
+```
+
+### Authenticate with Cloudflare
+
+```bash
+cloudflared tunnel login
+```
+
+This opens your browser. You must:
+1. Log in to your Cloudflare account
+2. **Select the domain** (zone) for the tunnel (e.g., `yourdomain.com`)
+3. Click **Authorize**
+
+Cloudflare writes an origin certificate to `~/.cloudflared/cert.pem`. This cert grants `cloudflared` permission to create tunnels and DNS records under that domain.
+
+> **Prerequisite:** Your domain must already be on Cloudflare (nameservers pointed to Cloudflare). If it's not, add it in the Cloudflare dashboard first.
+
+### Create a tunnel
+
+```bash
+cloudflared tunnel create openclaw-linear
+```
+
+This outputs a **Tunnel ID** (UUID like `da1f21bf-856e-...`) and writes credentials to `~/.cloudflared/<TUNNEL_ID>.json`.
+
+### DNS — point your hostname to the tunnel
+
+```bash
+cloudflared tunnel route dns openclaw-linear linear.yourdomain.com
+```
+
+This creates a CNAME record in Cloudflare DNS: `linear.yourdomain.com → <TUNNEL_ID>.cfargotunnel.com`. You can verify it in the Cloudflare dashboard under **DNS > Records**. You can also create this record manually.
+
+The hostname you choose here is what you'll use for **both** webhook URLs and the OAuth redirect URI in Linear. Make sure they all match.
+
+### Configure the tunnel
+
+Create `/etc/cloudflared/config.yml` (system-wide) or `~/.cloudflared/config.yml` (user):
+
+```yaml
+tunnel: <TUNNEL_ID>
+credentials-file: /home/<user>/.cloudflared/<TUNNEL_ID>.json
+
+ingress:
+  - hostname: linear.yourdomain.com
+    service: http://localhost:18789
+  - service: http_status:404    # catch-all, reject unmatched requests
+```
+
+The `ingress` rule routes all traffic for your hostname to the gateway on localhost. The catch-all `http_status:404` rejects requests for any other hostname.
+
+### Run as a service
+
+```bash
+# Install as system service (recommended for production)
+sudo cloudflared service install
+sudo systemctl enable --now cloudflared
+```
+
+To test without installing as a service:
+
+```bash
+cloudflared tunnel run openclaw-linear
+```
+
+### Verify end-to-end
+
+```bash
+curl -s https://linear.yourdomain.com/linear/webhook \
+  -X POST -H "Content-Type: application/json" \
+  -d '{"type":"test","action":"ping"}'
+# Should return: "ok"
+```
+
+> **Tip:** Keep the tunnel running at all times. If `cloudflared` stops, Linear webhook deliveries will fail silently — the gateway won't know about new issues, comments, or agent sessions until the tunnel is restored.
+
+---
+
+## How It Works — Step by Step
+
+A project goes through a complete lifecycle — from planning to implementation to closure. Here's every phase, what triggers it, and what you'll see in Linear.
 
 ```mermaid
 flowchart LR
-    A["Triage<br/><i>(auto)</i>"] --> B["Dispatch<br/><i>(you assign)</i>"]
-    B --> C["Worker<br/><i>(auto)</i>"]
-    C --> D["Audit<br/><i>(auto)</i>"]
-    D --> E["Done ✔"]
-    D --> F["Rework<br/><i>(auto retry)</i>"]
-    D --> G["Needs Your<br/>Help ⚠<br/><i>(escalated)</i>"]
-    F --> C
+    P["Plan<br/><i>(optional)</i>"] --> T["Triage<br/><i>(auto)</i>"]
+    T --> D["Dispatch<br/><i>(assign)</i>"]
+    D --> W["Worker<br/><i>(auto)</i>"]
+    W --> A["Audit<br/><i>(auto)</i>"]
+    A --> Done["Done ✔"]
+    A --> R["Rework<br/><i>(auto retry)</i>"]
+    A --> S["Escalate ⚠"]
+    R --> W
+    Done --> CL["Close<br/><i>(comment or auto)</i>"]
 ```
 
-### Stage 1: Triage (automatic)
+### Phase 1: Planning (optional)
 
-**Trigger:** You create a new issue.
+**Trigger:** Comment "let's plan the features" on a project issue.
 
-The agent reads your issue, estimates story points, adds labels, sets priority, and posts an assessment comment — all within seconds. Triage runs in **read-only mode** (no file writes, no code execution) to prevent side effects.
+For larger work, the planner breaks a project into issues before any code is written. It enters **interview mode** — asking questions, creating issues with user stories and acceptance criteria, and building a dependency graph in real time.
+
+```mermaid
+sequenceDiagram
+    actor Human
+    participant Linear
+    participant Plugin
+    participant Planner as Planner Agent
+    participant Reviewer as Cross-Model Reviewer
+
+    Human->>Linear: "plan this project"
+    Plugin->>Planner: start interview
+    loop Until plan is complete
+        Planner-->>Linear: question
+        Human->>Linear: reply
+        Planner-->>Linear: create/update issues
+    end
+    Human->>Linear: "looks good"
+    Plugin->>Plugin: validate DAG + descriptions
+    Plugin->>Reviewer: cross-model audit
+    Reviewer-->>Plugin: recommendations
+    Plugin-->>Linear: summary + ask for approval
+    Human->>Linear: "approve plan"
+    Plugin-->>Linear: dispatch issues in dependency order
+```
+
+The planner proactively asks for:
+- **User stories** — "As a [role], I want [feature] so that [benefit]"
+- **Acceptance criteria** — Given/When/Then format
+- **UAT test scenarios** — How to manually verify the feature
+
+**What you'll see in Linear:**
+
+> I've created 3 issues:
+> - **PROJ-2:** Build search API endpoint (3 pts, blocks PROJ-3)
+> - **PROJ-3:** Search results page (2 pts, blocked by PROJ-2)
+> - **PROJ-4:** Autocomplete suggestions (1 pt, independent)
+>
+> Does that cover it? Should the autocomplete call a separate endpoint or share the search API?
+
+When you say "looks good", the planner validates the plan (descriptions, estimates, no circular deps) and sends it to a **different AI model** for a cross-model review:
+
+| Your primary model | Auto-reviewer |
+|---|---|
+| Claude / Anthropic | Codex |
+| Codex / OpenAI | Gemini |
+| Gemini / Google | Codex |
+| Other (Kimi, Mistral, etc.) | Gemini |
+
+After approval, issues are dispatched automatically in dependency order — up to 3 in parallel.
+
+> `📊 Search Feature: 2/3 complete`
+
+### Phase 2: Triage (automatic)
+
+**Trigger:** A new issue is created (manually or by the planner).
+
+The agent reads the issue, estimates story points, adds labels, sets priority, and posts an assessment comment — all within seconds. Triage runs in **read-only mode** (no file writes, no code execution) to prevent side effects.
 
 **What you'll see in Linear:**
 
 > **[Mal]** This looks like a medium complexity change — the search API integration touches both the backend GraphQL schema and the frontend query layer. I've estimated 3 points and tagged it `backend` + `frontend`.
 
-The estimate, labels, and priority are applied silently to the issue fields. You don't need to do anything.
+The estimate, labels, and priority are applied silently to the issue fields.
 
-### Stage 2: Dispatch (you assign the issue)
+### Phase 3: Dispatch (assign the issue)
 
-**Trigger:** You assign the issue to the agent (or it gets auto-assigned after planning).
+**Trigger:** The issue is assigned to the agent (manually or auto-assigned after planning).
 
-The agent assesses complexity, picks an appropriate model, creates an isolated git worktree, and starts working.
+The plugin assesses complexity, picks an appropriate model tier, creates an isolated git worktree, and starts the worker.
 
 **What you'll see in Linear:**
 
@@ -353,25 +407,23 @@ The agent assesses complexity, picks an appropriate model, creates an isolated g
 | Medium | claude-sonnet-4-6 | Standard features, multi-file changes |
 | High | claude-opus-4-6 | Complex refactors, architecture changes |
 
-### Stage 3: Implementation (automatic)
+### Phase 4: Implementation (automatic)
 
-The worker agent reads the issue, plans its approach, writes code, and runs tests — all in the isolated worktree. You don't need to do anything during this stage.
+The worker agent reads the issue, plans its approach, writes code, and runs tests — all in the isolated worktree.
 
 If this is a **retry** after a failed audit, the worker gets the previous audit feedback as context so it knows exactly what to fix.
 
-**Notifications you'll receive:**
-> `ENG-100 working on it (attempt 1)`
+**Notification:** `ENG-100 working on it (attempt 1)`
 
-### Stage 4: Audit (automatic)
+### Phase 5: Audit (automatic)
 
-After the worker finishes, a separate auditor agent independently verifies the work. The auditor checks the issue requirements against what was actually implemented.
+After the worker finishes, a separate auditor agent independently verifies the work — checking issue requirements against what was actually implemented, running tests, and reviewing the diff.
 
 This is **not optional** — the worker cannot mark its own work as done. The audit is triggered by the plugin, not by the AI.
 
-**Notifications you'll receive:**
-> `ENG-100 checking the work...`
+**Notification:** `ENG-100 checking the work...`
 
-### Stage 5: Verdict
+### Phase 6: Verdict
 
 The audit produces one of three outcomes:
 
@@ -399,7 +451,7 @@ The issue is marked done automatically. A summary is posted.
 
 #### Fail (retries left) — Automatic rework
 
-The worker gets the audit feedback and tries again. You don't need to do anything.
+The worker gets the audit feedback and tries again automatically.
 
 **What you'll see in Linear:**
 
@@ -417,9 +469,9 @@ The worker gets the audit feedback and tries again. You don't need to do anythin
 
 **Notification:** `ENG-100 needs more work (attempt 1). Issues: missing validation, no empty query test`
 
-#### Fail (no retries left) — Needs your help
+#### Fail (no retries left) — Escalation
 
-After all retries are exhausted (default: 3 attempts), the issue is escalated to you.
+After all retries are exhausted (default: 3 attempts), the issue is escalated.
 
 **What you'll see in Linear:**
 
@@ -440,25 +492,51 @@ After all retries are exhausted (default: 3 attempts), the issue is escalated to
 
 **Notification:** `🚨 ENG-100 needs your help — couldn't fix it after 3 tries`
 
-**What you can do:**
+**Options:**
 1. **Clarify the issue** — Add more detail to the description, then re-assign to try again
 2. **Fix it yourself** — The agent's work is in the worktree, ready to edit
 3. **Force retry** — `/dispatch retry ENG-100`
 4. **Check logs** — Worker output in `.claw/worker-*.md`, audit verdicts in `.claw/audit-*.json`
 
-### Stage 6: Timeout (if the agent goes silent)
+### Phase 7: Closure
 
-If the agent produces no output for 2 minutes (configurable), the watchdog kills it and retries once. If the retry also times out, the issue is escalated.
+**Trigger:** Comment "close this", "mark as done", or "this is resolved" on any issue.
+
+The plugin generates a closure report and transitions the issue to completed. This is a **static action** — the plugin orchestrates the API calls directly, the agent only writes the report text.
+
+```mermaid
+flowchart LR
+    A["'close this'"] --> B["Fetch issue details"]
+    B --> C["Generate closure report<br/><i>(read-only agent)</i>"]
+    C --> D["Transition → completed"]
+    D --> E["Post report to issue"]
+```
 
 **What you'll see in Linear:**
 
-> ## Agent Timed Out
+> ## Closed
 >
-> The agent stopped responding for over 120s and was automatically restarted, but the retry also failed.
+> This issue has been reviewed and closed.
 >
-> **What to do:** Re-assign this issue to try again. If it keeps timing out, the issue might be too complex — try breaking it into smaller issues.
+> **Summary:** The search API endpoint was implemented with pagination, input validation, and error handling. All 14 tests pass. The frontend search page renders results correctly.
+
+### Timeout recovery
+
+If an agent produces no output for 2 minutes (configurable), the watchdog kills it and retries once. If the retry also times out, the issue is escalated.
 
 **Notification:** `⚡ ENG-100 timed out (no activity for 120s). Will retry.`
+
+### Project-level progress
+
+When issues are dispatched from a plan, you get project-level progress tracking:
+
+> `📊 Search Feature: 2/3 complete`
+
+When everything is done:
+
+> `✅ Search Feature: complete (3/3 issues)`
+
+If an issue gets stuck, dependent issues are blocked and you're notified.
 
 ### What's in the worktree
 
@@ -572,72 +650,15 @@ The webhook handler prevents double-processing through a two-tier guard system:
 
 ---
 
-## Planning a Project
+## Planning — Validation Details
 
-For larger work, the planner helps you break a project into issues with dependencies, then dispatches them automatically.
+See [Phase 1: Planning](#phase-1-planning-optional) for the full walkthrough. This section covers the validation rules that run when you say "finalize plan".
 
-### Start planning
+### Validation checks
 
-Comment on any issue that belongs to a Linear project — use natural language:
-
-> "let's plan out the features for this project"
-
-The planner enters **interview mode** and asks you questions one at a time:
-
-> I'm entering planning mode for **Search Feature**. I'll interview you about the features you want to build, then structure everything into Linear issues.
->
-> Let's start — what is this project about, and what are the main feature areas?
-
-### Build the plan
-
-Reply with your ideas. The planner creates issues with **user stories** and **acceptance criteria**, sets dependencies, and asks follow-up questions:
-
-> I've created 3 issues:
-> - **PROJ-2:** Build search API endpoint (3 pts, blocks PROJ-3)
-> - **PROJ-3:** Search results page (2 pts, blocked by PROJ-2)
-> - **PROJ-4:** Autocomplete suggestions (1 pt, independent)
->
-> For PROJ-2, here's what I wrote for acceptance criteria:
-> - *Given* a user sends a search query, *When* results exist, *Then* they are returned with pagination
->
-> Does that cover it? Should the autocomplete call a separate endpoint or share the search API?
-
-The planner proactively asks for:
-- **User stories** — "As a [role], I want [feature] so that [benefit]"
-- **Acceptance criteria** — Given/When/Then format
-- **UAT test scenarios** — How to manually verify the feature
-
-Keep replying until the plan looks right. The planner updates issues in real time.
-
-### Finalize & Cross-Model Review
-
-When you're happy, say something like "looks good" or "finalize plan". The planner runs a validation check:
 - Every issue has a description (50+ characters) with acceptance criteria
 - Every non-epic issue has an estimate and priority
 - No circular dependencies in the DAG
-
-**If validation passes, a cross-model review runs automatically:**
-
-> ## Plan Passed Checks
->
-> **3 issues** with valid dependency graph.
->
-> Let me have **Codex** audit this and make recommendations.
-
-A different AI model (always the complement of your primary model) reviews the plan for gaps:
-
-| Your primary model | Auto-reviewer |
-|---|---|
-| Claude / Anthropic | Codex |
-| Codex / OpenAI | Gemini |
-| Gemini / Google | Codex |
-| Other (Kimi, Mistral, etc.) | Gemini |
-
-After the review, the planner summarizes recommendations and asks you to approve:
-
-> Codex suggested adding error handling scenarios to PROJ-2 and noted PROJ-4 could be split into frontend/backend. I've updated PROJ-2's acceptance criteria. The PROJ-4 split is optional — your call.
->
-> If you're happy with this plan, say **approve plan** to start dispatching.
 
 **If validation fails:**
 
@@ -652,19 +673,7 @@ After the review, the planner summarizes recommendations and asks you to approve
 >
 > Please address these issues, then say "finalize plan" again.
 
-Fix the issues and try again. You can also say "cancel" or "stop planning" to exit without dispatching.
-
-### DAG dispatch progress
-
-After approval, issues are assigned to the agent automatically in dependency order. Up to 3 issues run in parallel.
-
-> `📊 Search Feature: 2/3 complete`
-
-When everything is done:
-
-> `✅ Search Feature: complete (3/3 issues)`
-
-If an issue gets stuck (all retries failed), dependent issues are blocked and you'll be notified.
+Fix the issues and try again. Say "cancel" or "stop planning" to exit without dispatching.
 
 ---
 
@@ -1113,7 +1122,7 @@ For programmatic access, the plugin registers these RPC methods:
 If an agent goes silent (LLM timeout, API hang, CLI lockup), the watchdog handles it automatically:
 
 1. No output for `inactivitySec` → kill and retry once
-2. Second silence → escalate to stuck (you get notified, see [Stage 6](#stage-6-timeout-if-the-agent-goes-silent) above)
+2. Second silence → escalate to stuck (you get notified, see [Timeout recovery](#timeout-recovery) above)
 
 | Setting | Default | What it controls |
 |---|---|---|
@@ -1146,11 +1155,13 @@ Agents call `linear_issues` with typed JSON parameters. The tool wraps the Linea
 | `list_states` | Get available workflow states for a team | `teamId` |
 | `list_labels` | Get available labels for a team | `teamId` |
 
-**Sub-issues:** Use `action="create"` with `parentIssueId` to create sub-issues under an existing issue. The new issue inherits `teamId` and `projectId` from its parent automatically. Agents are instructed to break large work into sub-issues for granular tracking — any task with multiple distinct deliverables should be decomposed. Auditors can also create sub-issues for remaining work when an implementation is partial.
+**Sub-issues:** Use `action="create"` with `parentIssueId` to create sub-issues under an existing issue. The new issue inherits `teamId` and `projectId` from its parent automatically. Only orchestrators on triaged issues have `create` access — workers and auditors cannot create issues.
 
 ### `spawn_agent` / `ask_agent` — Multi-agent orchestration
 
 Delegate work to other crew agents. `spawn_agent` is fire-and-forget (parallel), `ask_agent` waits for a reply (synchronous). Disabled with `enableOrchestration: false`.
+
+Sub-agents run in their own context — they do **not** share the parent's worktree or get `code_run` access. They're useful for reasoning, research, and coordination (e.g., "ask Inara how to phrase this error message") but cannot directly modify code. To give a sub-agent code context, include the relevant snippets in the task message.
 
 ### `dispatch_history` — Recent dispatch context
 
@@ -1158,14 +1169,21 @@ Returns recent dispatch activity. Agents use this for situational awareness when
 
 ### Access model
 
-Not all agents get write access. The webhook prompts enforce this:
+Tool access varies by context. Orchestrators get the full toolset; workers and auditors are restricted:
 
-| Context | `linear_issues` access | `code_run` |
-|---|---|---|
-| Triaged issue (In Progress, etc.) | Full (read + create + update + comment) | Yes |
-| Untriaged issue (Backlog, Triage) | Read only | Yes |
-| Auditor | Full (read + create + update + comment) | Yes |
-| Worker (inside `code_run`) | None | N/A |
+| Context | `linear_issues` | `code_run` | `spawn_agent` / `ask_agent` | Filesystem |
+|---|---|---|---|---|
+| Orchestrator (triaged issue) | Full (read, create, update, comment) | Yes | Yes | Read + write |
+| Orchestrator (untriaged issue) | Read only | Yes | Yes | Read + write |
+| Worker | None | None | None | Read + write |
+| Auditor | Prompt-constrained (has tool, instructed to verify only) | None | None | Read only (by prompt) |
+| Sub-agent (spawn/ask) | None | None | Yes (can chain) | Inherited from parent |
+
+**Workers** run inside the coding backend (Codex, Claude, Gemini) — they have full filesystem access to the worktree but no Linear tools and no orchestration. Their only job is to write code and return a summary.
+
+**Auditors** have access to `linear_issues` (the tool is registered) but are instructed via prompt to verify only — they return a JSON verdict, not code or issue mutations. Write access is not enforced at the tool level.
+
+**Sub-agents** spawned via `spawn_agent`/`ask_agent` run in their own session with no worktree access and no `code_run`. They're information workers — useful for reasoning and coordination, not code execution.
 
 ---
 
@@ -1302,14 +1320,14 @@ The full dispatch flow for implementing an issue:
 
 ```mermaid
 flowchart TD
-    A["Issue assigned to app user"] --> B["1. Assess complexity tier<br/><i>junior / medior / senior</i>"]
+    A["Issue assigned to app user"] --> B["1. Assess complexity tier<br/><i>small / medium / high</i>"]
     B --> C["2. Create isolated git worktree"]
     C --> D["3. Register dispatch in state file"]
     D --> E["4. Write .claw/manifest.json"]
     E --> F["5. Notify: dispatched as tier"]
 
-    F --> W["6. Worker phase<br/><i>code_run: YES, linear_issues: NO</i><br/>Build prompt → implement → save to .claw/"]
-    W -->|"plugin code — automatic"| AU["7. Audit phase<br/><i>code_run: YES, linear_issues: READ+WRITE</i><br/>Verify criteria → run tests → JSON verdict"]
+    F --> W["6. Worker phase<br/><i>filesystem: full, linear_issues: NO</i><br/>Build prompt → implement → save to .claw/"]
+    W -->|"plugin code — automatic"| AU["7. Audit phase<br/><i>filesystem: read, linear_issues: prompt-constrained</i><br/>Verify criteria → inspect diff → JSON verdict"]
 
     AU --> V{"8. Verdict"}
     V -->|PASS| DONE["Done ✔<br/>updateIssue → notify"]
