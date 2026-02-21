@@ -1,6 +1,7 @@
 import type { AnyAgentTool, OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { jsonResult } from "openclaw/plugin-sdk";
 import { LinearAgentApi, resolveLinearToken } from "../api/linear-api.js";
+import { isValidIssueId as isValidLinearId } from "../infra/validation.js";
 
 type Action = "read" | "create" | "update" | "comment" | "list_states" | "list_labels";
 
@@ -38,6 +39,9 @@ async function handleRead(api: LinearAgentApi, params: ToolParams) {
   if (!params.issueId) {
     return jsonResult({ error: "issueId is required for action='read'" });
   }
+  if (!isValidLinearId(params.issueId)) {
+    return jsonResult({ error: `Invalid issueId format: "${params.issueId}". Expected TEAM-123 or UUID.` });
+  }
   const issue = await api.getIssueDetails(params.issueId);
   return jsonResult({
     identifier: issue.identifier,
@@ -68,6 +72,15 @@ async function handleRead(api: LinearAgentApi, params: ToolParams) {
 async function handleCreate(api: LinearAgentApi, params: ToolParams) {
   if (!params.title) {
     return jsonResult({ error: "title is required for action='create'" });
+  }
+  if (params.teamId && !isValidLinearId(params.teamId)) {
+    return jsonResult({ error: `Invalid teamId format: "${params.teamId}". Expected TEAM-123 or UUID.` });
+  }
+  if (params.parentIssueId && !isValidLinearId(params.parentIssueId)) {
+    return jsonResult({ error: `Invalid parentIssueId format: "${params.parentIssueId}". Expected TEAM-123 or UUID.` });
+  }
+  if (params.projectId && !isValidLinearId(params.projectId)) {
+    return jsonResult({ error: `Invalid projectId format: "${params.projectId}". Expected TEAM-123 or UUID.` });
   }
 
   // Resolve teamId: explicit param, or derive from parent issue
@@ -132,6 +145,9 @@ async function handleCreate(api: LinearAgentApi, params: ToolParams) {
 async function handleUpdate(api: LinearAgentApi, params: ToolParams) {
   if (!params.issueId) {
     return jsonResult({ error: "issueId is required for action='update'" });
+  }
+  if (!isValidLinearId(params.issueId)) {
+    return jsonResult({ error: `Invalid issueId format: "${params.issueId}". Expected TEAM-123 or UUID.` });
   }
 
   const hasFields = params.status || params.priority != null || params.estimate != null || params.labels || params.title;
@@ -209,6 +225,9 @@ async function handleComment(api: LinearAgentApi, params: ToolParams) {
   if (!params.issueId) {
     return jsonResult({ error: "issueId is required for action='comment'" });
   }
+  if (!isValidLinearId(params.issueId)) {
+    return jsonResult({ error: `Invalid issueId format: "${params.issueId}". Expected TEAM-123 or UUID.` });
+  }
   if (!params.body) {
     return jsonResult({ error: "body is required for action='comment'" });
   }
@@ -220,6 +239,9 @@ async function handleListStates(api: LinearAgentApi, params: ToolParams) {
   if (!params.teamId) {
     return jsonResult({ error: "teamId is required for action='list_states'" });
   }
+  if (!isValidLinearId(params.teamId)) {
+    return jsonResult({ error: `Invalid teamId format: "${params.teamId}". Expected TEAM-123 or UUID.` });
+  }
   const states = await api.getTeamStates(params.teamId);
   return jsonResult({ states });
 }
@@ -227,6 +249,9 @@ async function handleListStates(api: LinearAgentApi, params: ToolParams) {
 async function handleListLabels(api: LinearAgentApi, params: ToolParams) {
   if (!params.teamId) {
     return jsonResult({ error: "teamId is required for action='list_labels'" });
+  }
+  if (!isValidLinearId(params.teamId)) {
+    return jsonResult({ error: `Invalid teamId format: "${params.teamId}". Expected TEAM-123 or UUID.` });
   }
   const labels = await api.getTeamLabels(params.teamId);
   return jsonResult({ labels });

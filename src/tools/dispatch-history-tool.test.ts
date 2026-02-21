@@ -42,6 +42,7 @@ const mockReadFileSync = readFileSync as unknown as ReturnType<typeof vi.fn>;
 
 function emptyState(): DispatchState {
   return {
+    version: 2,
     dispatches: { active: {}, completed: {} },
     sessionMap: {},
     processedEvents: [],
@@ -54,7 +55,7 @@ function makeActive(overrides?: Partial<ActiveDispatch>): ActiveDispatch {
     issueIdentifier: "CT-100",
     worktreePath: "/tmp/wt/CT-100",
     branch: "codex/CT-100",
-    tier: "junior",
+    tier: "small",
     model: "test-model",
     status: "dispatched",
     dispatchedAt: new Date().toISOString(),
@@ -66,7 +67,7 @@ function makeActive(overrides?: Partial<ActiveDispatch>): ActiveDispatch {
 function makeCompleted(overrides?: Partial<CompletedDispatch>): CompletedDispatch {
   return {
     issueIdentifier: "CT-200",
-    tier: "senior",
+    tier: "high",
     status: "done",
     completedAt: new Date().toISOString(),
     totalAttempts: 2,
@@ -106,7 +107,7 @@ describe("dispatch_history tool", () => {
   });
 
   it("finds active dispatch by identifier query", async () => {
-    const active = makeActive({ issueIdentifier: "CT-100", tier: "junior", status: "working" });
+    const active = makeActive({ issueIdentifier: "CT-100", tier: "small", status: "working" });
     const state = emptyState();
     state.dispatches.active["CT-100"] = active;
 
@@ -122,7 +123,7 @@ describe("dispatch_history tool", () => {
   });
 
   it("finds completed dispatch by identifier query", async () => {
-    const completed = makeCompleted({ issueIdentifier: "CT-200", tier: "senior", status: "done" });
+    const completed = makeCompleted({ issueIdentifier: "CT-200", tier: "high", status: "done" });
     const state = emptyState();
     state.dispatches.completed["CT-200"] = completed;
 
@@ -138,21 +139,21 @@ describe("dispatch_history tool", () => {
   });
 
   it("filters by tier", async () => {
-    const junior = makeActive({ issueIdentifier: "CT-10", tier: "junior", status: "working" });
-    const senior = makeActive({ issueIdentifier: "CT-20", tier: "senior", status: "working" });
+    const small = makeActive({ issueIdentifier: "CT-10", tier: "small", status: "working" });
+    const high = makeActive({ issueIdentifier: "CT-20", tier: "high", status: "working" });
     const state = emptyState();
-    state.dispatches.active["CT-10"] = junior;
-    state.dispatches.active["CT-20"] = senior;
+    state.dispatches.active["CT-10"] = small;
+    state.dispatches.active["CT-20"] = high;
 
     mockReadDispatchState.mockResolvedValue(state);
-    mockListActiveDispatches.mockReturnValue([junior, senior]);
+    mockListActiveDispatches.mockReturnValue([small, high]);
 
     const tool = createTool();
-    const result = await tool.execute("call-4", { tier: "senior" });
+    const result = await tool.execute("call-4", { tier: "high" });
 
     expect(result.data.results).toHaveLength(1);
     expect(result.data.results[0].identifier).toBe("CT-20");
-    expect(result.data.results[0].tier).toBe("senior");
+    expect(result.data.results[0].tier).toBe("high");
   });
 
   it("filters by status", async () => {
@@ -174,9 +175,9 @@ describe("dispatch_history tool", () => {
   });
 
   it("combines tier + status filters", async () => {
-    const a = makeActive({ issueIdentifier: "CT-1", tier: "senior", status: "working" });
-    const b = makeActive({ issueIdentifier: "CT-2", tier: "junior", status: "working" });
-    const c = makeActive({ issueIdentifier: "CT-3", tier: "senior", status: "dispatched" });
+    const a = makeActive({ issueIdentifier: "CT-1", tier: "high", status: "working" });
+    const b = makeActive({ issueIdentifier: "CT-2", tier: "small", status: "working" });
+    const c = makeActive({ issueIdentifier: "CT-3", tier: "high", status: "dispatched" });
     const state = emptyState();
     state.dispatches.active["CT-1"] = a;
     state.dispatches.active["CT-2"] = b;
@@ -186,7 +187,7 @@ describe("dispatch_history tool", () => {
     mockListActiveDispatches.mockReturnValue([a, b, c]);
 
     const tool = createTool();
-    const result = await tool.execute("call-6", { tier: "senior", status: "working" });
+    const result = await tool.execute("call-6", { tier: "high", status: "working" });
 
     expect(result.data.results).toHaveLength(1);
     expect(result.data.results[0].identifier).toBe("CT-1");
@@ -194,7 +195,7 @@ describe("dispatch_history tool", () => {
 
   it("respects limit parameter", async () => {
     const dispatches = Array.from({ length: 5 }, (_, i) =>
-      makeActive({ issueIdentifier: `CT-${i + 1}`, tier: "junior", status: "dispatched" }),
+      makeActive({ issueIdentifier: `CT-${i + 1}`, tier: "small", status: "dispatched" }),
     );
     const state = emptyState();
     for (const d of dispatches) {
@@ -222,7 +223,7 @@ describe("dispatch_history tool", () => {
     // Memory file for CT-300 contains extra context
     mockReaddirSync.mockReturnValue(["dispatch-CT-300.md"]);
     mockReadFileSync.mockReturnValue(
-      "---\ntier: medior\nstatus: done\nattempts: 1\n---\nApplied a workaround for the flaky test in CT-300.",
+      "---\ntier: medium\nstatus: done\nattempts: 1\n---\nApplied a workaround for the flaky test in CT-300.",
     );
 
     const tool = createTool();
@@ -230,7 +231,7 @@ describe("dispatch_history tool", () => {
 
     expect(result.data.results).toHaveLength(1);
     expect(result.data.results[0].identifier).toBe("CT-300");
-    expect(result.data.results[0].tier).toBe("medior");
+    expect(result.data.results[0].tier).toBe("medium");
     expect(result.data.results[0].summary).toContain("workaround");
   });
 
@@ -288,7 +289,7 @@ describe("dispatch_history tool", () => {
   it("returns structured result with identifier, tier, status, attempt fields", async () => {
     const active = makeActive({
       issueIdentifier: "CT-80",
-      tier: "medior",
+      tier: "medium",
       status: "auditing",
       attempt: 3,
     });
@@ -305,7 +306,7 @@ describe("dispatch_history tool", () => {
     expect(entry).toEqual(
       expect.objectContaining({
         identifier: "CT-80",
-        tier: "medior",
+        tier: "medium",
         status: "auditing",
         attempts: 3,
         active: true,

@@ -7,9 +7,8 @@
  *
  * Cost: one short agent turn (~300 tokens). Latency: ~2-5s.
  */
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import { resolveDefaultAgent } from "../infra/shared-profiles.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -115,13 +114,19 @@ export async function classifyIntent(
   try {
     const { runAgent } = await import("../agent/agent.js");
     const classifierAgent = resolveClassifierAgent(api, pluginConfig);
-    const result = await runAgent({
-      api,
-      agentId: classifierAgent,
-      sessionId: `intent-classify-${Date.now()}`,
-      message,
-      timeoutMs: 12_000, // 12s — fast classification
-    });
+    const CLASSIFY_TIMEOUT_MS = 10_000;
+    const result = await Promise.race([
+      runAgent({
+        api,
+        agentId: classifierAgent,
+        sessionId: `intent-classify-${Date.now()}`,
+        message,
+        timeoutMs: CLASSIFY_TIMEOUT_MS,
+      }),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("Intent classification timed out")), CLASSIFY_TIMEOUT_MS)
+      ),
+    ]);
 
     if (result.output) {
       const parsed = parseIntentResponse(result.output, ctx);
@@ -251,19 +256,4 @@ function resolveClassifierAgent(api: OpenClawPluginApi, pluginConfig?: Record<st
 
   // 2. Fall back to default agent
   return resolveDefaultAgent(api);
-}
-
-function resolveDefaultAgent(api: OpenClawPluginApi): string {
-  const fromConfig = (api as any).pluginConfig?.defaultAgentId;
-  if (typeof fromConfig === "string" && fromConfig) return fromConfig;
-
-  try {
-    const profilesPath = join(process.env.HOME ?? "/home/claw", ".openclaw", "agent-profiles.json");
-    const raw = readFileSync(profilesPath, "utf8");
-    const profiles = JSON.parse(raw).agents ?? {};
-    const defaultAgent = Object.entries(profiles).find(([, p]: [string, any]) => p.isDefault);
-    if (defaultAgent) return defaultAgent[0];
-  } catch { /* fall through */ }
-
-  return "default";
 }

@@ -48,6 +48,7 @@ import {
 } from "./artifacts.js";
 import { resolveWatchdogConfig } from "../agent/watchdog.js";
 import { emitDiagnostic } from "../infra/observability.js";
+import { renderTemplate } from "../infra/template.js";
 
 // ---------------------------------------------------------------------------
 // Prompt loading
@@ -164,14 +165,6 @@ export function loadPrompts(pluginConfig?: Record<string, unknown>, worktreePath
 export function clearPromptCache(): void {
   _cachedGlobalPrompts = null;
   _projectPromptCache.clear();
-}
-
-function renderTemplate(template: string, vars: Record<string, string>): string {
-  let result = template;
-  for (const [key, value] of Object.entries(vars)) {
-    result = result.replaceAll(`{{${key}}}`, value);
-  }
-  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -568,7 +561,15 @@ async function handleAuditPass(
   ).catch((err) => api.logger.error(`${TAG} failed to post audit pass comment: ${err}`));
 
   api.logger.info(`${TAG} audit PASSED — dispatch completed (attempt ${dispatch.attempt})`);
-  emitDiagnostic(api, { event: "verdict_processed", identifier: dispatch.issueIdentifier, phase: "done", attempt: dispatch.attempt });
+  emitDiagnostic(api, {
+    event: "verdict_processed",
+    identifier: dispatch.issueIdentifier,
+    issueId: dispatch.issueId,
+    phase: "done",
+    attempt: dispatch.attempt,
+    tier: dispatch.tier,
+    agentId: (pluginConfig?.defaultAgentId as string) ?? "default",
+  });
 
   await notify("audit_pass", {
     identifier: dispatch.issueIdentifier,
@@ -644,7 +645,15 @@ async function handleAuditFail(
     ).catch((err) => api.logger.error(`${TAG} failed to post escalation comment: ${err}`));
 
     api.logger.warn(`${TAG} audit FAILED ${nextAttempt}x — escalating to human`);
-    emitDiagnostic(api, { event: "verdict_processed", identifier: dispatch.issueIdentifier, phase: "stuck", attempt: nextAttempt });
+    emitDiagnostic(api, {
+      event: "verdict_processed",
+      identifier: dispatch.issueIdentifier,
+      issueId: dispatch.issueId,
+      phase: "stuck",
+      attempt: nextAttempt,
+      tier: dispatch.tier,
+      agentId: (pluginConfig?.defaultAgentId as string) ?? "default",
+    });
 
     await notify("escalation", {
       identifier: dispatch.issueIdentifier,
@@ -820,7 +829,15 @@ export async function spawnWorker(
     const thresholdSec = Math.round(wdConfig.inactivityMs / 1000);
 
     api.logger.warn(`${TAG} worker killed by inactivity watchdog 2x — escalating to stuck`);
-    emitDiagnostic(api, { event: "watchdog_kill", identifier: dispatch.issueIdentifier, attempt: dispatch.attempt });
+    emitDiagnostic(api, {
+      event: "watchdog_kill",
+      identifier: dispatch.issueIdentifier,
+      issueId: dispatch.issueId,
+      attempt: dispatch.attempt,
+      tier: dispatch.tier,
+      durationMs: workerElapsed,
+      agentId,
+    });
 
     try {
       appendLog(dispatch.worktreePath, {

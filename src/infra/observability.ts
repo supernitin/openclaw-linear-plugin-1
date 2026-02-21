@@ -23,6 +23,7 @@ export interface DiagnosticPayload {
   event: DiagnosticEvent;
   identifier?: string;
   issueId?: string;
+  agentId?: string;
   phase?: string;
   from?: string;
   to?: string;

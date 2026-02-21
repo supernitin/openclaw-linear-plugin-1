@@ -46,7 +46,7 @@ function makeDispatch(overrides?: Record<string, any>) {
     issueIdentifier: "CT-100",
     issueId: "issue-id",
     status: "working",
-    tier: "senior",
+    tier: "high",
     attempt: 0,
     worktreePath: "/wt/ct-100",
     model: "opus",
@@ -129,13 +129,13 @@ describe("dispatch.list", () => {
     const { api, methods } = createApi();
     registerDispatchMethods(api);
 
-    const d1 = makeDispatch({ issueIdentifier: "CT-1", tier: "junior" });
-    const d2 = makeDispatch({ issueIdentifier: "CT-2", tier: "senior" });
+    const d1 = makeDispatch({ issueIdentifier: "CT-1", tier: "small" });
+    const d2 = makeDispatch({ issueIdentifier: "CT-2", tier: "high" });
     mockReadDispatchState.mockResolvedValue(makeState());
     mockListActiveDispatches.mockReturnValue([d1, d2]);
 
     const respond = vi.fn();
-    await methods["dispatch.list"]({ params: { tier: "senior" }, respond });
+    await methods["dispatch.list"]({ params: { tier: "high" }, respond });
 
     const result = respond.mock.calls[0][1];
     expect(result.active).toEqual([d2]);
@@ -167,7 +167,7 @@ describe("dispatch.get", () => {
     const { api, methods } = createApi();
     registerDispatchMethods(api);
 
-    const completed = { status: "done", tier: "junior" };
+    const completed = { status: "done", tier: "small" };
     mockReadDispatchState.mockResolvedValue(makeState({}, { "CT-99": completed }));
     mockGetActiveDispatch.mockReturnValue(undefined);
 
@@ -372,9 +372,9 @@ describe("dispatch.stats", () => {
     registerDispatchMethods(api);
 
     const active = [
-      makeDispatch({ status: "working", tier: "senior" }),
-      makeDispatch({ status: "working", tier: "junior" }),
-      makeDispatch({ status: "stuck", tier: "senior" }),
+      makeDispatch({ status: "working", tier: "high" }),
+      makeDispatch({ status: "working", tier: "small" }),
+      makeDispatch({ status: "stuck", tier: "high" }),
     ];
     mockReadDispatchState.mockResolvedValue(makeState({}, { "CT-99": {} }));
     mockListActiveDispatches.mockReturnValue(active);
@@ -387,7 +387,7 @@ describe("dispatch.stats", () => {
     expect(result.activeCount).toBe(3);
     expect(result.completedCount).toBe(1);
     expect(result.byStatus).toEqual({ working: 2, stuck: 1 });
-    expect(result.byTier).toEqual({ senior: 2, junior: 1 });
+    expect(result.byTier).toEqual({ high: 2, small: 1 });
   });
 
   it("returns zeros when no dispatches", async () => {

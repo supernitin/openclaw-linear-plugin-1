@@ -71,6 +71,15 @@ export async function readPlanningState(configPath?: string): Promise<PlanningSt
     return parsed;
   } catch (err: any) {
     if (err.code === "ENOENT") return emptyState();
+    if (err instanceof SyntaxError) {
+      // State file corrupted — log and recover
+      console.error(`Planning state corrupted at ${filePath}: ${err.message}. Starting fresh.`);
+      // Rename corrupted file for forensics
+      try {
+        await fs.rename(filePath, `${filePath}.corrupted.${Date.now()}`);
+      } catch { /* best-effort */ }
+      return emptyState();
+    }
     throw err;
   }
 }

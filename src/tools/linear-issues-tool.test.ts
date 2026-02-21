@@ -45,6 +45,7 @@ vi.mock("../api/linear-api.js", () => ({
 }));
 
 import { createLinearIssuesTool } from "./linear-issues-tool.js";
+import { isValidIssueId as isValidLinearId } from "../infra/validation.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -88,6 +89,55 @@ beforeEach(() => {
   mockResolveLinearToken.mockReturnValue({
     accessToken: "test-token",
     source: "env" as const,
+  });
+});
+
+describe("isValidLinearId", () => {
+  it("accepts TEAM-123 format identifiers", () => {
+    expect(isValidLinearId("ENG-123")).toBe(true);
+    expect(isValidLinearId("API-1")).toBe(true);
+    expect(isValidLinearId("CT-42")).toBe(true);
+    expect(isValidLinearId("A-1")).toBe(true);
+    expect(isValidLinearId("Team2-999")).toBe(true);
+  });
+
+  it("accepts UUID format identifiers", () => {
+    expect(isValidLinearId("550e8400-e29b-41d4-a716-446655440000")).toBe(true);
+    expect(isValidLinearId("08cba264-d774-4afd-bc93-ee8213d12ef8")).toBe(true);
+    expect(isValidLinearId("ABCDEF01-2345-6789-ABCD-EF0123456789")).toBe(true);
+  });
+
+  it("rejects empty strings", () => {
+    expect(isValidLinearId("")).toBe(false);
+  });
+
+  it("rejects SQL injection attempts", () => {
+    expect(isValidLinearId("ENG-123'; DROP TABLE issues; --")).toBe(false);
+    expect(isValidLinearId("' OR 1=1 --")).toBe(false);
+  });
+
+  it("rejects GraphQL injection attempts", () => {
+    expect(isValidLinearId('{ __schema { types { name } } }')).toBe(false);
+    expect(isValidLinearId("ENG-123\n{malicious}")).toBe(false);
+  });
+
+  it("rejects path traversal", () => {
+    expect(isValidLinearId("../../../etc/passwd")).toBe(false);
+    expect(isValidLinearId("..\\..\\..\\windows")).toBe(false);
+  });
+
+  it("rejects strings that look like IDs but have extra characters", () => {
+    expect(isValidLinearId("ENG-123-extra")).toBe(false);
+    expect(isValidLinearId("-123")).toBe(false);
+    expect(isValidLinearId("123-ENG")).toBe(false);
+    expect(isValidLinearId("ENG-")).toBe(false);
+    expect(isValidLinearId("ENG")).toBe(false);
+  });
+
+  it("rejects UUIDs with wrong format", () => {
+    expect(isValidLinearId("550e8400-e29b-41d4-a716")).toBe(false);
+    expect(isValidLinearId("not-a-uuid-at-all-nope")).toBe(false);
+    expect(isValidLinearId("550e8400e29b41d4a716446655440000")).toBe(false); // missing dashes
   });
 });
 
@@ -424,6 +474,71 @@ describe("linear_issues tool", () => {
 
       expect(mockGetTeamLabels).toHaveBeenCalledWith("team-1");
       expect(result.labels).toEqual(labels);
+    });
+  });
+
+  describe("input validation", () => {
+    it("rejects invalid issueId format on read", async () => {
+      const result = parseResult(await executeTool({ action: "read", issueId: "'; DROP TABLE --" }));
+      expect(result.error).toMatch(/Invalid issueId format/);
+      expect(mockGetIssueDetails).not.toHaveBeenCalled();
+    });
+
+    it("rejects invalid issueId format on update", async () => {
+      const result = parseResult(await executeTool({ action: "update", issueId: "bad id!", status: "Done" }));
+      expect(result.error).toMatch(/Invalid issueId format/);
+      expect(mockGetIssueDetails).not.toHaveBeenCalled();
+    });
+
+    it("rejects invalid issueId format on comment", async () => {
+      const result = parseResult(await executeTool({ action: "comment", issueId: "{graphql}", body: "test" }));
+      expect(result.error).toMatch(/Invalid issueId format/);
+      expect(mockCreateComment).not.toHaveBeenCalled();
+    });
+
+    it("rejects invalid teamId format on create", async () => {
+      const result = parseResult(await executeTool({ action: "create", title: "Test", teamId: "invalid team!" }));
+      expect(result.error).toMatch(/Invalid teamId format/);
+      expect(mockCreateIssue).not.toHaveBeenCalled();
+    });
+
+    it("rejects invalid parentIssueId format on create", async () => {
+      const result = parseResult(await executeTool({ action: "create", title: "Test", parentIssueId: "not/valid" }));
+      expect(result.error).toMatch(/Invalid parentIssueId format/);
+      expect(mockGetIssueDetails).not.toHaveBeenCalled();
+    });
+
+    it("rejects invalid projectId format on create", async () => {
+      const result = parseResult(await executeTool({ action: "create", title: "Test", teamId: "team-1", projectId: "bad project" }));
+      expect(result.error).toMatch(/Invalid projectId format/);
+      expect(mockCreateIssue).not.toHaveBeenCalled();
+    });
+
+    it("rejects invalid teamId format on list_states", async () => {
+      const result = parseResult(await executeTool({ action: "list_states", teamId: "../../../etc/passwd" }));
+      expect(result.error).toMatch(/Invalid teamId format/);
+      expect(mockGetTeamStates).not.toHaveBeenCalled();
+    });
+
+    it("rejects invalid teamId format on list_labels", async () => {
+      const result = parseResult(await executeTool({ action: "list_labels", teamId: "' OR 1=1" }));
+      expect(result.error).toMatch(/Invalid teamId format/);
+      expect(mockGetTeamLabels).not.toHaveBeenCalled();
+    });
+
+    it("accepts valid TEAM-123 issueId", async () => {
+      mockGetIssueDetails.mockResolvedValueOnce(makeIssueDetails());
+      const result = parseResult(await executeTool({ action: "read", issueId: "ENG-123" }));
+      expect(result.error).toBeUndefined();
+      expect(mockGetIssueDetails).toHaveBeenCalledWith("ENG-123");
+    });
+
+    it("accepts valid UUID issueId", async () => {
+      const uuid = "08cba264-d774-4afd-bc93-ee8213d12ef8";
+      mockGetIssueDetails.mockResolvedValueOnce(makeIssueDetails());
+      const result = parseResult(await executeTool({ action: "read", issueId: uuid }));
+      expect(result.error).toBeUndefined();
+      expect(mockGetIssueDetails).toHaveBeenCalledWith(uuid);
     });
   });
 

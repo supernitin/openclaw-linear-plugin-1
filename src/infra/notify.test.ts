@@ -371,6 +371,55 @@ describe("createNotifierFromConfig", () => {
     consoleSpy.mockRestore();
   });
 
+  it("sanitizes URLs and tokens from error messages", async () => {
+    const runtime = mockRuntime();
+    runtime.channel.discord.sendMessageDiscord = vi.fn(async () => {
+      throw new Error("Failed to POST https://discord.com/api/v10/channels/123/messages with token fake-slack-token-1234567890");
+    });
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const notify = createNotifierFromConfig({
+      notifications: {
+        targets: [{ channel: "discord", target: "D-100" }],
+      },
+    }, runtime);
+    await notify("dispatch", basePayload);
+
+    // Check that the error message was sanitized
+    expect(consoleSpy).toHaveBeenCalledOnce();
+    const errorMessage = consoleSpy.mock.calls[0][0] as string;
+    expect(errorMessage).not.toContain("https://discord.com");
+    expect(errorMessage).not.toContain("xoxb-1234567890");
+    expect(errorMessage).toContain("[URL]");
+    expect(errorMessage).toContain("[TOKEN]");
+
+    consoleSpy.mockRestore();
+  });
+
+  it("does not leak long token-like strings in console error output", async () => {
+    const runtime = mockRuntime();
+    const fakeToken = "xoxb-ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890";
+    runtime.channel.discord.sendMessageDiscord = vi.fn(async () => {
+      throw new Error(`Auth failed with token ${fakeToken}`);
+    });
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const notify = createNotifierFromConfig({
+      notifications: {
+        targets: [{ channel: "discord", target: "D-100" }],
+      },
+    }, runtime);
+    await notify("dispatch", basePayload);
+
+    expect(consoleSpy).toHaveBeenCalledOnce();
+    const errorMessage = consoleSpy.mock.calls[0][0] as string;
+    // The long token-like string should be replaced
+    expect(errorMessage).not.toContain(fakeToken);
+    expect(errorMessage).toContain("[TOKEN]");
+
+    consoleSpy.mockRestore();
+  });
+
   it("skips suppressed events", async () => {
     const runtime = mockRuntime();
     const notify = createNotifierFromConfig({

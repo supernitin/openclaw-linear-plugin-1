@@ -33,7 +33,7 @@ function makeManifest(overrides?: Partial<ClawManifest>): ClawManifest {
     issueIdentifier: "API-100",
     issueTitle: "Fix login bug",
     issueId: "id-123",
-    tier: "junior",
+    tier: "small",
     model: "test-model",
     dispatchedAt: "2026-01-01T00:00:00Z",
     worktreePath: "/tmp/test",
@@ -359,7 +359,7 @@ describe("writeDispatchMemory", () => {
     const tmp = makeTmpDir();
     writeDispatchMemory("CT-50", "done summary", tmp, {
       title: "Fix login bug",
-      tier: "senior",
+      tier: "high",
       status: "done",
       project: "Auth",
       attempts: 2,
@@ -367,7 +367,7 @@ describe("writeDispatchMemory", () => {
     });
     const content = readFileSync(join(tmp, "memory", "dispatch-CT-50.md"), "utf-8");
     expect(content).toContain('title: "Fix login bug"');
-    expect(content).toContain('tier: "senior"');
+    expect(content).toContain('tier: "high"');
     expect(content).toContain('status: "done"');
     expect(content).toContain('project: "Auth"');
     expect(content).toContain("attempts: 2");

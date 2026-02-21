@@ -29,7 +29,93 @@ Connect Linear to AI agents. Issues get triaged, implemented, and audited — au
 openclaw plugins install @calltelemetry/openclaw-linear
 ```
 
-### 2. Create a Linear OAuth app
+### 2. Expose the gateway (Cloudflare Tunnel)
+
+Linear sends webhook events over the public internet, so the gateway must be reachable via HTTPS. A [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) is the recommended approach — no open ports, no TLS cert management, no static IP required.
+
+```mermaid
+flowchart TB
+    subgraph Internet
+        LW["Linear Webhooks<br/><i>Comment, Issue, AgentSession</i>"]
+        LO["Linear OAuth<br/><i>callback redirect</i>"]
+        You["You<br/><i>browser, curl</i>"]
+    end
+
+    subgraph CF["Cloudflare Edge"]
+        TLS["TLS termination<br/>DDoS protection"]
+    end
+
+    subgraph Server["Your Server"]
+        CD["cloudflared<br/><i>outbound-only tunnel</i>"]
+        GW["openclaw-gateway<br/><i>localhost:18789</i>"]
+    end
+
+    LW -- "POST /linear/webhook" --> TLS
+    LO -- "GET /linear/oauth/callback" --> TLS
+    You -- "HTTPS" --> TLS
+    TLS -- "tunnel" --> CD
+    CD -- "HTTP" --> GW
+```
+
+**How it works:** `cloudflared` opens an outbound connection to Cloudflare's edge and keeps it alive. Cloudflare routes incoming HTTPS requests for your hostname back through the tunnel to `localhost:18789`. No inbound firewall rules needed.
+
+#### Setup
+
+```bash
+# Install cloudflared
+# RHEL/AlmaLinux:
+sudo dnf install cloudflared
+# Or download: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/
+
+# Authenticate (opens browser, saves cert to ~/.cloudflared/)
+cloudflared tunnel login
+
+# Create a named tunnel
+cloudflared tunnel create openclaw-linear
+# Note the tunnel UUID from the output (e.g., da1f21bf-856e-49ea-83c2-d210092d96be)
+```
+
+#### Configure the tunnel
+
+Create `/etc/cloudflared/config.yml` (system-wide) or `~/.cloudflared/config.yml` (user):
+
+```yaml
+tunnel: <your-tunnel-uuid>
+credentials-file: /home/<user>/.cloudflared/<your-tunnel-uuid>.json
+
+ingress:
+  - hostname: your-domain.com
+    service: http://localhost:18789
+  - service: http_status:404    # catch-all, reject unmatched requests
+```
+
+#### DNS
+
+Point your hostname to the tunnel:
+
+```bash
+cloudflared tunnel route dns <your-tunnel-uuid> your-domain.com
+```
+
+This creates a CNAME record in Cloudflare DNS. You can also do this manually in the Cloudflare dashboard.
+
+#### Run as a service
+
+```bash
+# Install as system service (recommended for production)
+sudo cloudflared service install
+sudo systemctl enable --now cloudflared
+
+# Verify
+curl -s https://your-domain.com/linear/webhook \
+  -X POST -H "Content-Type: application/json" \
+  -d '{"type":"test","action":"ping"}'
+# Should return: "ok"
+```
+
+> **Tip:** Keep the tunnel running at all times. If `cloudflared` stops, Linear webhook deliveries will fail silently — the gateway won't know about new issues, comments, or agent sessions until the tunnel is restored.
+
+### 3. Create a Linear OAuth app
 
 Go to **Linear Settings > API > Applications** and create an app:
 
@@ -40,7 +126,7 @@ Go to **Linear Settings > API > Applications** and create an app:
 
 > You also need a **workspace webhook** — run `openclaw openclaw-linear webhooks setup` to auto-provision it, or manually create one in Settings > API > Webhooks pointing to the same URL with **Comment + Issue** events enabled. Both webhooks are required.
 
-### 3. Set credentials
+### 4. Set credentials
 
 ```bash
 export LINEAR_CLIENT_ID="your_client_id"
@@ -57,7 +143,7 @@ Environment=LINEAR_CLIENT_SECRET=your_client_secret
 
 Then reload: `systemctl --user daemon-reload && systemctl --user restart openclaw-gateway`
 
-### 4. Authorize
+### 5. Authorize
 
 ```bash
 openclaw openclaw-linear auth
@@ -69,7 +155,7 @@ This opens your browser. Approve the authorization, then restart:
 systemctl --user restart openclaw-gateway
 ```
 
-### 5. Verify
+### 6. Verify
 
 ```bash
 openclaw openclaw-linear status
@@ -96,24 +182,48 @@ That's it. Create an issue in Linear and watch the agent respond.
 
 ## How It Works — Step by Step
 
-Every issue moves through a clear pipeline. Here's exactly what happens at each stage and what you'll see in Linear.
+Every issue moves through a clear pipeline. Here's the full interaction flow between you, Linear, the plugin, and the agents:
 
+```mermaid
+sequenceDiagram
+    participant You
+    participant Linear
+    participant Plugin
+    participant Agents
+
+    You->>Linear: Create issue
+    Linear->>Plugin: Webhook (Issue.create)
+    Plugin->>Agents: Triage agent
+    Agents-->>Plugin: Estimate + labels
+    Plugin-->>Linear: Update issue
+    Plugin-->>Linear: Post assessment
+
+    You->>Linear: Assign to agent
+    Linear->>Plugin: Webhook (Issue.update)
+    Plugin->>Agents: Worker agent
+    Agents-->>Linear: Streaming status
+    Plugin->>Agents: Audit agent (automatic)
+    Agents-->>Plugin: JSON verdict
+    Plugin-->>Linear: Result comment
+
+    You->>Linear: Comment "@kaylee review"
+    Linear->>Plugin: Webhook (Comment)
+    Plugin->>Agents: Kaylee agent
+    Agents-->>Plugin: Response
+    Plugin-->>Linear: Branded comment
 ```
- ┌─────────┐    ┌──────────┐    ┌────────┐    ┌───────┐    ┌──────────┐
- │ Triage  │───▶│ Dispatch │───▶│ Worker │───▶│ Audit │───▶│  Done ✔  │
- │(auto)   │    │(you      │    │(auto)  │    │(auto) │    │          │
- │         │    │ assign)  │    │        │    │       │    └──────────┘
- └─────────┘    └──────────┘    └────────┘    └───┬───┘
-                                                  │
-                                    ┌─────────────┤
-                                    ▼             ▼
-                              ┌──────────┐  ┌───────────────┐
-                              │ Rework   │  │ Needs Your    │
-                              │ (auto    │  │ Help ⚠        │
-                              │  retry)  │  │ (escalated)   │
-                              └────┬─────┘  └───────────────┘
-                                   │
-                                   └──▶ back to Worker
+
+Here's what each stage does, and what you'll see in Linear:
+
+```mermaid
+flowchart LR
+    A["Triage<br/><i>(auto)</i>"] --> B["Dispatch<br/><i>(you assign)</i>"]
+    B --> C["Worker<br/><i>(auto)</i>"]
+    C --> D["Audit<br/><i>(auto)</i>"]
+    D --> E["Done ✔"]
+    D --> F["Rework<br/><i>(auto retry)</i>"]
+    D --> G["Needs Your<br/>Help ⚠<br/><i>(escalated)</i>"]
+    F --> C
 ```
 
 ### Stage 1: Triage (automatic)
@@ -136,7 +246,7 @@ The agent assesses complexity, picks an appropriate model, creates an isolated g
 
 **What you'll see in Linear:**
 
-> **Dispatched** as **senior** (anthropic/claude-opus-4-6)
+> **Dispatched** as **high** (anthropic/claude-opus-4-6)
 > > Complex multi-service refactor with migration concerns
 >
 > Worktree: `/home/claw/worktrees/ENG-100` (fresh)
@@ -153,9 +263,9 @@ The agent assesses complexity, picks an appropriate model, creates an isolated g
 
 | Tier | Model | When |
 |---|---|---|
-| Junior | claude-haiku-4-5 | Simple config changes, typos, one-file fixes |
-| Medior | claude-sonnet-4-6 | Standard features, multi-file changes |
-| Senior | claude-opus-4-6 | Complex refactors, architecture changes |
+| Small | claude-haiku-4-5 | Simple config changes, typos, one-file fixes |
+| Medium | claude-sonnet-4-6 | Standard features, multi-file changes |
+| High | claude-opus-4-6 | Complex refactors, architecture changes |
 
 ### Stage 3: Implementation (automatic)
 
@@ -291,10 +401,12 @@ If something went wrong, start with `log.jsonl` — it shows every phase, how lo
 
 You don't need to memorize magic commands. The bot uses an LLM-based intent classifier to understand what you want from any comment.
 
-```
-User comment → Intent Classifier (small model, ~2s) → Route to handler
-                         ↓ (on failure)
-                    Regex fallback → Route to handler
+```mermaid
+flowchart LR
+    A["User comment"] --> B["Intent Classifier<br/><i>(small model, ~2s)</i>"]
+    B --> C["Route to handler"]
+    B -. "on failure" .-> D["Regex fallback"]
+    D --> C
 ```
 
 **What the bot understands:**
@@ -753,7 +865,7 @@ rework:
 | `{{title}}` | Issue title |
 | `{{description}}` | Full issue body |
 | `{{worktreePath}}` | Path to the git worktree |
-| `{{tier}}` | Complexity tier (junior/medior/senior) |
+| `{{tier}}` | Complexity tier (small/medium/high) |
 | `{{attempt}}` | Current attempt number |
 | `{{gaps}}` | Audit gaps from previous attempt |
 | `{{projectName}}` | Project name (planner prompts) |
@@ -853,7 +965,7 @@ If you don't tag the issue at all, the plugin uses your `codexBaseRepo` setting 
 
 When the agent picks up a multi-repo issue, the dispatch comment tells you:
 
-> **Dispatched** as **senior** (anthropic/claude-opus-4-6)
+> **Dispatched** as **high** (anthropic/claude-opus-4-6)
 >
 > Worktrees:
 > - `api` → `/home/claw/worktrees/ENG-100/api`
@@ -1025,30 +1137,15 @@ Both must point to the same URL. `AgentSessionEvent` payloads carry workspace/te
 
 The handler dispatches by `type + action`:
 
-```
-Incoming POST /linear/webhook
-  │
-  ├─ type=AgentSessionEvent, action=created
-  │    └─ New agent session → dedup → scan message for @mentions →
-  │       route to mentioned agent (or default) → run agent
-  │
-  ├─ type=AgentSessionEvent, action=prompted
-  │    └─ Follow-up message → dedup → scan message for @mentions →
-  │       route to mentioned agent (one-time detour, or default) → resume agent
-  │
-  ├─ type=Comment, action=create
-  │    └─ Comment on issue → filter self-comments (viewerId) → dedup →
-  │       intent classify → route to handler (see Intent Classification below)
-  │
-  ├─ type=Issue, action=update
-  │    └─ Issue field changed → check assignment → if assigned to app user →
-  │       dispatch (triage or full implementation)
-  │
-  ├─ type=Issue, action=create
-  │    └─ New issue created → triage (estimate, labels, priority)
-  │
-  └─ type=AppUserNotification
-       └─ Immediately discarded (duplicates workspace webhook events)
+```mermaid
+flowchart TD
+    A["POST /linear/webhook"] --> B{"Event Type"}
+    B --> C["AgentSessionEvent.created<br/>→ dedup → scan @mentions → run agent"]
+    B --> D["AgentSessionEvent.prompted<br/>→ dedup → scan @mentions → resume agent"]
+    B --> E["Comment.create<br/>→ filter self → dedup → intent classify → route"]
+    B --> F["Issue.update<br/>→ check assignment → dispatch"]
+    B --> G["Issue.create<br/>→ triage (estimate, labels, priority)"]
+    B --> H["AppUserNotification<br/>→ discarded (duplicates workspace events)"]
 ```
 
 ### Intent Classification
@@ -1100,16 +1197,15 @@ Agent responses follow an **emitActivity-first** pattern:
 
 When intent classification returns `close_issue`:
 
-```
-close_issue intent
-  │
-  ├─ Fetch full issue details (getIssueDetails)
-  ├─ Find team's "completed" state (getTeamStates → type=completed)
-  ├─ Create agent session on issue (createSessionOnIssue)
-  ├─ Emit "preparing closure report" thought (emitActivity)
-  ├─ Run agent in read-only mode to generate closure report (runAgent)
-  ├─ Transition issue state to completed (updateIssue → stateId)
-  └─ Post closure report (emitActivity → createComment fallback)
+```mermaid
+flowchart TD
+    A["close_issue intent"] --> B["Fetch issue details"]
+    B --> C["Find team's completed state"]
+    C --> D["Create agent session on issue"]
+    D --> E["Emit 'preparing closure report' thought"]
+    E --> F["Run agent in read-only mode<br/><i>(generates closure report)</i>"]
+    F --> G["Transition issue → completed"]
+    G --> H["Post closure report<br/><i>(emitActivity → createComment fallback)</i>"]
 ```
 
 This is a **static action** — the intent triggers direct API calls orchestrated by the plugin, not by giving the agent write tools. The agent only generates the closure report text; all state transitions are handled by the plugin.
@@ -1118,31 +1214,22 @@ This is a **static action** — the intent triggers direct API calls orchestrate
 
 The full dispatch flow for implementing an issue:
 
-```
-Issue assigned to app user
-  │
-  ├─ 1. Assess complexity tier (runAgent → junior/medior/senior)
-  ├─ 2. Create isolated git worktree (createWorktree)
-  ├─ 3. Register dispatch in state file (registerDispatch)
-  ├─ 4. Write .claw/manifest.json with issue metadata
-  ├─ 5. Notify: "dispatched as {tier}"
-  │
-  ├─ 6. Worker phase (spawnWorker)
-  │    ├─ Build prompt from prompts.yaml (worker.system + worker.task)
-  │    ├─ If retry: append rework.addendum with prior audit gaps
-  │    ├─ Tool access: code_run YES, linear_issues NO
-  │    └─ Output captured as text → saved to .claw/worker-{attempt}.md
-  │
-  ├─ 7. Audit phase (triggerAudit)
-  │    ├─ Build prompt from prompts.yaml (audit.system + audit.task)
-  │    ├─ Tool access: code_run YES, linear_issues READ+WRITE
-  │    ├─ Auditor verifies acceptance criteria, runs tests, reviews diff
-  │    └─ Must return JSON verdict: {pass, criteria, gaps, testResults}
-  │
-  └─ 8. Verdict (processVerdict)
-       ├─ PASS → updateIssue(stateId=Done), post summary, notify ✅
-       ├─ FAIL + retries left → back to step 6 with audit gaps as context
-       └─ FAIL + no retries → escalate, notify 🚨, status="stuck"
+```mermaid
+flowchart TD
+    A["Issue assigned to app user"] --> B["1. Assess complexity tier<br/><i>junior / medior / senior</i>"]
+    B --> C["2. Create isolated git worktree"]
+    C --> D["3. Register dispatch in state file"]
+    D --> E["4. Write .claw/manifest.json"]
+    E --> F["5. Notify: dispatched as tier"]
+
+    F --> W["6. Worker phase<br/><i>code_run: YES, linear_issues: NO</i><br/>Build prompt → implement → save to .claw/"]
+    W -->|"plugin code — automatic"| AU["7. Audit phase<br/><i>code_run: YES, linear_issues: READ+WRITE</i><br/>Verify criteria → run tests → JSON verdict"]
+
+    AU --> V{"8. Verdict"}
+    V -->|PASS| DONE["Done ✔<br/>updateIssue → notify"]
+    V -->|"FAIL ≤ max"| RW["Rework<br/><i>attempt++, inject audit gaps</i>"]
+    RW --> W
+    V -->|"FAIL > max"| STUCK["Stuck 🚨<br/>escalate + notify"]
 ```
 
 **State persistence:** Dispatch state is written to `~/.openclaw/linear-dispatch-state.json` with active dispatches, completed history, session mappings, and processed event IDs.
@@ -1293,7 +1380,7 @@ npx tsx scripts/uat-linear.ts --test intent
 ```
 [dispatch] Created issue ENG-200: "UAT: simple config tweak"
 [dispatch] Assigned to agent — waiting for dispatch comment...
-[dispatch] ✔ Dispatch confirmed (12s) — assessed as junior
+[dispatch] ✔ Dispatch confirmed (12s) — assessed as small
 [dispatch] Waiting for audit result...
 [dispatch] ✔ Audit passed (94s) — issue marked done
 [dispatch] Total: 106s
@@ -1444,6 +1531,7 @@ journalctl --user -u openclaw-gateway -f         # Watch live logs
 | `code_run` uses wrong backend | Check `coding-tools.json` — explicit backend > per-agent > global default. Run `code-run doctor` to see routing. |
 | `code_run` fails at runtime | Run `openclaw openclaw-linear code-run doctor` — checks binary, API key, and live callability for each backend. |
 | Webhook events not arriving | Run `openclaw openclaw-linear webhooks setup` to auto-provision. Both webhooks must point to `/linear/webhook`. Check tunnel is running. |
+| Tunnel down / webhooks silently failing | `systemctl status cloudflared` (or `systemctl --user status cloudflared`). Restart with `systemctl restart cloudflared`. Test: `curl -s -X POST https://your-domain.com/linear/webhook -H 'Content-Type: application/json' -d '{"type":"test"}'` — should return `"ok"`. |
 | OAuth token expired | Auto-refreshes. If stuck, re-run `openclaw openclaw-linear auth` and restart. |
 | Audit always fails | Run `openclaw openclaw-linear prompts validate` to check prompt syntax. |
 | Multi-repo not detected | Markers must be `<!-- repos: name1, name2 -->`. Names must match `repos` config keys. |

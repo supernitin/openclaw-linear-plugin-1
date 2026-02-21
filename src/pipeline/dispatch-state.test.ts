@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -17,6 +17,7 @@ import {
   removeSessionMapping,
   markEventProcessed,
   pruneCompleted,
+  pruneCompletedDispatches,
   removeActiveDispatch,
   TransitionError,
   type ActiveDispatch,
@@ -33,7 +34,7 @@ function makeDispatch(overrides?: Partial<ActiveDispatch>): ActiveDispatch {
     issueIdentifier: "API-100",
     worktreePath: "/tmp/wt/API-100",
     branch: "codex/API-100",
-    tier: "junior",
+    tier: "small",
     model: "test-model",
     status: "dispatched",
     dispatchedAt: new Date().toISOString(),
@@ -50,10 +51,28 @@ describe("readDispatchState", () => {
   it("returns empty state when file missing", async () => {
     const p = tmpStatePath();
     const state = await readDispatchState(p);
+    expect(state.version).toBe(2);
     expect(state.dispatches.active).toEqual({});
     expect(state.dispatches.completed).toEqual({});
     expect(state.sessionMap).toEqual({});
     expect(state.processedEvents).toEqual([]);
+  });
+
+  it("recovers from corrupted state file", async () => {
+    const p = tmpStatePath();
+    // Write invalid JSON
+    writeFileSync(p, "{{{{not valid json!!!!", "utf-8");
+    const state = await readDispatchState(p);
+    expect(state.version).toBe(2);
+    expect(state.dispatches.active).toEqual({});
+    expect(state.dispatches.completed).toEqual({});
+    expect(state.sessionMap).toEqual({});
+    expect(state.processedEvents).toEqual([]);
+    // Corrupted file should have been renamed
+    const dir = join(p, "..");
+    const files = readdirSync(dir);
+    const corrupted = files.filter((f: string) => f.includes(".corrupted."));
+    expect(corrupted.length).toBe(1);
   });
 });
 
@@ -223,7 +242,7 @@ describe("completeDispatch", () => {
     const p = tmpStatePath();
     await registerDispatch("API-100", makeDispatch(), p);
     await completeDispatch("API-100", {
-      tier: "junior",
+      tier: "small",
       status: "done",
       completedAt: new Date().toISOString(),
     }, p);
@@ -239,7 +258,7 @@ describe("completeDispatch", () => {
     await registerSessionMapping("sess-w", { dispatchId: "API-100", phase: "worker", attempt: 0 }, p);
     await registerSessionMapping("sess-a", { dispatchId: "API-100", phase: "audit", attempt: 0 }, p);
     await completeDispatch("API-100", {
-      tier: "junior",
+      tier: "small",
       status: "done",
       completedAt: new Date().toISOString(),
     }, p);
@@ -311,7 +330,7 @@ describe("pruneCompleted", () => {
     const p = tmpStatePath();
     await registerDispatch("DONE-1", makeDispatch({ issueIdentifier: "DONE-1" }), p);
     await completeDispatch("DONE-1", {
-      tier: "junior",
+      tier: "small",
       status: "done",
       completedAt: new Date(Date.now() - 2 * 24 * 60 * 60_000).toISOString(), // 2 days ago
     }, p);
@@ -323,7 +342,7 @@ describe("pruneCompleted", () => {
     const p = tmpStatePath();
     await registerDispatch("DONE-2", makeDispatch({ issueIdentifier: "DONE-2" }), p);
     await completeDispatch("DONE-2", {
-      tier: "junior",
+      tier: "small",
       status: "done",
       completedAt: new Date().toISOString(),
     }, p);
@@ -337,9 +356,9 @@ describe("pruneCompleted", () => {
 // ---------------------------------------------------------------------------
 
 describe("migration", () => {
-  it("adds missing sessionMap and processedEvents", async () => {
+  it("migrates v1 state to v2 (adds version, sessionMap, processedEvents)", async () => {
     const p = tmpStatePath();
-    // Write v1 state with no v2 fields
+    // Write v1 state with no v2 fields (no version field)
     writeFileSync(p, JSON.stringify({
       dispatches: {
         active: { "X-1": makeDispatch({ issueIdentifier: "X-1" }) },
@@ -347,6 +366,7 @@ describe("migration", () => {
       },
     }), "utf-8");
     const state = await readDispatchState(p);
+    expect(state.version).toBe(2);
     expect(state.sessionMap).toEqual({});
     expect(state.processedEvents).toEqual([]);
   });
@@ -361,7 +381,34 @@ describe("migration", () => {
       processedEvents: [],
     }), "utf-8");
     const state = await readDispatchState(p);
+    expect(state.version).toBe(2);
     expect(getActiveDispatch(state, "X-2")!.status).toBe("working");
+  });
+
+  it("rejects unknown version", async () => {
+    const p = tmpStatePath();
+    writeFileSync(p, JSON.stringify({
+      version: 99,
+      dispatches: { active: {}, completed: {} },
+      sessionMap: {},
+      processedEvents: [],
+    }), "utf-8");
+    await expect(readDispatchState(p)).rejects.toThrow("Unknown dispatch state version: 99");
+  });
+
+  it("passes through v2 state unchanged", async () => {
+    const p = tmpStatePath();
+    const d = makeDispatch({ issueIdentifier: "X-3" });
+    writeFileSync(p, JSON.stringify({
+      version: 2,
+      dispatches: { active: { "X-3": d }, completed: {} },
+      sessionMap: {},
+      processedEvents: ["evt-old"],
+    }), "utf-8");
+    const state = await readDispatchState(p);
+    expect(state.version).toBe(2);
+    expect(getActiveDispatch(state, "X-3")).not.toBeNull();
+    expect(state.processedEvents).toEqual(["evt-old"]);
   });
 });
 
@@ -378,5 +425,61 @@ describe("removeActiveDispatch", () => {
     const state = await readDispatchState(p);
     expect(getActiveDispatch(state, "RM-1")).toBeNull();
     expect(lookupSessionMapping(state, "sess-rm")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// pruneCompletedDispatches (convenience wrapper)
+// ---------------------------------------------------------------------------
+
+describe("pruneCompletedDispatches", () => {
+  it("prunes old completed dispatches", async () => {
+    const p = tmpStatePath();
+    // Create and complete a dispatch with a timestamp 10 days ago
+    await registerDispatch("OLD-GC", makeDispatch({ issueIdentifier: "OLD-GC" }), p);
+    await completeDispatch("OLD-GC", {
+      tier: "small",
+      status: "done",
+      completedAt: new Date(Date.now() - 10 * 24 * 60 * 60_000).toISOString(), // 10 days ago
+    }, p);
+    // Also add a recent completed dispatch
+    await registerDispatch("NEW-GC", makeDispatch({ issueIdentifier: "NEW-GC" }), p);
+    await completeDispatch("NEW-GC", {
+      tier: "high",
+      status: "done",
+      completedAt: new Date().toISOString(), // now
+    }, p);
+
+    // Prune with 7-day default
+    const pruned = await pruneCompletedDispatches(7 * 24 * 60 * 60_000, p);
+    expect(pruned).toBe(1);
+
+    // Verify old one gone, recent one survives
+    const state = await readDispatchState(p);
+    expect(state.dispatches.completed["OLD-GC"]).toBeUndefined();
+    expect(state.dispatches.completed["NEW-GC"]).toBeDefined();
+  });
+
+  it("preserves recent completed dispatches", async () => {
+    const p = tmpStatePath();
+    await registerDispatch("FRESH-1", makeDispatch({ issueIdentifier: "FRESH-1" }), p);
+    await completeDispatch("FRESH-1", {
+      tier: "small",
+      status: "done",
+      completedAt: new Date().toISOString(),
+    }, p);
+    await registerDispatch("FRESH-2", makeDispatch({ issueIdentifier: "FRESH-2" }), p);
+    await completeDispatch("FRESH-2", {
+      tier: "medium",
+      status: "failed",
+      completedAt: new Date(Date.now() - 3 * 24 * 60 * 60_000).toISOString(), // 3 days ago
+    }, p);
+
+    const pruned = await pruneCompletedDispatches(7 * 24 * 60 * 60_000, p);
+    expect(pruned).toBe(0);
+
+    const state = await readDispatchState(p);
+    expect(state.dispatches.completed["FRESH-1"]).toBeDefined();
+    expect(state.dispatches.completed["FRESH-2"]).toBeDefined();
   });
 });

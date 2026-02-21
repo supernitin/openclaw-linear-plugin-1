@@ -63,7 +63,7 @@ function makeActive(overrides?: Partial<ActiveDispatch>): ActiveDispatch {
     issueIdentifier: "CT-100",
     worktreePath: "/tmp/wt/CT-100",
     branch: "codex/CT-100",
-    tier: "junior",
+    tier: "small",
     model: "test-model",
     status: "dispatched",
     dispatchedAt: new Date("2026-02-18T10:00:00Z").toISOString(),
@@ -106,7 +106,7 @@ describe("registerDispatchCommands", () => {
   it("dispatch list shows active dispatches with age/tier/status", async () => {
     const d = makeActive({
       issueIdentifier: "CT-100",
-      tier: "senior",
+      tier: "high",
       status: "working",
       attempt: 1,
     });
@@ -122,7 +122,7 @@ describe("registerDispatchCommands", () => {
     expect(result.text).toContain("Active Dispatches (1)");
     expect(result.text).toContain("CT-100");
     expect(result.text).toContain("working");
-    expect(result.text).toContain("senior");
+    expect(result.text).toContain("high");
     expect(result.text).toContain("attempt 1");
     // Should contain age in minutes (a number followed by 'm')
     expect(result.text).toMatch(/\d+m/);
@@ -142,7 +142,7 @@ describe("registerDispatchCommands", () => {
     const d = makeActive({
       issueIdentifier: "CT-100",
       issueTitle: "Fix the login bug",
-      tier: "medior",
+      tier: "medium",
       status: "auditing",
       attempt: 2,
     });
@@ -158,7 +158,7 @@ describe("registerDispatchCommands", () => {
     expect(result.text).toContain("CT-100");
     expect(result.text).toContain("Fix the login bug");
     expect(result.text).toContain("auditing");
-    expect(result.text).toContain("medior");
+    expect(result.text).toContain("medium");
     expect(result.text).toContain("Attempt: 2");
   });
 

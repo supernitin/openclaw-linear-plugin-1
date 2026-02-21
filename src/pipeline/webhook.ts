@@ -1,6 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { homedir } from "node:os";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { LinearAgentApi, resolveLinearToken } from "../api/linear-api.js";
 import { spawnWorker, type HookContext } from "./pipeline.js";
@@ -17,76 +17,51 @@ import { startProjectDispatch } from "./dag-dispatch.js";
 import { emitDiagnostic } from "../infra/observability.js";
 import { classifyIntent } from "./intent-classify.js";
 import { extractGuidance, formatGuidanceAppendix, cacheGuidanceForTeam, getCachedGuidanceForTeam, isGuidanceEnabled, _resetGuidanceCacheForTesting } from "./guidance.js";
+import { loadAgentProfiles, buildMentionPattern, resolveAgentFromAlias, _resetProfilesCacheForTesting, type AgentProfile } from "../infra/shared-profiles.js";
 
-// ── Agent profiles (loaded from config, no hardcoded names) ───────
-interface AgentProfile {
-  label: string;
-  mission: string;
-  mentionAliases: string[];
-  appAliases?: string[];
-  isDefault?: boolean;
-  avatarUrl?: string;
-}
+// ── Prompt input sanitization ─────────────────────────────────────
 
-const PROFILES_PATH = join(process.env.HOME ?? "/home/claw", ".openclaw", "agent-profiles.json");
-
-// ── Cached profile loader (5s TTL) ─────────────────────────────────
-let profilesCache: { data: Record<string, AgentProfile>; loadedAt: number } | null = null;
-const PROFILES_CACHE_TTL_MS = 5_000;
-
-function loadAgentProfiles(): Record<string, AgentProfile> {
-  const now = Date.now();
-  if (profilesCache && now - profilesCache.loadedAt < PROFILES_CACHE_TTL_MS) {
-    return profilesCache.data;
-  }
-  try {
-    const raw = readFileSync(PROFILES_PATH, "utf8");
-    const data = JSON.parse(raw).agents ?? {};
-    profilesCache = { data, loadedAt: now };
-    return data;
-  } catch {
-    return {};
-  }
-}
-
-function buildMentionPattern(profiles: Record<string, AgentProfile>): RegExp | null {
-  // Collect mentionAliases from ALL agents (including default).
-  // appAliases are excluded — those trigger AgentSessionEvent instead.
-  const aliases: string[] = [];
-  for (const [, profile] of Object.entries(profiles)) {
-    aliases.push(...profile.mentionAliases);
-  }
-  if (aliases.length === 0) return null;
-  // Escape regex special chars in aliases, join with |
-  const escaped = aliases.map(a => a.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
-  return new RegExp(`@(${escaped.join("|")})`, "gi");
-}
-
-function resolveAgentFromAlias(alias: string, profiles: Record<string, AgentProfile>): { agentId: string; label: string } | null {
-  const lower = alias.toLowerCase();
-  for (const [agentId, profile] of Object.entries(profiles)) {
-    if (profile.mentionAliases.some(a => a.toLowerCase() === lower)) {
-      return { agentId, label: profile.label };
-    }
-  }
-  return null;
+/**
+ * Sanitize user-controlled text before embedding in agent prompts.
+ * Prevents token budget abuse (truncation) and template variable
+ * injection (escaping {{ / }}).
+ */
+export function sanitizePromptInput(text: string, maxLength = 4000): string {
+  if (!text) return "(no content)";
+  // Truncate to prevent token budget abuse
+  let sanitized = text.slice(0, maxLength);
+  // Escape template variable patterns that could interfere with prompt processing
+  sanitized = sanitized.replace(/\{\{/g, "{ {").replace(/\}\}/g, "} }");
+  return sanitized;
 }
 
 // Track issues with active agent runs to prevent concurrent duplicate runs.
 const activeRuns = new Set<string>();
 
 // Dedup: track recently processed keys to avoid double-handling.
-// Periodic sweep (every 10s) instead of O(n) scan on every call.
+// Periodic sweep instead of O(n) scan on every call.
+// TTLs are configurable via pluginConfig (dedupTtlMs, dedupSweepIntervalMs).
 const recentlyProcessed = new Map<string, number>();
-const DEDUP_TTL_MS = 60_000;
-const SWEEP_INTERVAL_MS = 10_000;
+let _dedupTtlMs = 60_000;
+let _sweepIntervalMs = 10_000;
 let lastSweep = Date.now();
+
+/** @internal — configure dedup TTLs from pluginConfig. Called once at module init or from tests. */
+export function _configureDedupTtls(pluginConfig?: Record<string, unknown>): void {
+  _dedupTtlMs = (pluginConfig?.dedupTtlMs as number) ?? 60_000;
+  _sweepIntervalMs = (pluginConfig?.dedupSweepIntervalMs as number) ?? 10_000;
+}
+
+/** @internal — read current dedup TTL (for testing). */
+export function _getDedupTtlMs(): number {
+  return _dedupTtlMs;
+}
 
 function wasRecentlyProcessed(key: string): boolean {
   const now = Date.now();
-  if (now - lastSweep > SWEEP_INTERVAL_MS) {
+  if (now - lastSweep > _sweepIntervalMs) {
     for (const [k, ts] of recentlyProcessed) {
-      if (now - ts > DEDUP_TTL_MS) recentlyProcessed.delete(k);
+      if (now - ts > _dedupTtlMs) recentlyProcessed.delete(k);
     }
     lastSweep = now;
   }
@@ -99,9 +74,11 @@ function wasRecentlyProcessed(key: string): boolean {
 export function _resetForTesting(): void {
   activeRuns.clear();
   recentlyProcessed.clear();
-  profilesCache = null;
+  _resetProfilesCacheForTesting();
   linearApiCache = null;
   lastSweep = Date.now();
+  _dedupTtlMs = 60_000;
+  _sweepIntervalMs = 10_000;
   _resetGuidanceCacheForTesting();
 }
 
@@ -115,13 +92,25 @@ export function _markAsProcessedForTesting(key: string): void {
   wasRecentlyProcessed(key);
 }
 
-async function readJsonBody(req: IncomingMessage, maxBytes: number) {
+/** @internal — exported for testing */
+export async function readJsonBody(req: IncomingMessage, maxBytes: number, timeoutMs = 5000) {
   const chunks: Buffer[] = [];
   let total = 0;
+  let settled = false;
   return await new Promise<{ ok: boolean; value?: any; error?: string }>((resolve) => {
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      req.destroy();
+      resolve({ ok: false, error: "Request body timeout" });
+    }, timeoutMs);
+
     req.on("data", (chunk: Buffer) => {
+      if (settled) return;
       total += chunk.length;
       if (total > maxBytes) {
+        settled = true;
+        clearTimeout(timer);
         req.destroy();
         resolve({ ok: false, error: "payload too large" });
         return;
@@ -129,12 +118,21 @@ async function readJsonBody(req: IncomingMessage, maxBytes: number) {
       chunks.push(chunk);
     });
     req.on("end", () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       try {
         const raw = Buffer.concat(chunks).toString("utf8");
         resolve({ ok: true, value: JSON.parse(raw) });
       } catch {
         resolve({ ok: false, error: "invalid json" });
       }
+    });
+    req.on("error", () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ ok: false, error: "request error" });
     });
   });
 }
@@ -238,12 +236,36 @@ export async function handleLinearWebhook(
   }
 
   const payload = body.value;
+
+  // Structural validation — reject obviously invalid payloads early
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    api.logger.warn("Linear webhook: invalid payload (not an object)");
+    res.statusCode = 400;
+    res.end("Invalid payload");
+    return true;
+  }
+  if (typeof payload.type !== "string") {
+    api.logger.warn(`Linear webhook: missing or non-string type field`);
+    res.statusCode = 400;
+    res.end("Missing type");
+    return true;
+  }
+
   const pluginConfig = (api as any).pluginConfig as Record<string, unknown> | undefined;
+
+  // Apply configurable dedup TTLs on each webhook (idempotent)
+  _configureDedupTtls(pluginConfig);
 
   // Debug: log full payload structure for diagnosing webhook types
   const payloadKeys = Object.keys(payload).join(", ");
   api.logger.info(`Linear webhook received: type=${payload.type} action=${payload.action} keys=[${payloadKeys}]`);
-  emitDiagnostic(api, { event: "webhook_received", webhookType: payload.type, webhookAction: payload.action });
+  emitDiagnostic(api, {
+    event: "webhook_received",
+    webhookType: payload.type,
+    webhookAction: payload.action,
+    identifier: payload.data?.identifier ?? payload.agentSession?.issue?.identifier,
+    issueId: payload.data?.id ?? payload.agentSession?.issue?.id,
+  });
 
 
   // ── AppUserNotification — IGNORED ─────────────────────────────────
@@ -1622,7 +1644,7 @@ async function handleDispatch(
   const pluginConfig = (api as any).pluginConfig as Record<string, unknown> | undefined;
   const statePath = pluginConfig?.dispatchStatePath as string | undefined;
   const worktreeBaseDir = pluginConfig?.worktreeBaseDir as string | undefined;
-  const baseRepo = (pluginConfig?.codexBaseRepo as string) ?? "/home/claw/ai-workspace";
+  const baseRepo = (pluginConfig?.codexBaseRepo as string) ?? join(process.env.HOME ?? homedir(), "ai-workspace");
   const identifier = issue.identifier ?? issue.id;
 
   api.logger.info(`@dispatch: processing ${identifier}`);
@@ -1706,7 +1728,13 @@ async function handleDispatch(
   });
 
   api.logger.info(`@dispatch: ${identifier} assessed as ${assessment.tier} (${assessment.model}) — ${assessment.reasoning}`);
-  emitDiagnostic(api, { event: "dispatch_started", identifier, tier: assessment.tier, issueId: issue.id });
+  emitDiagnostic(api, {
+    event: "dispatch_started",
+    identifier,
+    tier: assessment.tier,
+    issueId: issue.id,
+    agentId: resolveAgentId(api),
+  });
 
   // 5. Create persistent worktree(s)
   let worktreePath: string;

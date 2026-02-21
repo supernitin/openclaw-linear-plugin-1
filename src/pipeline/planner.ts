@@ -26,6 +26,7 @@ import {
 import { runClaude } from "../tools/claude-tool.js";
 import { runCodex } from "../tools/codex-tool.js";
 import { runGemini } from "../tools/gemini-tool.js";
+import { renderTemplate } from "../infra/template.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -70,14 +71,6 @@ function loadPlannerPrompts(pluginConfig?: Record<string, unknown>): PlannerProm
   }
 
   return defaults;
-}
-
-function renderTemplate(template: string, vars: Record<string, string>): string {
-  let result = template;
-  for (const [key, value] of Object.entries(vars)) {
-    result = result.replaceAll(`{{${key}}}`, value);
-  }
-  return result;
 }
 
 // ---------------------------------------------------------------------------

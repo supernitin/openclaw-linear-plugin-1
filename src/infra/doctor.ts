@@ -52,11 +52,15 @@ export interface DoctorOptions {
 
 const AGENT_PROFILES_PATH = join(homedir(), ".openclaw", "agent-profiles.json");
 const VALID_BACKENDS: readonly string[] = ["claude", "codex", "gemini"];
-const CLI_BINS: [string, string][] = [
-  ["codex", "/home/claw/.npm-global/bin/codex"],
-  ["claude", "/home/claw/.npm-global/bin/claude"],
-  ["gemini", "/home/claw/.npm-global/bin/gemini"],
-];
+const DEFAULT_BIN_DIR = join(process.env.HOME ?? homedir(), ".npm-global", "bin");
+
+function resolveCliBins(pluginConfig?: Record<string, unknown>): [string, string][] {
+  return [
+    ["codex", (pluginConfig?.codexBin as string) ?? join(DEFAULT_BIN_DIR, "codex")],
+    ["claude", (pluginConfig?.claudeBin as string) ?? join(DEFAULT_BIN_DIR, "claude")],
+    ["gemini", (pluginConfig?.geminiBin as string) ?? join(DEFAULT_BIN_DIR, "gemini")],
+  ];
+}
 const STALE_DISPATCH_MS = 2 * 60 * 60_000; // 2 hours
 const OLD_COMPLETED_MS = 7 * 24 * 60 * 60_000; // 7 days
 const LOCK_STALE_MS = 30_000; // 30 seconds
@@ -92,7 +96,7 @@ function resolveWorktreeBaseDir(pluginConfig?: Record<string, unknown>): string 
 }
 
 function resolveBaseRepo(pluginConfig?: Record<string, unknown>): string {
-  return (pluginConfig?.codexBaseRepo as string) ?? "/home/claw/ai-workspace";
+  return (pluginConfig?.codexBaseRepo as string) ?? join(process.env.HOME ?? homedir(), "ai-workspace");
 }
 
 interface AgentProfile {
@@ -315,7 +319,7 @@ export function checkAgentConfig(pluginConfig?: Record<string, unknown>): CheckR
 // Section 3: Coding Tools
 // ---------------------------------------------------------------------------
 
-export function checkCodingTools(): CheckResult[] {
+export function checkCodingTools(pluginConfig?: Record<string, unknown>): CheckResult[] {
   const checks: CheckResult[] = [];
 
   // Load config
@@ -345,7 +349,8 @@ export function checkCodingTools(): CheckResult[] {
   }
 
   // CLI availability
-  for (const [name, bin] of CLI_BINS) {
+  const cliBins = resolveCliBins(pluginConfig);
+  for (const [name, bin] of cliBins) {
     try {
       const raw = execFileSync(bin, ["--version"], {
         encoding: "utf8",
@@ -728,7 +733,7 @@ export async function runDoctor(opts: DoctorOptions): Promise<DoctorReport> {
   sections.push({ name: "Agent Configuration", checks: checkAgentConfig(opts.pluginConfig) });
 
   // 3. Coding tools
-  sections.push({ name: "Coding Tools", checks: checkCodingTools() });
+  sections.push({ name: "Coding Tools", checks: checkCodingTools(opts.pluginConfig) });
 
   // 4. Files & dirs
   sections.push({
@@ -788,31 +793,34 @@ interface BackendSpec {
   unsetEnv?: string[];
 }
 
-const BACKEND_SPECS: BackendSpec[] = [
-  {
-    id: "claude",
-    label: "Claude Code (Anthropic)",
-    bin: "/home/claw/.npm-global/bin/claude",
-    testArgs: ["--print", "-p", "Respond with the single word hello", "--output-format", "stream-json", "--max-turns", "1", "--dangerously-skip-permissions"],
-    envKeys: ["ANTHROPIC_API_KEY"],
-    configKey: "claudeApiKey",
-    unsetEnv: ["CLAUDECODE"],
-  },
-  {
-    id: "codex",
-    label: "Codex (OpenAI)",
-    bin: "/home/claw/.npm-global/bin/codex",
-    testArgs: ["exec", "--json", "--ephemeral", "--full-auto", "echo hello"],
-    envKeys: ["OPENAI_API_KEY"],
-  },
-  {
-    id: "gemini",
-    label: "Gemini CLI (Google)",
-    bin: "/home/claw/.npm-global/bin/gemini",
-    testArgs: ["-p", "Respond with the single word hello", "-o", "stream-json", "--yolo"],
-    envKeys: ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENAI_API_KEY"],
-  },
-];
+function resolveBackendSpecs(pluginConfig?: Record<string, unknown>): BackendSpec[] {
+  const binDir = join(process.env.HOME ?? homedir(), ".npm-global", "bin");
+  return [
+    {
+      id: "claude",
+      label: "Claude Code (Anthropic)",
+      bin: (pluginConfig?.claudeBin as string) ?? join(binDir, "claude"),
+      testArgs: ["--print", "-p", "Respond with the single word hello", "--output-format", "stream-json", "--max-turns", "1", "--dangerously-skip-permissions"],
+      envKeys: ["ANTHROPIC_API_KEY"],
+      configKey: "claudeApiKey",
+      unsetEnv: ["CLAUDECODE"],
+    },
+    {
+      id: "codex",
+      label: "Codex (OpenAI)",
+      bin: (pluginConfig?.codexBin as string) ?? join(binDir, "codex"),
+      testArgs: ["exec", "--json", "--ephemeral", "--full-auto", "echo hello"],
+      envKeys: ["OPENAI_API_KEY"],
+    },
+    {
+      id: "gemini",
+      label: "Gemini CLI (Google)",
+      bin: (pluginConfig?.geminiBin as string) ?? join(binDir, "gemini"),
+      testArgs: ["-p", "Respond with the single word hello", "-o", "stream-json", "--yolo"],
+      envKeys: ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENAI_API_KEY"],
+    },
+  ];
+}
 
 function checkBackendBinary(spec: BackendSpec): { installed: boolean; checks: CheckResult[] } {
   const checks: CheckResult[] = [];
@@ -929,8 +937,9 @@ export async function checkCodeRunDeep(
   const sections: CheckSection[] = [];
   const config = loadCodingConfig();
   let callableCount = 0;
+  const backendSpecs = resolveBackendSpecs(pluginConfig);
 
-  for (const spec of BACKEND_SPECS) {
+  for (const spec of backendSpecs) {
     const checks: CheckResult[] = [];
 
     // 1. Binary check
@@ -966,7 +975,7 @@ export async function checkCodeRunDeep(
     ));
   }
 
-  routingChecks.push(pass(`Callable backends: ${callableCount}/${BACKEND_SPECS.length}`));
+  routingChecks.push(pass(`Callable backends: ${callableCount}/${backendSpecs.length}`));
   sections.push({ name: "Code Run: Routing", checks: routingChecks });
 
   return sections;

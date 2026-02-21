@@ -44,10 +44,10 @@ function makeIssue(overrides?: Partial<IssueContext>): IssueContext {
 // ---------------------------------------------------------------------------
 
 describe("TIER_MODELS", () => {
-  it("maps junior to haiku, medior to sonnet, senior to opus", () => {
-    expect(TIER_MODELS.junior).toBe("anthropic/claude-haiku-4-5");
-    expect(TIER_MODELS.medior).toBe("anthropic/claude-sonnet-4-6");
-    expect(TIER_MODELS.senior).toBe("anthropic/claude-opus-4-6");
+  it("maps small to haiku, medium to sonnet, high to opus", () => {
+    expect(TIER_MODELS.small).toBe("anthropic/claude-haiku-4-5");
+    expect(TIER_MODELS.medium).toBe("anthropic/claude-sonnet-4-6");
+    expect(TIER_MODELS.high).toBe("anthropic/claude-opus-4-6");
   });
 });
 
@@ -59,19 +59,19 @@ describe("assessTier", () => {
   it("returns parsed tier from agent response", async () => {
     mockRunAgent.mockResolvedValue({
       success: true,
-      output: '{"tier":"senior","reasoning":"Multi-service architecture change"}',
+      output: '{"tier":"high","reasoning":"Multi-service architecture change"}',
     });
 
     const api = makeApi({ defaultAgentId: "mal" });
     const result = await assessTier(api, makeIssue());
 
-    expect(result.tier).toBe("senior");
-    expect(result.model).toBe(TIER_MODELS.senior);
+    expect(result.tier).toBe("high");
+    expect(result.model).toBe(TIER_MODELS.high);
     expect(result.reasoning).toBe("Multi-service architecture change");
     expect(api.logger.info).toHaveBeenCalled();
   });
 
-  it("falls back to medior when agent fails (success: false) with no parseable JSON", async () => {
+  it("falls back to medium when agent fails (success: false) with no parseable JSON", async () => {
     mockRunAgent.mockResolvedValue({
       success: false,
       output: "Agent process exited with code 1",
@@ -80,13 +80,13 @@ describe("assessTier", () => {
     const api = makeApi({ defaultAgentId: "mal" });
     const result = await assessTier(api, makeIssue());
 
-    expect(result.tier).toBe("medior");
-    expect(result.model).toBe(TIER_MODELS.medior);
-    expect(result.reasoning).toBe("Assessment failed — defaulting to medior");
+    expect(result.tier).toBe("medium");
+    expect(result.model).toBe(TIER_MODELS.medium);
+    expect(result.reasoning).toBe("Assessment failed — defaulting to medium");
     expect(api.logger.warn).toHaveBeenCalled();
   });
 
-  it("falls back to medior when output has no JSON", async () => {
+  it("falls back to medium when output has no JSON", async () => {
     mockRunAgent.mockResolvedValue({
       success: true,
       output: "I think this is a medium complexity issue because it involves multiple files.",
@@ -95,12 +95,12 @@ describe("assessTier", () => {
     const api = makeApi({ defaultAgentId: "mal" });
     const result = await assessTier(api, makeIssue());
 
-    expect(result.tier).toBe("medior");
-    expect(result.model).toBe(TIER_MODELS.medior);
-    expect(result.reasoning).toBe("Assessment failed — defaulting to medior");
+    expect(result.tier).toBe("medium");
+    expect(result.model).toBe(TIER_MODELS.medium);
+    expect(result.reasoning).toBe("Assessment failed — defaulting to medium");
   });
 
-  it("falls back to medior when JSON has invalid tier", async () => {
+  it("falls back to medium when JSON has invalid tier", async () => {
     mockRunAgent.mockResolvedValue({
       success: true,
       output: '{"tier":"expert","reasoning":"Very hard problem"}',
@@ -109,8 +109,8 @@ describe("assessTier", () => {
     const api = makeApi({ defaultAgentId: "mal" });
     const result = await assessTier(api, makeIssue());
 
-    expect(result.tier).toBe("medior");
-    expect(result.model).toBe(TIER_MODELS.medior);
+    expect(result.tier).toBe("medium");
+    expect(result.model).toBe(TIER_MODELS.medium);
   });
 
   it("handles agent throwing an error", async () => {
@@ -119,9 +119,9 @@ describe("assessTier", () => {
     const api = makeApi({ defaultAgentId: "mal" });
     const result = await assessTier(api, makeIssue());
 
-    expect(result.tier).toBe("medior");
-    expect(result.model).toBe(TIER_MODELS.medior);
-    expect(result.reasoning).toBe("Assessment failed — defaulting to medior");
+    expect(result.tier).toBe("medium");
+    expect(result.model).toBe(TIER_MODELS.medium);
+    expect(result.reasoning).toBe("Assessment failed — defaulting to medium");
     expect(api.logger.warn).toHaveBeenCalledWith(
       expect.stringContaining("Tier assessment error for CT-123"),
     );
@@ -131,7 +131,7 @@ describe("assessTier", () => {
     const longDescription = "A".repeat(3000);
     mockRunAgent.mockResolvedValue({
       success: true,
-      output: '{"tier":"junior","reasoning":"Simple copy change"}',
+      output: '{"tier":"small","reasoning":"Simple copy change"}',
     });
 
     const api = makeApi({ defaultAgentId: "mal" });
@@ -149,7 +149,7 @@ describe("assessTier", () => {
   it("uses configured agentId when provided", async () => {
     mockRunAgent.mockResolvedValue({
       success: true,
-      output: '{"tier":"junior","reasoning":"Typo fix"}',
+      output: '{"tier":"small","reasoning":"Typo fix"}',
     });
 
     const api = makeApi({ defaultAgentId: "mal" });
@@ -162,42 +162,42 @@ describe("assessTier", () => {
   it("parses JSON even when wrapped in markdown fences", async () => {
     mockRunAgent.mockResolvedValue({
       success: true,
-      output: '```json\n{"tier":"junior","reasoning":"Config tweak"}\n```',
+      output: '```json\n{"tier":"small","reasoning":"Config tweak"}\n```',
     });
 
     const api = makeApi({ defaultAgentId: "mal" });
     const result = await assessTier(api, makeIssue());
 
-    expect(result.tier).toBe("junior");
-    expect(result.model).toBe(TIER_MODELS.junior);
+    expect(result.tier).toBe("small");
+    expect(result.model).toBe(TIER_MODELS.small);
     expect(result.reasoning).toBe("Config tweak");
   });
 
   it("handles null description gracefully", async () => {
     mockRunAgent.mockResolvedValue({
       success: true,
-      output: '{"tier":"junior","reasoning":"Trivial"}',
+      output: '{"tier":"small","reasoning":"Trivial"}',
     });
 
     const api = makeApi({ defaultAgentId: "mal" });
     const result = await assessTier(api, makeIssue({ description: null }));
 
-    expect(result.tier).toBe("junior");
+    expect(result.tier).toBe("small");
   });
 
   it("handles empty labels and no comments", async () => {
     mockRunAgent.mockResolvedValue({
       success: true,
-      output: '{"tier":"medior","reasoning":"Standard feature"}',
+      output: '{"tier":"medium","reasoning":"Standard feature"}',
     });
 
     const api = makeApi({ defaultAgentId: "mal" });
     const result = await assessTier(api, makeIssue({ labels: [], commentCount: undefined }));
 
-    expect(result.tier).toBe("medior");
+    expect(result.tier).toBe("medium");
   });
 
-  it("falls back to medior on malformed JSON (half JSON)", async () => {
+  it("falls back to medium on malformed JSON (half JSON)", async () => {
     mockRunAgent.mockResolvedValue({
       success: true,
       output: '{"tier":"seni',
@@ -206,40 +206,40 @@ describe("assessTier", () => {
     const api = makeApi({ defaultAgentId: "mal" });
     const result = await assessTier(api, makeIssue());
 
-    expect(result.tier).toBe("medior");
-    expect(result.reasoning).toBe("Assessment failed — defaulting to medior");
+    expect(result.tier).toBe("medium");
+    expect(result.reasoning).toBe("Assessment failed — defaulting to medium");
   });
 
   it("provides default reasoning when missing from response", async () => {
     mockRunAgent.mockResolvedValue({
       success: true,
-      output: '{"tier":"senior"}',
+      output: '{"tier":"high"}',
     });
 
     const api = makeApi({ defaultAgentId: "mal" });
     const result = await assessTier(api, makeIssue());
 
-    expect(result.tier).toBe("senior");
+    expect(result.tier).toBe("high");
     expect(result.reasoning).toBe("no reasoning provided");
   });
 
   it("extracts JSON from output with success=false but valid JSON", async () => {
     mockRunAgent.mockResolvedValue({
       success: false,
-      output: 'Agent exited early but: {"tier":"junior","reasoning":"Simple fix"}',
+      output: 'Agent exited early but: {"tier":"small","reasoning":"Simple fix"}',
     });
 
     const api = makeApi({ defaultAgentId: "mal" });
     const result = await assessTier(api, makeIssue());
 
-    expect(result.tier).toBe("junior");
+    expect(result.tier).toBe("small");
     expect(result.reasoning).toBe("Simple fix");
   });
 
   it("defaults agentId from pluginConfig when not passed", async () => {
     mockRunAgent.mockResolvedValue({
       success: true,
-      output: '{"tier":"medior","reasoning":"Normal"}',
+      output: '{"tier":"medium","reasoning":"Normal"}',
     });
 
     const api = makeApi({ defaultAgentId: "zoe" });
@@ -252,7 +252,7 @@ describe("assessTier", () => {
   it("uses 30s timeout for assessment", async () => {
     mockRunAgent.mockResolvedValue({
       success: true,
-      output: '{"tier":"medior","reasoning":"Normal"}',
+      output: '{"tier":"medium","reasoning":"Normal"}',
     });
 
     const api = makeApi({ defaultAgentId: "mal" });

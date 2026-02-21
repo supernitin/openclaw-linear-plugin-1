@@ -100,7 +100,7 @@ function makeDispatch(worktreePath: string, overrides?: Partial<ActiveDispatch>)
     issueIdentifier: "ENG-100",
     worktreePath,
     branch: "codex/ENG-100",
-    tier: "junior" as const,
+    tier: "small" as const,
     model: "test-model",
     status: "dispatched",
     dispatchedAt: new Date().toISOString(),
@@ -468,7 +468,7 @@ describe("E2E dispatch pipeline", () => {
     writeManifest(worktree, {
       issueIdentifier: "ENG-100",
       issueId: "issue-1",
-      tier: "junior",
+      tier: "small",
       status: "dispatched",
       attempts: 0,
       dispatchedAt: new Date().toISOString(),

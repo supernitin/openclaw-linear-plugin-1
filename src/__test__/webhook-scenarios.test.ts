@@ -98,7 +98,7 @@ vi.mock("../pipeline/intent-classify.js", () => ({
 }));
 
 vi.mock("../pipeline/dispatch-state.js", () => ({
-  readDispatchState: vi.fn().mockResolvedValue({ dispatches: { active: {}, completed: {} }, sessionMap: {} }),
+  readDispatchState: vi.fn().mockResolvedValue({ version: 2, dispatches: { active: {}, completed: {} }, sessionMap: {}, processedEvents: [] }),
   getActiveDispatch: vi.fn().mockReturnValue(null),
   registerDispatch: vi.fn().mockResolvedValue(undefined),
   updateDispatchStatus: vi.fn().mockResolvedValue(undefined),

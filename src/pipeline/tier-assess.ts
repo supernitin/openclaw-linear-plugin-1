@@ -7,19 +7,18 @@
  *
  * Cost: one short agent turn (~500 tokens). Latency: ~2-5s.
  */
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import type { Tier } from "./dispatch-state.js";
+import { resolveDefaultAgent } from "../infra/shared-profiles.js";
 
 // ---------------------------------------------------------------------------
 // Tier → Model mapping
 // ---------------------------------------------------------------------------
 
 export const TIER_MODELS: Record<Tier, string> = {
-  junior: "anthropic/claude-haiku-4-5",
-  medior: "anthropic/claude-sonnet-4-6",
-  senior: "anthropic/claude-opus-4-6",
+  small: "anthropic/claude-haiku-4-5",
+  medium: "anthropic/claude-sonnet-4-6",
+  high: "anthropic/claude-opus-4-6",
 };
 
 export interface TierAssessment {
@@ -43,9 +42,9 @@ export interface IssueContext {
 const ASSESS_PROMPT = `You are a complexity assessor. Assess this issue and respond ONLY with JSON.
 
 Tiers:
-- junior: typos, copy changes, config tweaks, simple CSS, env var additions
-- medior: features, bugfixes, moderate refactoring, adding tests, API changes
-- senior: architecture changes, database migrations, security fixes, multi-service coordination
+- small: typos, copy changes, config tweaks, simple CSS, env var additions
+- medium: features, bugfixes, moderate refactoring, adding tests, API changes
+- high: architecture changes, database migrations, security fixes, multi-service coordination
 
 Consider:
 1. How many files/services are likely affected?
@@ -53,12 +52,12 @@ Consider:
 3. Is the description clear and actionable?
 4. Are there dependencies or unknowns?
 
-Respond ONLY with: {"tier":"junior|medior|senior","reasoning":"one sentence"}`;
+Respond ONLY with: {"tier":"small|medium|high","reasoning":"one sentence"}`;
 
 /**
  * Assess issue complexity using the agent's configured model.
  *
- * Falls back to "medior" if the agent call fails or returns invalid JSON.
+ * Falls back to "medium" if the agent call fails or returns invalid JSON.
  */
 export async function assessTier(
   api: OpenClawPluginApi,
@@ -105,36 +104,19 @@ export async function assessTier(
     api.logger.warn(`Tier assessment error for ${issue.identifier}: ${err}`);
   }
 
-  // Fallback: medior is the safest default
+  // Fallback: medium is the safest default
   const fallback: TierAssessment = {
-    tier: "medior",
-    model: TIER_MODELS.medior,
-    reasoning: "Assessment failed — defaulting to medior",
+    tier: "medium",
+    model: TIER_MODELS.medium,
+    reasoning: "Assessment failed — defaulting to medium",
   };
-  api.logger.info(`Tier assessment fallback for ${issue.identifier}: medior`);
+  api.logger.info(`Tier assessment fallback for ${issue.identifier}: medium`);
   return fallback;
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-function resolveDefaultAgent(api: OpenClawPluginApi): string {
-  // Use the plugin's configured default agent (same one that runs the pipeline)
-  const fromConfig = (api as any).pluginConfig?.defaultAgentId;
-  if (typeof fromConfig === "string" && fromConfig) return fromConfig;
-
-  // Fall back to isDefault in agent profiles
-  try {
-    const profilesPath = join(process.env.HOME ?? "/home/claw", ".openclaw", "agent-profiles.json");
-    const raw = readFileSync(profilesPath, "utf8");
-    const profiles = JSON.parse(raw).agents ?? {};
-    const defaultAgent = Object.entries(profiles).find(([, p]: [string, any]) => p.isDefault);
-    if (defaultAgent) return defaultAgent[0];
-  } catch { /* fall through */ }
-
-  return "default";
-}
 
 function parseAssessment(raw: string): TierAssessment | null {
   // Extract JSON from the response (may have markdown wrapping)
@@ -144,7 +126,7 @@ function parseAssessment(raw: string): TierAssessment | null {
   try {
     const parsed = JSON.parse(jsonMatch[0]);
     const tier = parsed.tier as string;
-    if (tier !== "junior" && tier !== "medior" && tier !== "senior") return null;
+    if (tier !== "small" && tier !== "medium" && tier !== "high") return null;
 
     return {
       tier: tier as Tier,

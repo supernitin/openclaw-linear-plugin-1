@@ -33,7 +33,7 @@ export function createDispatchHistoryTool(
         },
         tier: {
           type: "string",
-          enum: ["junior", "medior", "senior"],
+          enum: ["small", "medium", "high"],
           description: "Filter by tier.",
         },
         status: {

@@ -1,4 +1,6 @@
 import { execFileSync } from "node:child_process";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { registerLinearProvider } from "./src/api/auth.js";
 import { registerCli } from "./src/infra/cli.js";
@@ -8,7 +10,7 @@ import { handleOAuthCallback } from "./src/api/oauth-callback.js";
 import { LinearAgentApi, resolveLinearToken } from "./src/api/linear-api.js";
 import { createDispatchService } from "./src/pipeline/dispatch-service.js";
 import { registerDispatchMethods } from "./src/gateway/dispatch-methods.js";
-import { readDispatchState, lookupSessionMapping, getActiveDispatch } from "./src/pipeline/dispatch-state.js";
+import { readDispatchState, lookupSessionMapping, getActiveDispatch, transitionDispatch, type DispatchStatus } from "./src/pipeline/dispatch-state.js";
 import { triggerAudit, processVerdict, type HookContext } from "./src/pipeline/pipeline.js";
 import { createNotifierFromConfig, type NotifyFn } from "./src/infra/notify.js";
 import { readPlanningState, setPlanningCache } from "./src/pipeline/planning-state.js";
@@ -169,6 +171,35 @@ export default function register(api: OpenClawPluginApi) {
       }
     } catch (err) {
       api.logger.error(`agent_end hook error: ${err}`);
+      // Escalate: mark dispatch as stuck so it's visible
+      try {
+        const statePath = pluginConfig?.dispatchStatePath as string | undefined;
+        const state = await readDispatchState(statePath);
+        const sessionKey = ctx?.sessionKey ?? "";
+        const mapping = sessionKey ? lookupSessionMapping(state, sessionKey) : null;
+        if (mapping) {
+          const dispatch = getActiveDispatch(state, mapping.dispatchId);
+          if (dispatch && dispatch.status !== "done" && dispatch.status !== "stuck" && dispatch.status !== "failed") {
+            const stuckReason = `Hook error: ${err instanceof Error ? err.message : String(err)}`.slice(0, 500);
+            await transitionDispatch(
+              mapping.dispatchId,
+              dispatch.status as DispatchStatus,
+              "stuck",
+              { stuckReason },
+              statePath,
+            );
+            // Notify if possible
+            await notify("escalation", {
+              identifier: dispatch.issueIdentifier,
+              title: dispatch.issueTitle ?? "Unknown",
+              status: "stuck",
+              reason: `Dispatch failed in ${mapping.phase} phase: ${stuckReason}`,
+            }).catch(() => {}); // Don't fail on notification failure
+          }
+        }
+      } catch (escalateErr) {
+        api.logger.error(`agent_end escalation also failed: ${escalateErr}`);
+      }
     }
   });
 
@@ -222,10 +253,11 @@ export default function register(api: OpenClawPluginApi) {
 
   // Check CLI availability (Codex, Claude, Gemini)
   const cliChecks: Record<string, string> = {};
+  const defaultBinDir = join(process.env.HOME ?? homedir(), ".npm-global", "bin");
   const cliBins: [string, string, string][] = [
-    ["codex", "/home/claw/.npm-global/bin/codex", "npm install -g @openai/codex"],
-    ["claude", "/home/claw/.npm-global/bin/claude", "npm install -g @anthropic-ai/claude-code"],
-    ["gemini", "/home/claw/.npm-global/bin/gemini", "npm install -g @anthropic-ai/gemini-cli"],
+    ["codex", pluginConfig?.codexBin as string ?? join(defaultBinDir, "codex"), "npm install -g @openai/codex"],
+    ["claude", pluginConfig?.claudeBin as string ?? join(defaultBinDir, "claude"), "npm install -g @anthropic-ai/claude-code"],
+    ["gemini", pluginConfig?.geminiBin as string ?? join(defaultBinDir, "gemini"), "npm install -g @anthropic-ai/gemini-cli"],
   ];
   for (const [name, bin, installCmd] of cliBins) {
     try {

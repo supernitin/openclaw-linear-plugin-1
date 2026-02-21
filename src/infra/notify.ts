@@ -262,13 +262,18 @@ export function createNotifierFromConfig(
         try {
           await sendToTarget(target, message, runtime);
         } catch (err) {
-          console.error(`Notify error (${target.channel}:${target.target}):`, err);
+          const safeError = err instanceof Error ? err.message : "Unknown error";
+          // Strip potential URLs/tokens from error messages to prevent secret leakage
+          const sanitizedError = safeError
+            .replace(/https?:\/\/[^\s]+/g, "[URL]")
+            .replace(/[A-Za-z0-9_-]{20,}/g, "[TOKEN]");
+          console.error(`Notify error (${target.channel}:${target.target}): ${sanitizedError}`);
           if (api) {
             emitDiagnostic(api, {
               event: "notify_failed",
               identifier: payload.identifier,
               phase: kind,
-              error: String(err),
+              error: sanitizedError,
             });
           }
         }

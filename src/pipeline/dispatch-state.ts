@@ -20,7 +20,7 @@ import { homedir } from "node:os";
 // Types
 // ---------------------------------------------------------------------------
 
-export type Tier = "junior" | "medior" | "senior";
+export type Tier = "small" | "medium" | "high";
 
 export type DispatchStatus =
   | "dispatched"
@@ -79,6 +79,8 @@ export interface SessionMapping {
 }
 
 export interface DispatchState {
+  /** Schema version — used by migrateState() for forward-compatible upgrades */
+  version: 2;
   dispatches: {
     active: Record<string, ActiveDispatch>;
     completed: Record<string, CompletedDispatch>;
@@ -114,26 +116,38 @@ import { acquireLock, releaseLock } from "../infra/file-lock.js";
 
 function emptyState(): DispatchState {
   return {
+    version: 2,
     dispatches: { active: {}, completed: {} },
     sessionMap: {},
     processedEvents: [],
   };
 }
 
-/** Migrate v1 state (no sessionMap/processedEvents) to v2 */
+/** Migrate state from any known version to the current version (2). */
 function migrateState(raw: any): DispatchState {
-  const state = raw as DispatchState;
-  if (!state.sessionMap) state.sessionMap = {};
-  if (!state.processedEvents) state.processedEvents = [];
-  // Ensure all active dispatches have attempt field
-  for (const d of Object.values(state.dispatches.active)) {
-    if ((d as any).attempt === undefined) (d as any).attempt = 0;
+  const version = raw?.version ?? 1;
+  switch (version) {
+    case 1: {
+      // v1 → v2: add sessionMap, processedEvents, attempt defaults, status rename
+      const state = raw as DispatchState;
+      if (!state.sessionMap) state.sessionMap = {};
+      if (!state.processedEvents) state.processedEvents = [];
+      // Ensure all active dispatches have attempt field
+      for (const d of Object.values(state.dispatches.active)) {
+        if ((d as any).attempt === undefined) (d as any).attempt = 0;
+      }
+      // Migrate old status "running" → "working"
+      for (const d of Object.values(state.dispatches.active)) {
+        if ((d as any).status === "running") (d as any).status = "working";
+      }
+      state.version = 2;
+      return state;
+    }
+    case 2:
+      return raw as DispatchState;
+    default:
+      throw new Error(`Unknown dispatch state version: ${version}`);
   }
-  // Migrate old status "running" → "working"
-  for (const d of Object.values(state.dispatches.active)) {
-    if ((d as any).status === "running") (d as any).status = "working";
-  }
-  return state;
 }
 
 export async function readDispatchState(configPath?: string): Promise<DispatchState> {
@@ -143,6 +157,15 @@ export async function readDispatchState(configPath?: string): Promise<DispatchSt
     return migrateState(JSON.parse(raw));
   } catch (err: any) {
     if (err.code === "ENOENT") return emptyState();
+    if (err instanceof SyntaxError) {
+      // State file corrupted — log and recover
+      console.error(`Dispatch state corrupted at ${filePath}: ${err.message}. Starting fresh.`);
+      // Rename corrupted file for forensics
+      try {
+        await fs.rename(filePath, `${filePath}.corrupted.${Date.now()}`);
+      } catch { /* best-effort */ }
+      return emptyState();
+    }
     throw err;
   }
 }
@@ -432,6 +455,18 @@ export async function pruneCompleted(
   } finally {
     await releaseLock(filePath);
   }
+}
+
+/**
+ * Garbage-collect completed dispatches older than maxAgeMs.
+ * Convenience wrapper with a 7-day default.
+ * Returns the count of pruned entries.
+ */
+export async function pruneCompletedDispatches(
+  maxAgeMs: number = 7 * 24 * 60 * 60_000,
+  configPath?: string,
+): Promise<number> {
+  return pruneCompleted(maxAgeMs, configPath);
 }
 
 /**

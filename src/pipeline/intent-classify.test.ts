@@ -151,14 +151,32 @@ describe("classifyIntent", () => {
     expect(result.fromFallback).toBe(true);
   });
 
-  it("uses 12s timeout for classification", async () => {
+  it("uses 10s timeout for classification", async () => {
     await classifyIntent(createApi(), createCtx());
 
     expect(runAgentMock).toHaveBeenCalledWith(
       expect.objectContaining({
-        timeoutMs: 12_000,
+        timeoutMs: 10_000,
       }),
     );
+  });
+
+  it("falls back to regex when classification times out via Promise.race", async () => {
+    // Simulate runAgent hanging beyond the 10s timeout
+    runAgentMock.mockImplementationOnce(
+      () => new Promise((resolve) => setTimeout(resolve, 60_000)),
+    );
+
+    // Use fake timers to avoid actually waiting
+    vi.useFakeTimers();
+    const promise = classifyIntent(createApi(), createCtx({ commentBody: "fix the bug" }));
+    // Advance past the 10s timeout
+    await vi.advanceTimersByTimeAsync(10_001);
+    const result = await promise;
+    vi.useRealTimers();
+
+    expect(result.fromFallback).toBe(true);
+    expect(result.intent).toBe("general"); // regex fallback for "fix the bug" with no agent names matched
   });
 
   it("includes context in the prompt", async () => {
