@@ -23,7 +23,7 @@ jobs:
           node-version: 24
           cache: npm
 
-      - run: npm ci
+      - run: npm install --ignore-scripts
 
       - run: npx vitest run --coverage
         env:
