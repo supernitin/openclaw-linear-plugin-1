@@ -305,6 +305,7 @@ User comment → Intent Classifier (small model, ~2s) → Route to handler
 | "looks good, ship it" (during planning) | Runs plan audit + cross-model review |
 | "nevermind, cancel this" (during planning) | Exits planning mode |
 | "hey kaylee can you look at this?" | Routes to Kaylee (no `@` needed) |
+| "@mal close this issue" | Routes to Mal (one-time detour) and closes the issue |
 | "what can I do here?" | Default agent responds (not silently dropped) |
 | "fix the search bug" | Default agent dispatches work |
 | "close this" / "mark as done" / "this is resolved" | Generates closure report, transitions issue to completed |
@@ -312,6 +313,41 @@ User comment → Intent Classifier (small model, ~2s) → Route to handler
 `@mentions` still work as a fast path — if you write `@kaylee`, the classifier is skipped entirely for speed.
 
 > **Tip:** Configure `classifierAgentId` to point to a small/fast model agent (like Haiku) for low-latency, low-cost intent classification. The classifier only needs ~300 tokens per call.
+
+### Agent Routing
+
+The plugin supports a multi-agent team where one agent is the default (`isDefault: true` in agent profiles) and others are routed to on demand. Routing works across all webhook paths:
+
+| Webhook Path | How agent is selected |
+|---|---|
+| `Comment.create` | `@mention` in comment text → specific agent. No mention → intent classifier may detect agent name ("hey kaylee") → `ask_agent` intent. Otherwise → default agent. |
+| `AgentSessionEvent.created` | Scans user's message for `@mention` aliases → routes to mentioned agent for that interaction. No mention → default agent. |
+| `AgentSessionEvent.prompted` | Same as `created` — scans follow-up message for `@mention` → one-time detour to mentioned agent. No mention → default agent. |
+| `Issue.update` (assignment) | Always dispatches to default agent. |
+| `Issue.create` (triage) | Always dispatches to default agent. |
+
+**One-time detour:** When you `@mention` an agent in a session that belongs to a different default agent, the mentioned agent handles that single interaction. The session itself stays owned by whoever created it — subsequent messages without `@mentions` go back to the default. This lets you ask a specific agent for help without permanently switching context.
+
+**Agent profiles** are configured in `~/.openclaw/agent-profiles.json`:
+
+```json
+{
+  "agents": {
+    "mal": {
+      "label": "Mal",
+      "mentionAliases": ["mal"],
+      "isDefault": false
+    },
+    "zoe": {
+      "label": "Zoe",
+      "mentionAliases": ["zoe"],
+      "isDefault": true
+    }
+  }
+}
+```
+
+Each agent needs a unique set of `mentionAliases`. The `appAliases` field (e.g. `["ctclaw"]`) is separate — those trigger `AgentSessionEvent` from Linear's own `@app` mention system, not the plugin's routing.
 
 ### Deduplication
 
@@ -993,10 +1029,12 @@ The handler dispatches by `type + action`:
 Incoming POST /linear/webhook
   │
   ├─ type=AgentSessionEvent, action=created
-  │    └─ New agent session on issue → dedup → create LinearAgentApi → run agent
+  │    └─ New agent session → dedup → scan message for @mentions →
+  │       route to mentioned agent (or default) → run agent
   │
   ├─ type=AgentSessionEvent, action=prompted
-  │    └─ Follow-up message in existing session → dedup → resume agent with context
+  │    └─ Follow-up message → dedup → scan message for @mentions →
+  │       route to mentioned agent (one-time detour, or default) → resume agent
   │
   ├─ type=Comment, action=create
   │    └─ Comment on issue → filter self-comments (viewerId) → dedup →
