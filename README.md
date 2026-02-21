@@ -23,13 +23,13 @@ Connect Linear to AI agents. Issues get triaged, implemented, and audited — au
 - [x] Linear API integration (issues, comments, labels, state transitions)
 - [x] Agent routing (`@mentions`, natural language intent classifier)
 - [ ] Linear OAuth app webhook (AgentSessionEvent created/prompted)
-- [ ] Auto-triage (story points, labels, priority — read-only)
-- [ ] Complexity-tier dispatch (small → Haiku, medium → Sonnet, high → Opus)
-- [ ] Isolated git worktrees per dispatch
-- [ ] Worker → Auditor pipeline (hard-enforced, not LLM-mediated)
+- [x] Auto-triage (story points, labels, priority — read-only)
+- [x] Complexity-tier dispatch (small → Haiku, medium → Sonnet, high → Opus)
+- [x] Isolated git worktrees per dispatch
+- [x] Worker → Auditor pipeline (hard-enforced, not LLM-mediated)
 - [ ] Audit rework loop (gaps fed back, automatic retry)
 - [ ] Watchdog timeout + escalation
-- [ ] Webhook deduplication (60s sliding window across session/comment/assignment)
+- [x] Webhook deduplication (60s sliding window across session/comment/assignment)
 - [ ] Multi-repo worktree support
 - [ ] Project planner (interview → user stories → sub-issues → DAG dispatch)
 - [ ] Cross-model plan review (Claude ↔ Codex ↔ Gemini)
