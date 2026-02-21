@@ -95,6 +95,99 @@ export function makeIssueCreate(overrides?: Record<string, unknown>) {
   };
 }
 
+/**
+ * AgentSessionEvent.created — the actual type from OAuth app webhooks.
+ * (makeAgentSessionCreated uses the legacy "AgentSession"/"create" variant.)
+ */
+export function makeAgentSessionEventCreated(overrides?: Record<string, unknown>) {
+  return {
+    type: "AgentSessionEvent",
+    action: "created",
+    agentSession: {
+      id: "sess-event-1",
+      issue: {
+        id: "issue-1",
+        identifier: "ENG-123",
+        title: "Fix webhook routing",
+      },
+    },
+    previousComments: [],
+    guidance: "Please investigate this issue",
+    ...overrides,
+  };
+}
+
+/**
+ * AgentSessionEvent.prompted — follow-up user message in existing session.
+ */
+export function makeAgentSessionEventPrompted(overrides?: Record<string, unknown>) {
+  return {
+    type: "AgentSessionEvent",
+    action: "prompted",
+    agentSession: {
+      id: "sess-event-1",
+      issue: {
+        id: "issue-1",
+        identifier: "ENG-123",
+        title: "Fix webhook routing",
+      },
+    },
+    agentActivity: { content: { body: "Follow-up question here" } },
+    webhookId: "webhook-prompted-1",
+    ...overrides,
+  };
+}
+
+/**
+ * Comment.create from the bot's own user (should be skipped by viewerId check).
+ */
+export function makeCommentCreateFromBot(viewerId: string, overrides?: Record<string, unknown>) {
+  return {
+    type: "Comment",
+    action: "create",
+    data: {
+      id: `comment-bot-${Date.now()}`,
+      body: "**[Mal]** Bot response text",
+      user: { id: viewerId, name: "CT Claw" },
+      issue: {
+        id: "issue-1",
+        identifier: "ENG-123",
+        title: "Fix webhook routing",
+        team: { id: "team-1" },
+        assignee: { id: viewerId },
+        project: null,
+      },
+      createdAt: new Date().toISOString(),
+    },
+    ...overrides,
+  };
+}
+
+/**
+ * Issue.update with assignment/delegation fields for dedup testing.
+ */
+export function makeIssueUpdateWithAssignment(overrides?: Record<string, unknown>) {
+  return {
+    type: "Issue",
+    action: "update",
+    data: {
+      id: "issue-1",
+      identifier: "ENG-123",
+      title: "Fix webhook routing",
+      state: { name: "In Progress", type: "started" },
+      assignee: { id: "viewer-1", name: "Agent" },
+      assigneeId: "viewer-1",
+      delegateId: null,
+      team: { id: "team-1" },
+      project: null,
+    },
+    updatedFrom: {
+      assigneeId: null,
+    },
+    ...overrides,
+  };
+}
+
 export function makeAppUserNotification(overrides?: Record<string, unknown>) {
   return {
     type: "AppUserNotification",

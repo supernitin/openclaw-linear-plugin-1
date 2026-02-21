@@ -36,7 +36,7 @@ Go to **Linear Settings > API > Applications** and create an app:
 - Enable events: **Agent Sessions**, **Comments**, **Issues**
 - Save your **Client ID** and **Client Secret**
 
-> You also need a **workspace webhook** (Settings > API > Webhooks) pointing to the same URL with Comment + Issue + User events enabled. Both webhooks are required.
+> You also need a **workspace webhook** — run `openclaw openclaw-linear webhooks setup` to auto-provision it, or manually create one in Settings > API > Webhooks pointing to the same URL with **Comment + Issue** events enabled. Both webhooks are required.
 
 ### 3. Set credentials
 
@@ -309,6 +309,25 @@ User comment → Intent Classifier (small model, ~2s) → Route to handler
 `@mentions` still work as a fast path — if you write `@kaylee`, the classifier is skipped entirely for speed.
 
 > **Tip:** Configure `classifierAgentId` to point to a small/fast model agent (like Haiku) for low-latency, low-cost intent classification. The classifier only needs ~300 tokens per call.
+
+### Deduplication
+
+The webhook handler prevents double-processing through a two-tier guard system:
+
+1. **`activeRuns` (in-memory Set)** — O(1) check if an agent is already running for an issue. Catches feedback loops where our own API calls (e.g., `createComment`, `createSessionOnIssue`) trigger webhooks back to us.
+
+2. **`wasRecentlyProcessed` (TTL Map, 60s)** — Catches exact-duplicate webhook deliveries. Each event type uses a specific dedup key:
+
+| Event | Dedup Key | Guards (in order) |
+|---|---|---|
+| `AgentSessionEvent.created` | `session:<sessionId>` | activeRuns → wasRecentlyProcessed |
+| `AgentSessionEvent.prompted` | `webhook:<webhookId>` | activeRuns → wasRecentlyProcessed |
+| `Comment.create` | `comment:<commentId>` | wasRecentlyProcessed → viewerId → activeRuns |
+| `Issue.update` | `<trigger>:<issueId>:<viewerId>` | activeRuns → no-change → viewerId → wasRecentlyProcessed |
+| `Issue.create` | `issue-create:<issueId>` | wasRecentlyProcessed → activeRuns → planning mode → bot-created |
+| `AppUserNotification` | *(immediate discard)* | — |
+
+**Comment echo prevention:** All comments posted by the handler use `createCommentWithDedup()`, which pre-registers the comment's ID in `wasRecentlyProcessed` immediately after the API returns. When Linear echoes the `Comment.create` webhook back, it's caught before any processing.
 
 ---
 
@@ -1026,6 +1045,13 @@ openclaw openclaw-linear notify test               # Test all targets
 openclaw openclaw-linear notify test --channel discord  # Test one channel
 openclaw openclaw-linear notify setup              # Interactive setup
 
+# Webhooks
+openclaw openclaw-linear webhooks status             # Show webhook config in Linear
+openclaw openclaw-linear webhooks setup              # Auto-provision workspace webhook
+openclaw openclaw-linear webhooks setup --dry-run    # Preview what would change
+openclaw openclaw-linear webhooks setup --url <url>  # Use custom webhook URL
+openclaw openclaw-linear webhooks delete <id>        # Delete a webhook by ID
+
 # Dispatch
 /dispatch list                                     # Active dispatches
 /dispatch status <identifier>                      # Dispatch details
@@ -1057,7 +1083,7 @@ journalctl --user -u openclaw-gateway -f         # Watch live logs
 | Agent goes silent | Watchdog auto-kills after `inactivitySec` and retries. Check logs for `Watchdog KILL`. |
 | Dispatch stuck after watchdog | Both retries failed. Check `.claw/log.jsonl`. Re-assign issue to restart. |
 | `code_run` uses wrong backend | Check `coding-tools.json` — explicit backend > per-agent > global default. |
-| Webhook events not arriving | Both webhooks must point to `/linear/webhook`. Check tunnel is running. |
+| Webhook events not arriving | Run `openclaw openclaw-linear webhooks setup` to auto-provision. Both webhooks must point to `/linear/webhook`. Check tunnel is running. |
 | OAuth token expired | Auto-refreshes. If stuck, re-run `openclaw openclaw-linear auth` and restart. |
 | Audit always fails | Run `openclaw openclaw-linear prompts validate` to check prompt syntax. |
 | Multi-repo not detected | Markers must be `<!-- repos: name1, name2 -->`. Names must match `repos` config keys. |

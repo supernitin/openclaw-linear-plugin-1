@@ -8,11 +8,12 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
 
-import { resolveLinearToken, AUTH_PROFILES_PATH, LINEAR_GRAPHQL_URL } from "../api/linear-api.js";
+import { resolveLinearToken, LinearAgentApi, AUTH_PROFILES_PATH, LINEAR_GRAPHQL_URL } from "../api/linear-api.js";
 import { readDispatchState, listActiveDispatches, listStaleDispatches, pruneCompleted, type DispatchState } from "../pipeline/dispatch-state.js";
 import { loadPrompts, clearPromptCache } from "../pipeline/pipeline.js";
 import { listWorktrees } from "./codex-worktree.js";
 import { loadCodingConfig, type CodingBackend } from "../tools/code-tool.js";
+import { getWebhookStatus, provisionWebhook, REQUIRED_RESOURCE_TYPES } from "./webhook-provision.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -651,6 +652,68 @@ export async function checkDispatchHealth(pluginConfig?: Record<string, unknown>
 }
 
 // ---------------------------------------------------------------------------
+// Section 7: Webhook Configuration
+// ---------------------------------------------------------------------------
+
+export async function checkWebhooks(pluginConfig?: Record<string, unknown>, fix = false): Promise<CheckResult[]> {
+  const checks: CheckResult[] = [];
+
+  const tokenInfo = resolveLinearToken(pluginConfig);
+  if (!tokenInfo.accessToken) {
+    checks.push(warn("Webhook check skipped (no Linear token)"));
+    return checks;
+  }
+
+  const linearApi = new LinearAgentApi(tokenInfo.accessToken, {
+    refreshToken: tokenInfo.refreshToken,
+    expiresAt: tokenInfo.expiresAt,
+  });
+
+  const webhookUrl = (pluginConfig?.webhookUrl as string)
+    ?? "https://linear.calltelemetry.com/linear/webhook";
+
+  try {
+    const status = await getWebhookStatus(linearApi, webhookUrl);
+
+    if (!status) {
+      if (fix) {
+        const result = await provisionWebhook(linearApi, webhookUrl, { allPublicTeams: true });
+        checks.push(pass(`Workspace webhook created (${result.webhookId}) (--fix)`));
+      } else {
+        checks.push(fail(
+          `No workspace webhook found for ${webhookUrl}`,
+          undefined,
+          'Run: openclaw openclaw-linear webhooks setup',
+        ));
+      }
+      return checks;
+    }
+
+    if (status.issues.length === 0) {
+      checks.push(pass(`Workspace webhook OK (${[...REQUIRED_RESOURCE_TYPES].join(", ")})`));
+    } else {
+      if (fix) {
+        const result = await provisionWebhook(linearApi, webhookUrl);
+        const changes = result.changes?.join(", ") ?? "fixed";
+        checks.push(pass(`Workspace webhook fixed: ${changes} (--fix)`));
+      } else {
+        for (const issue of status.issues) {
+          checks.push(warn(
+            `Webhook issue: ${issue}`,
+            undefined,
+            { fixable: true, fix: 'Run: openclaw openclaw-linear webhooks setup' },
+          ));
+        }
+      }
+    }
+  } catch (err) {
+    checks.push(warn(`Webhook check failed: ${err instanceof Error ? err.message : String(err)}`));
+  }
+
+  return checks;
+}
+
+// ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
 
@@ -683,6 +746,12 @@ export async function runDoctor(opts: DoctorOptions): Promise<DoctorReport> {
   sections.push({
     name: "Dispatch Health",
     checks: await checkDispatchHealth(opts.pluginConfig, opts.fix),
+  });
+
+  // 7. Webhook configuration (auto-fix if --fix)
+  sections.push({
+    name: "Webhook Configuration",
+    checks: await checkWebhooks(opts.pluginConfig, opts.fix),
   });
 
   // Fix: chmod auth-profiles.json if needed

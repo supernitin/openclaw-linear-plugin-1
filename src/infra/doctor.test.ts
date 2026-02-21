@@ -11,6 +11,9 @@ vi.mock("../api/linear-api.js", () => ({
     expiresAt: Date.now() + 24 * 3_600_000,
     source: "profile" as const,
   })),
+  LinearAgentApi: class MockLinearAgentApi {
+    constructor() {}
+  },
   AUTH_PROFILES_PATH: "/tmp/test-auth-profiles.json",
   LINEAR_GRAPHQL_URL: "https://api.linear.app/graphql",
 }));
@@ -57,6 +60,16 @@ vi.mock("../tools/code-tool.js", () => ({
   })),
 }));
 
+vi.mock("./webhook-provision.js", () => ({
+  getWebhookStatus: vi.fn(async () => null),
+  provisionWebhook: vi.fn(async () => ({
+    action: "created",
+    webhookId: "wh-test-1",
+    changes: ["created new webhook"],
+  })),
+  REQUIRED_RESOURCE_TYPES: ["Comment", "Issue"],
+}));
+
 import {
   checkAuth,
   checkAgentConfig,
@@ -64,6 +77,7 @@ import {
   checkFilesAndDirs,
   checkConnectivity,
   checkDispatchHealth,
+  checkWebhooks,
   runDoctor,
   formatReport,
   formatReportJson,
@@ -330,7 +344,7 @@ describe("checkDispatchHealth", () => {
 // ---------------------------------------------------------------------------
 
 describe("runDoctor", () => {
-  it("returns all 6 sections", async () => {
+  it("returns all 7 sections", async () => {
     vi.stubGlobal("fetch", vi.fn(async (url: string) => {
       if (url.includes("linear.app")) {
         return {
@@ -342,7 +356,7 @@ describe("runDoctor", () => {
     }));
 
     const report = await runDoctor({ fix: false, json: false });
-    expect(report.sections).toHaveLength(6);
+    expect(report.sections).toHaveLength(7);
     expect(report.sections.map((s) => s.name)).toEqual([
       "Authentication & Tokens",
       "Agent Configuration",
@@ -350,6 +364,7 @@ describe("runDoctor", () => {
       "Files & Directories",
       "Connectivity",
       "Dispatch Health",
+      "Webhook Configuration",
     ]);
     expect(report.summary.passed + report.summary.warnings + report.summary.errors).toBeGreaterThan(0);
   });

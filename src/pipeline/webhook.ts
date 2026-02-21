@@ -29,10 +29,20 @@ interface AgentProfile {
 
 const PROFILES_PATH = join(process.env.HOME ?? "/home/claw", ".openclaw", "agent-profiles.json");
 
+// ── Cached profile loader (5s TTL) ─────────────────────────────────
+let profilesCache: { data: Record<string, AgentProfile>; loadedAt: number } | null = null;
+const PROFILES_CACHE_TTL_MS = 5_000;
+
 function loadAgentProfiles(): Record<string, AgentProfile> {
+  const now = Date.now();
+  if (profilesCache && now - profilesCache.loadedAt < PROFILES_CACHE_TTL_MS) {
+    return profilesCache.data;
+  }
   try {
     const raw = readFileSync(PROFILES_PATH, "utf8");
-    return JSON.parse(raw).agents ?? {};
+    const data = JSON.parse(raw).agents ?? {};
+    profilesCache = { data, loadedAt: now };
+    return data;
   } catch {
     return {};
   }
@@ -64,17 +74,43 @@ function resolveAgentFromAlias(alias: string, profiles: Record<string, AgentProf
 // Track issues with active agent runs to prevent concurrent duplicate runs.
 const activeRuns = new Set<string>();
 
-// Dedup: track recently processed keys to avoid double-handling
+// Dedup: track recently processed keys to avoid double-handling.
+// Periodic sweep (every 10s) instead of O(n) scan on every call.
 const recentlyProcessed = new Map<string, number>();
+const DEDUP_TTL_MS = 60_000;
+const SWEEP_INTERVAL_MS = 10_000;
+let lastSweep = Date.now();
+
 function wasRecentlyProcessed(key: string): boolean {
   const now = Date.now();
-  // Clean old entries
-  for (const [k, ts] of recentlyProcessed) {
-    if (now - ts > 60_000) recentlyProcessed.delete(k);
+  if (now - lastSweep > SWEEP_INTERVAL_MS) {
+    for (const [k, ts] of recentlyProcessed) {
+      if (now - ts > DEDUP_TTL_MS) recentlyProcessed.delete(k);
+    }
+    lastSweep = now;
   }
   if (recentlyProcessed.has(key)) return true;
   recentlyProcessed.set(key, now);
   return false;
+}
+
+/** @internal — test-only; clears all in-memory dedup state. */
+export function _resetForTesting(): void {
+  activeRuns.clear();
+  recentlyProcessed.clear();
+  profilesCache = null;
+  linearApiCache = null;
+  lastSweep = Date.now();
+}
+
+/** @internal — test-only; add an issue ID to the activeRuns set. */
+export function _addActiveRunForTesting(issueId: string): void {
+  activeRuns.add(issueId);
+}
+
+/** @internal — test-only; pre-registers a key as recently processed. */
+export function _markAsProcessedForTesting(key: string): void {
+  wasRecentlyProcessed(key);
 }
 
 async function readJsonBody(req: IncomingMessage, maxBytes: number) {
@@ -101,7 +137,16 @@ async function readJsonBody(req: IncomingMessage, maxBytes: number) {
   });
 }
 
+// ── Cached LinearApi instance (30s TTL) ────────────────────────────
+let linearApiCache: { instance: LinearAgentApi; createdAt: number } | null = null;
+const LINEAR_API_CACHE_TTL_MS = 30_000;
+
 function createLinearApi(api: OpenClawPluginApi): LinearAgentApi | null {
+  const now = Date.now();
+  if (linearApiCache && now - linearApiCache.createdAt < LINEAR_API_CACHE_TTL_MS) {
+    return linearApiCache.instance;
+  }
+
   const pluginConfig = (api as any).pluginConfig as Record<string, unknown> | undefined;
   const resolved = resolveLinearToken(pluginConfig);
 
@@ -110,12 +155,54 @@ function createLinearApi(api: OpenClawPluginApi): LinearAgentApi | null {
   const clientId = (pluginConfig?.clientId as string) ?? process.env.LINEAR_CLIENT_ID;
   const clientSecret = (pluginConfig?.clientSecret as string) ?? process.env.LINEAR_CLIENT_SECRET;
 
-  return new LinearAgentApi(resolved.accessToken, {
+  const instance = new LinearAgentApi(resolved.accessToken, {
     refreshToken: resolved.refreshToken,
     expiresAt: resolved.expiresAt,
     clientId: clientId ?? undefined,
     clientSecret: clientSecret ?? undefined,
   });
+  linearApiCache = { instance, createdAt: now };
+  return instance;
+}
+
+// ── Comment wrapper that pre-registers comment ID for dedup ────────
+// When we create a comment, Linear fires Comment.create webhook back to us.
+// Register the comment ID immediately so the webhook handler skips it.
+// The `opts` parameter posts as a named OpenClaw agent identity (e.g.
+// createAsUser: "Mal" with avatar) — requires OAuth actor=app scope.
+async function createCommentWithDedup(
+  linearApi: LinearAgentApi,
+  issueId: string,
+  body: string,
+  opts?: { createAsUser?: string; displayIconUrl?: string },
+): Promise<string> {
+  const commentId = await linearApi.createComment(issueId, body, opts);
+  wasRecentlyProcessed(`comment:${commentId}`);
+  return commentId;
+}
+
+/**
+ * Post a comment as agent identity with prefix fallback.
+ * With gql() partial-success fix, the catch only fires for real failures.
+ */
+async function postAgentComment(
+  api: OpenClawPluginApi,
+  linearApi: LinearAgentApi,
+  issueId: string,
+  body: string,
+  label: string,
+  agentOpts?: { createAsUser: string; displayIconUrl: string },
+): Promise<void> {
+  if (!agentOpts) {
+    await createCommentWithDedup(linearApi, issueId, `**[${label}]** ${body}`);
+    return;
+  }
+  try {
+    await createCommentWithDedup(linearApi, issueId, body, agentOpts);
+  } catch (identityErr) {
+    api.logger.warn(`Agent identity comment failed: ${identityErr}`);
+    await createCommentWithDedup(linearApi, issueId, `**[${label}]** ${body}`);
+  }
 }
 
 function resolveAgentId(api: OpenClawPluginApi): string {
@@ -186,7 +273,17 @@ export async function handleLinearWebhook(
       return true;
     }
 
-    // Dedup: skip if we already handled this session
+    // Guard: check activeRuns FIRST (O(1), no side effects).
+    // This catches sessions created by our own handlers (Comment dispatch,
+    // Issue triage, handleDispatch) which all set activeRuns BEFORE calling
+    // createSessionOnIssue(). Checking this first prevents the race condition
+    // where the webhook arrives before wasRecentlyProcessed is registered.
+    if (activeRuns.has(issue.id)) {
+      api.logger.info(`Agent already running for ${issue?.identifier ?? issue?.id} — skipping session ${session.id}`);
+      return true;
+    }
+
+    // Secondary dedup: skip if we already handled this exact session ID
     if (wasRecentlyProcessed(`session:${session.id}`)) {
       api.logger.info(`AgentSession ${session.id} already handled — skipping`);
       return true;
@@ -202,13 +299,7 @@ export async function handleLinearWebhook(
     const previousComments = payload.previousComments ?? [];
     const guidance = payload.guidance;
 
-    api.logger.info(`AgentSession created: ${session.id} for issue ${issue?.identifier ?? issue?.id} (comments: ${previousComments.length}, guidance: ${guidance ? "yes" : "no"})`);
-
-    // Guard: skip if an agent run is already active for this issue
-    if (activeRuns.has(issue.id)) {
-      api.logger.info(`Agent already running for ${issue?.identifier ?? issue?.id} — skipping session ${session.id}`);
-      return true;
-    }
+    api.logger.info(`AgentSession created: ${session.id} for issue ${issue?.identifier ?? issue?.id} (comments: ${previousComments.length}, guidance: ${guidance ? "yes" : "no"})`)
 
     // Extract the user's latest message from previousComments
     // The last comment is the most recent user message
@@ -298,31 +389,21 @@ export async function handleLinearWebhook(
           ? result.output
           : `Something went wrong while processing this. The system will retry automatically if possible. If this keeps happening, run \`openclaw openclaw-linear doctor\` to check for issues.`;
 
-        // Post as comment
-        const avatarUrl = defaultProfile?.[1]?.avatarUrl ?? profiles[agentId]?.avatarUrl;
-        const brandingOpts = avatarUrl
-          ? { createAsUser: label, displayIconUrl: avatarUrl }
-          : undefined;
-
-        try {
-          if (brandingOpts) {
-            await linearApi.createComment(issue.id, responseBody, brandingOpts);
-          } else {
-            await linearApi.createComment(issue.id, `**[${label}]** ${responseBody}`);
-          }
-        } catch (brandErr) {
-          api.logger.warn(`Branded comment failed: ${brandErr}`);
-          await linearApi.createComment(issue.id, `**[${label}]** ${responseBody}`);
-        }
-
-        // Emit response (closes session)
-        const truncated = responseBody.length > 2000
-          ? responseBody.slice(0, 2000) + "\u2026"
-          : responseBody;
-        await linearApi.emitActivity(session.id, {
+        // Emit response via session (preferred — avoids duplicate comment).
+        // Fall back to a regular comment only if emitActivity fails.
+        const labeledResponse = `**[${label}]** ${responseBody}`;
+        const emitted = await linearApi.emitActivity(session.id, {
           type: "response",
-          body: truncated,
-        }).catch(() => {});
+          body: labeledResponse,
+        }).then(() => true).catch(() => false);
+
+        if (!emitted) {
+          const avatarUrl = defaultProfile?.[1]?.avatarUrl ?? profiles[agentId]?.avatarUrl;
+          const agentOpts = avatarUrl
+            ? { createAsUser: label, displayIconUrl: avatarUrl }
+            : undefined;
+          await postAgentComment(api, linearApi, issue.id, responseBody, label, agentOpts);
+        }
 
         api.logger.info(`Posted agent response to ${enrichedIssue?.identifier ?? issue.id} (session ${session.id})`);
       } catch (err) {
@@ -476,29 +557,20 @@ export async function handleLinearWebhook(
           ? result.output
           : `Something went wrong while processing this. The system will retry automatically if possible. If this keeps happening, run \`openclaw openclaw-linear doctor\` to check for issues.`;
 
-        const avatarUrl = defaultProfile?.[1]?.avatarUrl ?? profiles[agentId]?.avatarUrl;
-        const brandingOpts = avatarUrl
-          ? { createAsUser: label, displayIconUrl: avatarUrl }
-          : undefined;
-
-        try {
-          if (brandingOpts) {
-            await linearApi.createComment(issue.id, responseBody, brandingOpts);
-          } else {
-            await linearApi.createComment(issue.id, `**[${label}]** ${responseBody}`);
-          }
-        } catch (brandErr) {
-          api.logger.warn(`Branded comment failed: ${brandErr}`);
-          await linearApi.createComment(issue.id, `**[${label}]** ${responseBody}`);
-        }
-
-        const truncated = responseBody.length > 2000
-          ? responseBody.slice(0, 2000) + "\u2026"
-          : responseBody;
-        await linearApi.emitActivity(session.id, {
+        // Emit response via session (preferred). Fall back to comment if it fails.
+        const labeledResponse = `**[${label}]** ${responseBody}`;
+        const emitted = await linearApi.emitActivity(session.id, {
           type: "response",
-          body: truncated,
-        }).catch(() => {});
+          body: labeledResponse,
+        }).then(() => true).catch(() => false);
+
+        if (!emitted) {
+          const avatarUrl = defaultProfile?.[1]?.avatarUrl ?? profiles[agentId]?.avatarUrl;
+          const agentOpts = avatarUrl
+            ? { createAsUser: label, displayIconUrl: avatarUrl }
+            : undefined;
+          await postAgentComment(api, linearApi, issue.id, responseBody, label, agentOpts);
+        }
 
         api.logger.info(`Posted follow-up response to ${enrichedIssue?.identifier ?? issue.id} (session ${session.id})`);
       } catch (err) {
@@ -552,6 +624,14 @@ export async function handleLinearWebhook(
         return true;
       }
     } catch { /* proceed if viewerId check fails */ }
+
+    // Early guard: skip if an agent run is already active for this issue.
+    // Avoids wasted LLM intent classification (~2-5s) when result would
+    // be discarded anyway by activeRuns check in dispatchCommentToAgent().
+    if (activeRuns.has(issue.id)) {
+      api.logger.info(`Comment on ${issue.identifier ?? issue.id}: active run — skipping`);
+      return true;
+    }
 
     // Load agent profiles
     const profiles = loadAgentProfiles();
@@ -647,7 +727,7 @@ export async function handleLinearWebhook(
           void (async () => {
             try {
               await endPlanningSession(planSession.projectId, "approved", planStatePath);
-              await linearApi.createComment(
+              await createCommentWithDedup(linearApi,
                 planSession.rootIssueId,
                 `## Plan Approved\n\nPlan for **${planSession.projectName}** has been approved. Dispatching to workers.`,
               );
@@ -680,7 +760,7 @@ export async function handleLinearWebhook(
         void (async () => {
           try {
             await endPlanningSession(planSession.projectId, "abandoned", planStatePath);
-            await linearApi.createComment(
+            await createCommentWithDedup(linearApi,
               planSession.rootIssueId,
               `Planning mode ended for **${planSession.projectName}**. Session abandoned.`,
             );
@@ -740,6 +820,16 @@ export async function handleLinearWebhook(
     res.end("ok");
 
     const issue = payload.data;
+
+    // Guard: check activeRuns FIRST (synchronous, O(1)) before any async work.
+    // Linear can send duplicate Issue.update webhooks <20ms apart for the same
+    // assignment change. Without this sync guard, both pass through the async
+    // getViewerId() call before either registers with wasRecentlyProcessed().
+    if (activeRuns.has(issue?.id)) {
+      api.logger.info(`Issue.update ${issue?.identifier ?? issue?.id}: active run — skipping`);
+      return true;
+    }
+
     const updatedFrom = payload.updatedFrom ?? {};
 
     // Check both assigneeId and delegateId — Linear uses delegateId for agent delegation
@@ -777,7 +867,8 @@ export async function handleLinearWebhook(
     const trigger = isDelegatedToUs ? "delegated" : "assigned";
     api.logger.info(`Issue ${trigger} to our app user (${viewerId}), executing pipeline`);
 
-    // Dedup on assignment/delegation
+    // Secondary dedup: catch duplicate webhooks that both passed the activeRuns
+    // check before either could register (belt-and-suspenders with the sync guard).
     const dedupKey = `${trigger}:${issue.id}:${viewerId}`;
     if (wasRecentlyProcessed(dedupKey)) {
       api.logger.info(`${trigger} ${issue.id} -> ${viewerId} already processed — skipping`);
@@ -895,7 +986,7 @@ export async function handleLinearWebhook(
         if (agentSessionId) {
           await linearApi.emitActivity(agentSessionId, {
             type: "thought",
-            body: `Triaging new issue ${enrichedIssue?.identifier ?? issue.id}...`,
+            body: `${label} is triaging new issue ${enrichedIssue?.identifier ?? issue.id}...`,
           }).catch(() => {});
         }
 
@@ -1003,30 +1094,26 @@ export async function handleLinearWebhook(
           }
         }
 
-        // Post branded triage comment
-        const brandingOpts = avatarUrl
-          ? { createAsUser: label, displayIconUrl: avatarUrl }
-          : undefined;
-
-        try {
-          if (brandingOpts) {
-            await linearApi.createComment(issue.id, commentBody, brandingOpts);
-          } else {
-            await linearApi.createComment(issue.id, `**[${label}]** ${commentBody}`);
-          }
-        } catch (brandErr) {
-          api.logger.warn(`Branded comment failed, falling back to prefix: ${brandErr}`);
-          await linearApi.createComment(issue.id, `**[${label}]** ${commentBody}`);
-        }
-
+        // When a session exists, prefer emitActivity (avoids duplicate comment).
+        // Otherwise, post as a regular comment.
         if (agentSessionId) {
-          const truncated = commentBody.length > 2000
-            ? commentBody.slice(0, 2000) + "…"
-            : commentBody;
-          await linearApi.emitActivity(agentSessionId, {
+          const labeledComment = `**[${label}]** ${commentBody}`;
+          const emitted = await linearApi.emitActivity(agentSessionId, {
             type: "response",
-            body: truncated,
-          }).catch(() => {});
+            body: labeledComment,
+          }).then(() => true).catch(() => false);
+
+          if (!emitted) {
+            const agentOpts = avatarUrl
+              ? { createAsUser: label, displayIconUrl: avatarUrl }
+              : undefined;
+            await postAgentComment(api, linearApi, issue.id, commentBody, label, agentOpts);
+          }
+        } else {
+          const agentOpts = avatarUrl
+            ? { createAsUser: label, displayIconUrl: avatarUrl }
+            : undefined;
+          await postAgentComment(api, linearApi, issue.id, commentBody, label, agentOpts);
         }
 
         api.logger.info(`Triage complete for ${enrichedIssue?.identifier ?? issue.id}`);
@@ -1140,7 +1227,7 @@ async function dispatchCommentToAgent(
     if (agentSessionId) {
       await linearApi.emitActivity(agentSessionId, {
         type: "thought",
-        body: `Processing comment on ${issueRef}...`,
+        body: `${label} is processing comment on ${issueRef}...`,
       }).catch(() => {});
     }
 
@@ -1160,31 +1247,26 @@ async function dispatchCommentToAgent(
       ? result.output
       : `Something went wrong while processing this. The system will retry automatically if possible.`;
 
-    // Post branded comment
-    const brandingOpts = avatarUrl
-      ? { createAsUser: label, displayIconUrl: avatarUrl }
-      : undefined;
-
-    try {
-      if (brandingOpts) {
-        await linearApi.createComment(issue.id, responseBody, brandingOpts);
-      } else {
-        await linearApi.createComment(issue.id, `**[${label}]** ${responseBody}`);
-      }
-    } catch (brandErr) {
-      api.logger.warn(`Branded comment failed, falling back to prefix: ${brandErr}`);
-      await linearApi.createComment(issue.id, `**[${label}]** ${responseBody}`);
-    }
-
-    // Emit response (closes session)
+    // When a session exists, prefer emitActivity (avoids duplicate comment).
+    // Otherwise, post as a regular comment.
     if (agentSessionId) {
-      const truncated = responseBody.length > 2000
-        ? responseBody.slice(0, 2000) + "…"
-        : responseBody;
-      await linearApi.emitActivity(agentSessionId, {
+      const labeledResponse = `**[${label}]** ${responseBody}`;
+      const emitted = await linearApi.emitActivity(agentSessionId, {
         type: "response",
-        body: truncated,
-      }).catch(() => {});
+        body: labeledResponse,
+      }).then(() => true).catch(() => false);
+
+      if (!emitted) {
+        const agentOpts = avatarUrl
+          ? { createAsUser: label, displayIconUrl: avatarUrl }
+          : undefined;
+        await postAgentComment(api, linearApi, issue.id, responseBody, label, agentOpts);
+      }
+    } else {
+      const agentOpts = avatarUrl
+        ? { createAsUser: label, displayIconUrl: avatarUrl }
+        : undefined;
+      await postAgentComment(api, linearApi, issue.id, responseBody, label, agentOpts);
     }
 
     api.logger.info(`Posted ${agentId} response to ${issueRef}`);
@@ -1230,7 +1312,7 @@ async function handleDispatch(
       const planState = await readPlanningState(planStatePath);
       if (isInPlanningMode(planState, planProjectId)) {
         api.logger.info(`dispatch: ${identifier} is in planning-mode project — skipping`);
-        await linearApi.createComment(
+        await createCommentWithDedup(linearApi,
           issue.id,
           `**Can't dispatch yet** — this project is in planning mode.\n\n**To continue:** Comment on the planning issue with your requirements, then say **"finalize plan"** when ready.\n\n**To cancel planning:** Comment **"abandon"** on the planning issue.`,
         );
@@ -1253,7 +1335,7 @@ async function handleDispatch(
     if (!isStale && inMemory) {
       // Truly still running in this gateway process
       api.logger.info(`dispatch: ${identifier} actively running (status: ${existing.status}, age: ${Math.round(ageMs / 1000)}s) — skipping`);
-      await linearApi.createComment(
+      await createCommentWithDedup(linearApi,
         issue.id,
         `**Already running** as **${existing.tier}** — status: **${existing.status}**, started ${Math.round(ageMs / 60_000)}m ago.\n\nWorktree: \`${existing.worktreePath}\`\n\n**Options:**\n- Check progress: \`/dispatch status ${identifier}\`\n- Force restart: \`/dispatch retry ${identifier}\` (only works when stuck)\n- Escalate: \`/dispatch escalate ${identifier} "reason"\``,
       );
@@ -1325,7 +1407,7 @@ async function handleDispatch(
     }
   } catch (err) {
     api.logger.error(`@dispatch: worktree creation failed: ${err}`);
-    await linearApi.createComment(
+    await createCommentWithDedup(linearApi,
       issue.id,
       `**Dispatch failed** — couldn't create the worktree.\n\n> ${String(err).slice(0, 200)}\n\n**What to try:**\n- Check that the base repo exists\n- Re-assign this issue to try again\n- Check logs: \`journalctl --user -u openclaw-gateway --since "5 min ago"\``,
     );
@@ -1429,7 +1511,7 @@ async function handleDispatch(
     `- All dispatches: \`/dispatch list\``,
   ].join("\n");
 
-  await linearApi.createComment(issue.id, statusComment);
+  await createCommentWithDedup(linearApi, issue.id, statusComment);
 
   if (agentSessionId) {
     await linearApi.emitActivity(agentSessionId, {

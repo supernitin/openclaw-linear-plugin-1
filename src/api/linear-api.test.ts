@@ -232,6 +232,43 @@ describe("LinearAgentApi", () => {
       );
     });
 
+    it("returns data when GraphQL errors and data coexist (partial success)", async () => {
+      // Simulates createAsUser returning warnings alongside valid comment data.
+      // This is the root cause of Bug 2 in API-477: gql() used to throw on
+      // any errors, even when the mutation succeeded and data was present.
+      fetchMock.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({
+            data: {
+              commentCreate: { success: true, comment: { id: "c-partial" } },
+            },
+            errors: [{ message: "createAsUser: user not found, using default" }],
+          }),
+        text: () => Promise.resolve(""),
+        headers: new Headers(),
+      } as unknown as Response);
+
+      const api = new LinearAgentApi(TOKEN);
+      const id = await api.createComment("issue-1", "test body", {
+        createAsUser: "NonexistentUser",
+      });
+
+      expect(id).toBe("c-partial");
+    });
+
+    it("still throws on GraphQL errors when no data is present", async () => {
+      fetchMock.mockResolvedValueOnce(
+        gqlErrorResponse([{ message: "Totally broken" }]),
+      );
+
+      const api = new LinearAgentApi(TOKEN);
+      await expect(
+        api.createComment("issue-1", "test body"),
+      ).rejects.toThrow(/Linear GraphQL/);
+    });
+
     it("retries on 401 when refresh token is available", async () => {
       // First call (via withResilience): 401
       fetchMock.mockResolvedValueOnce(errorResponse(401, "Unauthorized"));

@@ -193,7 +193,7 @@ export class LinearAgentApi {
       }
 
       const payload = await retryRes.json();
-      if (payload.errors?.length) {
+      if (payload.errors?.length && !payload.data) {
         throw new Error(`Linear GraphQL: ${JSON.stringify(payload.errors)}`);
       }
       return payload.data as T;
@@ -205,7 +205,7 @@ export class LinearAgentApi {
     }
 
     const payload = await res.json();
-    if (payload.errors?.length) {
+    if (payload.errors?.length && !payload.data) {
       throw new Error(`Linear GraphQL: ${JSON.stringify(payload.errors)}`);
     }
 
@@ -306,7 +306,7 @@ export class LinearAgentApi {
     title: string;
     description: string | null;
     estimate: number | null;
-    state: { name: string };
+    state: { name: string; type: string };
     assignee: { name: string } | null;
     labels: { nodes: Array<{ id: string; name: string }> };
     team: { id: string; name: string; issueEstimationType: string };
@@ -323,7 +323,7 @@ export class LinearAgentApi {
           title
           description
           estimate
-          state { name }
+          state { name type }
           assignee { name }
           labels { nodes { id name } }
           team { id name issueEstimationType }
@@ -533,7 +533,7 @@ export class LinearAgentApi {
     }>(
       `query TeamStates($id: String!) {
         team(id: $id) {
-          states: workflowStates { nodes { id name type } }
+          states { nodes { id name type } }
         }
       }`,
       { id: teamId },
@@ -590,5 +590,96 @@ export class LinearAgentApi {
       { first: count },
     );
     return data.notifications.nodes as any;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Webhook management
+  // ---------------------------------------------------------------------------
+
+  async listWebhooks(): Promise<Array<{
+    id: string;
+    label: string | null;
+    url: string;
+    enabled: boolean;
+    resourceTypes: string[];
+    allPublicTeams: boolean;
+    team: { id: string; name: string } | null;
+    createdAt: string;
+  }>> {
+    const data = await this.gql<{
+      webhooks: { nodes: unknown[] };
+    }>(
+      `query Webhooks {
+        webhooks {
+          nodes {
+            id
+            label
+            url
+            enabled
+            resourceTypes
+            allPublicTeams
+            team { id name }
+            createdAt
+          }
+        }
+      }`,
+    );
+    return data.webhooks.nodes as any;
+  }
+
+  async createWebhook(input: {
+    url: string;
+    resourceTypes: string[];
+    label?: string;
+    teamId?: string;
+    allPublicTeams?: boolean;
+    enabled?: boolean;
+    secret?: string;
+  }): Promise<{ id: string; enabled: boolean }> {
+    const data = await this.gql<{
+      webhookCreate: { success: boolean; webhook: { id: string; enabled: boolean } };
+    }>(
+      `mutation WebhookCreate($input: WebhookCreateInput!) {
+        webhookCreate(input: $input) {
+          success
+          webhook { id enabled }
+        }
+      }`,
+      { input },
+    );
+    return data.webhookCreate.webhook;
+  }
+
+  async updateWebhook(webhookId: string, input: {
+    url?: string;
+    resourceTypes?: string[];
+    label?: string;
+    enabled?: boolean;
+  }): Promise<boolean> {
+    const data = await this.gql<{
+      webhookUpdate: { success: boolean };
+    }>(
+      `mutation WebhookUpdate($id: String!, $input: WebhookUpdateInput!) {
+        webhookUpdate(id: $id, input: $input) {
+          success
+        }
+      }`,
+      { id: webhookId, input },
+    );
+    return data.webhookUpdate.success;
+  }
+
+  async deleteWebhook(webhookId: string): Promise<boolean> {
+    const data = await this.gql<{
+      webhookDelete: { success: boolean };
+    }>(
+      `mutation WebhookDelete($id: String!) {
+        webhookDelete(id: $id) {
+          success
+        }
+      }`,
+      { id: webhookId },
+    );
+    return data.webhookDelete.success;
   }
 }

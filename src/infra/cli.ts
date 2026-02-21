@@ -644,6 +644,156 @@ export function registerCli(program: Command, api: OpenClawPluginApi): void {
         process.exitCode = 1;
       }
     });
+
+  // --- openclaw openclaw-linear webhooks ---
+  const webhooksCmd = linear
+    .command("webhooks")
+    .description("Manage Linear webhook subscriptions");
+
+  webhooksCmd
+    .command("status")
+    .description("Show current webhook configuration in Linear")
+    .action(async () => {
+      const pluginConfig = (api as any).pluginConfig as Record<string, unknown> | undefined;
+      const tokenInfo = resolveLinearToken(pluginConfig);
+      if (!tokenInfo.accessToken) {
+        console.error("\n  No Linear token found. Run \"openclaw openclaw-linear auth\" first.\n");
+        process.exitCode = 1;
+        return;
+      }
+
+      const linearApi = new LinearAgentApi(tokenInfo.accessToken, {
+        refreshToken: tokenInfo.refreshToken,
+        expiresAt: tokenInfo.expiresAt,
+      });
+
+      console.log("\nLinear Webhooks");
+      console.log("─".repeat(50));
+
+      const webhooks = await linearApi.listWebhooks();
+      if (webhooks.length === 0) {
+        console.log("\n  No webhooks found.");
+        console.log("  Run \"openclaw openclaw-linear webhooks setup\" to create one.\n");
+        return;
+      }
+
+      for (const wh of webhooks) {
+        const status = wh.enabled ? "enabled" : "DISABLED";
+        const label = wh.label ?? "(no label)";
+        const team = wh.team ? ` (team: ${wh.team.name})` : " (all teams)";
+        console.log(`\n  ${label}${team}`);
+        console.log(`    ID:      ${wh.id}`);
+        console.log(`    URL:     ${wh.url}`);
+        console.log(`    Status:  ${status}`);
+        console.log(`    Events:  ${wh.resourceTypes.join(", ")}`);
+        console.log(`    Created: ${wh.createdAt}`);
+      }
+
+      console.log();
+    });
+
+  webhooksCmd
+    .command("setup")
+    .description("Auto-provision or fix the workspace webhook (create/update as needed)")
+    .option("--url <url>", "Webhook URL (default: from Cloudflare tunnel config)")
+    .option("--team <id>", "Restrict to a specific team ID (default: all public teams)")
+    .option("--dry-run", "Show what would change without making changes")
+    .action(async (opts: { url?: string; team?: string; dryRun?: boolean }) => {
+      const pluginConfig = (api as any).pluginConfig as Record<string, unknown> | undefined;
+      const { provisionWebhook, getWebhookStatus, REQUIRED_RESOURCE_TYPES } = await import("./webhook-provision.js");
+
+      const tokenInfo = resolveLinearToken(pluginConfig);
+      if (!tokenInfo.accessToken) {
+        console.error("\n  No Linear token found. Run \"openclaw openclaw-linear auth\" first.\n");
+        process.exitCode = 1;
+        return;
+      }
+
+      const linearApi = new LinearAgentApi(tokenInfo.accessToken, {
+        refreshToken: tokenInfo.refreshToken,
+        expiresAt: tokenInfo.expiresAt,
+      });
+
+      const webhookUrl = opts.url
+        ?? (pluginConfig?.webhookUrl as string)
+        ?? "https://linear.calltelemetry.com/linear/webhook";
+
+      console.log("\nWebhook Provisioning");
+      console.log("─".repeat(50));
+      console.log(`  URL:    ${webhookUrl}`);
+      console.log(`  Events: ${[...REQUIRED_RESOURCE_TYPES].join(", ")}`);
+
+      if (opts.dryRun) {
+        const status = await getWebhookStatus(linearApi, webhookUrl);
+        if (!status) {
+          console.log("\n  Would CREATE a new webhook with the above config.");
+        } else if (status.issues.length === 0) {
+          console.log("\n  Webhook already configured correctly. No changes needed.");
+        } else {
+          console.log("\n  Would UPDATE existing webhook:");
+          for (const issue of status.issues) {
+            console.log(`    - Fix: ${issue}`);
+          }
+        }
+        console.log();
+        return;
+      }
+
+      const result = await provisionWebhook(linearApi, webhookUrl, {
+        teamId: opts.team,
+        allPublicTeams: !opts.team,
+      });
+
+      switch (result.action) {
+        case "created":
+          console.log(`\n  Created webhook: ${result.webhookId}`);
+          break;
+        case "updated":
+          console.log(`\n  Updated webhook: ${result.webhookId}`);
+          for (const change of result.changes ?? []) {
+            console.log(`    - ${change}`);
+          }
+          break;
+        case "already_ok":
+          console.log(`\n  Webhook already configured correctly (${result.webhookId}). No changes needed.`);
+          break;
+      }
+
+      console.log();
+    });
+
+  webhooksCmd
+    .command("delete")
+    .description("Delete a webhook by ID")
+    .argument("<webhook-id>", "ID of the webhook to delete")
+    .action(async (webhookId: string) => {
+      const pluginConfig = (api as any).pluginConfig as Record<string, unknown> | undefined;
+      const tokenInfo = resolveLinearToken(pluginConfig);
+      if (!tokenInfo.accessToken) {
+        console.error("\n  No Linear token found.\n");
+        process.exitCode = 1;
+        return;
+      }
+
+      const linearApi = new LinearAgentApi(tokenInfo.accessToken, {
+        refreshToken: tokenInfo.refreshToken,
+        expiresAt: tokenInfo.expiresAt,
+      });
+
+      const confirmAnswer = await prompt(`Delete webhook ${webhookId}? [y/N]: `);
+      if (confirmAnswer.toLowerCase() !== "y") {
+        console.log("  Aborted.\n");
+        return;
+      }
+
+      const success = await linearApi.deleteWebhook(webhookId);
+      if (success) {
+        console.log(`\n  Deleted webhook ${webhookId}\n`);
+      } else {
+        console.error(`\n  Failed to delete webhook ${webhookId}\n`);
+        process.exitCode = 1;
+      }
+    });
 }
 
 // ---------------------------------------------------------------------------
