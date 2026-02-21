@@ -325,16 +325,35 @@ export async function handleLinearWebhook(
       .join("\n\n");
 
     const issueRef = enrichedIssue?.identifier ?? issue.identifier ?? issue.id;
+    const stateType = enrichedIssue?.state?.type ?? "";
+    const isTriaged = stateType === "started" || stateType === "completed" || stateType === "canceled";
+
+    const toolAccessLines = isTriaged
+      ? [
+        `**Tool access:**`,
+        `- \`linearis\` CLI: Full access. You can read, update, close, and comment on issues. Use \`linearis issues update ${issueRef} --state <state>\` to change status, \`linearis issues update ${issueRef} --priority <1-4>\` to set priority, etc.`,
+        `- \`code_run\`: Dispatch coding work to a worker. Workers return text — they cannot access linearis.`,
+        `- \`spawn_agent\`/\`ask_agent\`: Delegate to other crew agents.`,
+        `- Standard tools: exec, read, edit, write, web_search, etc.`,
+      ]
+      : [
+        `**Tool access:**`,
+        `- \`linearis\` CLI: READ ONLY. You can read issues (\`linearis issues read ${issueRef}\`), list issues (\`linearis issues list\`), and search (\`linearis issues search "..."\`). Do NOT use linearis to update, close, comment, or modify issues.`,
+        `- \`code_run\`: Dispatch coding work to a worker. Workers return text — they cannot access linearis.`,
+        `- \`spawn_agent\`/\`ask_agent\`: Delegate to other crew agents.`,
+        `- Standard tools: exec, read, edit, write, web_search, etc.`,
+      ];
+
+    const roleLines = isTriaged
+      ? [`**Your role:** Orchestrator with full Linear access. You can update issue fields, change status, and dispatch work via \`code_run\`. Do NOT post comments yourself — the handler posts your text output.`]
+      : [`**Your role:** You are the dispatcher. For any coding or implementation work, use \`code_run\` to dispatch it. Workers return text output. You summarize results. You do NOT update issue status or post linearis comments — the audit system handles lifecycle transitions.`];
+
     const message = [
       `You are an orchestrator responding in a Linear issue session. Your text output will be posted as activities visible to the user.`,
       ``,
-      `**Tool access:**`,
-      `- \`linearis\` CLI: READ ONLY. You can read issues (\`linearis issues read ${issueRef}\`), list issues (\`linearis issues list\`), and search (\`linearis issues search "..."\`). Do NOT use linearis to update, close, comment, or modify issues.`,
-      `- \`code_run\`: Dispatch coding work to a worker. Workers return text — they cannot access linearis.`,
-      `- \`spawn_agent\`/\`ask_agent\`: Delegate to other crew agents.`,
-      `- Standard tools: exec, read, edit, write, web_search, etc.`,
+      ...toolAccessLines,
       ``,
-      `**Your role:** You are the dispatcher. For any coding or implementation work, use \`code_run\` to dispatch it. Workers return text output. You summarize results. You do NOT update issue status or post linearis comments — the audit system handles lifecycle transitions.`,
+      ...roleLines,
       ``,
       `## Issue: ${issueRef} — ${enrichedIssue?.title ?? issue.title ?? "(untitled)"}`,
       `**Status:** ${enrichedIssue?.state?.name ?? "Unknown"} | **Assignee:** ${enrichedIssue?.assignee?.name ?? "Unassigned"}`,
@@ -367,7 +386,7 @@ export async function handleLinearWebhook(
         // Emit initial thought
         await linearApi.emitActivity(session.id, {
           type: "thought",
-          body: `Processing request for ${enrichedIssue?.identifier ?? issue.id}...`,
+          body: `${label} is processing request for ${enrichedIssue?.identifier ?? issue.id}...`,
         }).catch(() => {});
 
         // Run agent with streaming to Linear
@@ -503,16 +522,35 @@ export async function handleLinearWebhook(
         .join("\n\n");
 
       const followUpIssueRef = enrichedIssue?.identifier ?? issue.identifier ?? issue.id;
+      const followUpStateType = enrichedIssue?.state?.type ?? "";
+      const followUpIsTriaged = followUpStateType === "started" || followUpStateType === "completed" || followUpStateType === "canceled";
+
+      const followUpToolAccessLines = followUpIsTriaged
+        ? [
+          `**Tool access:**`,
+          `- \`linearis\` CLI: Full access. You can read, update, close, and comment on issues. Use \`linearis issues update ${followUpIssueRef} --state <state>\` to change status, \`linearis issues update ${followUpIssueRef} --priority <1-4>\` to set priority, etc.`,
+          `- \`code_run\`: Dispatch coding work to a worker. Workers return text — they cannot access linearis.`,
+          `- \`spawn_agent\`/\`ask_agent\`: Delegate to other crew agents.`,
+          `- Standard tools: exec, read, edit, write, web_search, etc.`,
+        ]
+        : [
+          `**Tool access:**`,
+          `- \`linearis\` CLI: READ ONLY. You can read issues (\`linearis issues read ${followUpIssueRef}\`), list, and search. Do NOT use linearis to update, close, comment, or modify issues.`,
+          `- \`code_run\`: Dispatch coding work to a worker. Workers return text — they cannot access linearis.`,
+          `- \`spawn_agent\`/\`ask_agent\`: Delegate to other crew agents.`,
+          `- Standard tools: exec, read, edit, write, web_search, etc.`,
+        ];
+
+      const followUpRoleLines = followUpIsTriaged
+        ? [`**Your role:** Orchestrator with full Linear access. You can update issue fields, change status, and dispatch work via \`code_run\`. Do NOT post comments yourself — the handler posts your text output.`]
+        : [`**Your role:** Dispatcher. For work requests, use \`code_run\`. You do NOT update issue status — the audit system handles lifecycle.`];
+
       const message = [
         `You are an orchestrator responding in a Linear issue session. Your text output will be posted as activities visible to the user.`,
         ``,
-        `**Tool access:**`,
-        `- \`linearis\` CLI: READ ONLY. You can read issues (\`linearis issues read ${followUpIssueRef}\`), list, and search. Do NOT use linearis to update, close, comment, or modify issues.`,
-        `- \`code_run\`: Dispatch coding work to a worker. Workers return text — they cannot access linearis.`,
-        `- \`spawn_agent\`/\`ask_agent\`: Delegate to other crew agents.`,
-        `- Standard tools: exec, read, edit, write, web_search, etc.`,
+        ...followUpToolAccessLines,
         ``,
-        `**Your role:** Dispatcher. For work requests, use \`code_run\`. You do NOT update issue status — the audit system handles lifecycle.`,
+        ...followUpRoleLines,
         ``,
         `## Issue: ${followUpIssueRef} — ${enrichedIssue?.title ?? issue.title ?? "(untitled)"}`,
         `**Status:** ${enrichedIssue?.state?.name ?? "Unknown"} | **Assignee:** ${enrichedIssue?.assignee?.name ?? "Unassigned"}`,
@@ -536,7 +574,7 @@ export async function handleLinearWebhook(
       try {
         await linearApi.emitActivity(session.id, {
           type: "thought",
-          body: `Processing follow-up for ${enrichedIssue?.identifier ?? issue.id}...`,
+          body: `${label} is processing follow-up for ${enrichedIssue?.identifier ?? issue.id}...`,
         }).catch(() => {});
 
         const sessionId = `linear-session-${session.id}`;
@@ -1006,11 +1044,18 @@ export async function handleLinearWebhook(
           }).catch(() => {});
         }
 
+        const creatorName = enrichedIssue?.creator?.name ?? "Unknown";
+        const creatorEmail = enrichedIssue?.creator?.email ?? null;
+        const creatorLine = creatorEmail
+          ? `**Created by:** ${creatorName} (${creatorEmail})`
+          : `**Created by:** ${creatorName}`;
+
         const message = [
           `IMPORTANT: You are triaging a new Linear issue. You MUST respond with a JSON block containing your triage decisions, followed by your assessment as plain text.`,
           ``,
           `## Issue: ${enrichedIssue?.identifier ?? issue.identifier ?? issue.id} — ${enrichedIssue?.title ?? issue.title ?? "(untitled)"}`,
           `**Status:** ${enrichedIssue?.state?.name ?? "Unknown"} | **Current Estimate:** ${enrichedIssue?.estimate ?? "None"} | **Current Labels:** ${currentLabelNames}`,
+          creatorLine,
           ``,
           `**Description:**`,
           description,
@@ -1037,6 +1082,8 @@ export async function handleLinearWebhook(
           `  "assessment": "<one-line summary of your sizing rationale>"`,
           `}`,
           '```',
+          ``,
+          `IMPORTANT: Only reference real users from the issue data above. Do NOT fabricate or guess user names, emails, or identities. The issue creator is shown in the "Created by" field.`,
           ``,
           `Then write your full assessment as markdown below the JSON block.`,
         ].filter(Boolean).join("\n");
@@ -1191,23 +1238,44 @@ async function dispatchCommentToAgent(
     .join("\n");
 
   const issueRef = enrichedIssue?.identifier ?? issue.identifier ?? issue.id;
+  const stateType = enrichedIssue?.state?.type ?? "";
+  const isTriaged = stateType === "started" || stateType === "completed" || stateType === "canceled";
+
+  const toolAccessLines = isTriaged
+    ? [
+      `**Tool access:**`,
+      `- \`linearis\` CLI: Full access. You can read, update, close, and comment on issues. Use \`linearis issues update ${issueRef} --state <state>\` to change status, \`linearis issues update ${issueRef} --priority <1-4>\` to set priority, etc.`,
+      `- \`code_run\`: Dispatch coding work to a worker. Workers return text — they cannot access linearis.`,
+      `- Standard tools: exec, read, edit, write, web_search, etc.`,
+    ]
+    : [
+      `**Tool access:**`,
+      `- \`linearis\` CLI: READ ONLY. You can read issues (\`linearis issues read ${issueRef}\`), list, and search. Do NOT use linearis to update, close, comment, or modify issues.`,
+      `- \`code_run\`: Dispatch coding work to a worker. Workers return text — they cannot access linearis.`,
+      `- Standard tools: exec, read, edit, write, web_search, etc.`,
+    ];
+
+  const roleLines = isTriaged
+    ? [`**Your role:** Orchestrator with full Linear access. You can update issue fields, change status, and dispatch work via \`code_run\`. Do NOT post comments yourself — the handler posts your text output.`]
+    : [`**Your role:** Dispatcher. For work requests, use \`code_run\`. You do NOT update issue status — the audit system handles lifecycle.`];
+
   const message = [
     `You are an orchestrator responding to a Linear comment. Your text output will be automatically posted as a comment on the issue (do NOT post a comment yourself — the handler does it).`,
     ``,
-    `**Tool access:**`,
-    `- \`linearis\` CLI: READ ONLY. You can read issues (\`linearis issues read ${issueRef}\`), list, and search. Do NOT use linearis to update, close, comment, or modify issues.`,
-    `- \`code_run\`: Dispatch coding work to a worker. Workers return text — they cannot access linearis.`,
-    `- Standard tools: exec, read, edit, write, web_search, etc.`,
+    ...toolAccessLines,
     ``,
-    `**Your role:** Dispatcher. For work requests, use \`code_run\`. You do NOT update issue status — the audit system handles lifecycle.`,
+    ...roleLines,
     ``,
     `## Issue: ${issueRef} — ${enrichedIssue?.title ?? issue.title ?? "(untitled)"}`,
     `**Status:** ${enrichedIssue?.state?.name ?? "Unknown"} | **Assignee:** ${enrichedIssue?.assignee?.name ?? "Unassigned"}`,
+    enrichedIssue?.creator ? `**Created by:** ${enrichedIssue.creator.name}${enrichedIssue.creator.email ? ` (${enrichedIssue.creator.email})` : ""}` : "",
     ``,
     `**Description:**`,
     description,
     commentSummary ? `\n**Recent comments:**\n${commentSummary}` : "",
     `\n**${commentor} says:**\n> ${commentBody}`,
+    ``,
+    `IMPORTANT: Only reference real users from the issue data above. Do NOT fabricate or guess user names, emails, or identities.`,
     ``,
     `Respond concisely. For work requests, dispatch via \`code_run\` and summarize the result.`,
   ].filter(Boolean).join("\n");
@@ -1354,11 +1422,14 @@ async function handleCloseIssue(
     ``,
     `## Issue: ${issueRef} — ${enrichedIssue?.title ?? issue.title ?? "(untitled)"}`,
     `**Status:** ${enrichedIssue?.state?.name ?? "Unknown"} | **Assignee:** ${enrichedIssue?.assignee?.name ?? "Unassigned"}`,
+    enrichedIssue?.creator ? `**Created by:** ${enrichedIssue.creator.name}${enrichedIssue.creator.email ? ` (${enrichedIssue.creator.email})` : ""}` : "",
     ``,
     `**Description:**`,
     description,
     commentSummary ? `\n**Comment history:**\n${commentSummary}` : "",
     `\n**${commentor} says (closure request):**\n> ${commentBody}`,
+    ``,
+    `IMPORTANT: Only reference real users from the issue data above. Do NOT fabricate or guess user names, emails, or identities.`,
     ``,
     `Write a concise closure report with:`,
     `- **Summary**: What was done (1-2 sentences)`,
@@ -1404,9 +1475,13 @@ async function handleCloseIssue(
       readOnly: true,
     });
 
+    if (!result.success) {
+      api.logger.error(`Closure report agent failed for ${issueRef}: ${(result.output ?? "no output").slice(0, 500)}`);
+    }
+
     const closureReport = result.success
       ? result.output
-      : "Issue closed. (Closure report generation failed.)";
+      : `Issue closed by ${commentor}.\n\n> ${commentBody}\n\n*Closure report generation failed — agent returned: ${(result.output ?? "no output").slice(0, 200)}*`;
 
     const fullReport = `## Closure Report\n\n${closureReport}`;
 

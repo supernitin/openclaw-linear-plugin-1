@@ -904,9 +904,45 @@ Example output:
 
 Every warning and error includes a `→` line telling you what to do. Run `doctor --fix` to auto-repair what it can.
 
+### Code-run health check
+
+For deeper diagnostics on coding tool backends (Claude Code, Codex, Gemini CLI), run the dedicated code-run doctor. It checks binary installation, API key configuration, and actually invokes each backend to verify it can authenticate and respond:
+
+```bash
+openclaw openclaw-linear code-run doctor
+```
+
+Example output:
+
+```
+Code Run: Claude Code (Anthropic)
+  ✓ Binary: 2.1.50 (/home/claw/.npm-global/bin/claude)
+  ✓ API key: configured (ANTHROPIC_API_KEY)
+  ✓ Live test: responded in 3.2s
+
+Code Run: Codex (OpenAI)
+  ✓ Binary: 0.101.0 (/home/claw/.npm-global/bin/codex)
+  ✓ API key: configured (OPENAI_API_KEY)
+  ✓ Live test: responded in 2.8s
+
+Code Run: Gemini CLI (Google)
+  ✓ Binary: 0.28.2 (/home/claw/.npm-global/bin/gemini)
+  ✓ API key: configured (GEMINI_API_KEY)
+  ✓ Live test: responded in 4.1s
+
+Code Run: Routing
+  ✓ Default backend: codex
+  ✓ Mal → codex (default)
+  ✓ Kaylee → codex (default)
+  ✓ Inara → claude (override)
+  ✓ Callable backends: 3/3
+```
+
+This is separate from the main `doctor` because each live test spawns a real CLI subprocess (~5-10s per backend). Use `--json` for machine-readable output.
+
 ### Unit tests
 
-524 tests covering the full pipeline — triage, dispatch, audit, planning, intent classification, cross-model review, notifications, and infrastructure:
+532 tests covering the full pipeline — triage, dispatch, audit, planning, intent classification, cross-model review, notifications, and infrastructure:
 
 ```bash
 cd ~/claw-extensions/linear
@@ -1069,6 +1105,10 @@ openclaw openclaw-linear webhooks delete <id>        # Delete a webhook by ID
 openclaw openclaw-linear doctor                    # Run health checks
 openclaw openclaw-linear doctor --fix              # Auto-fix issues
 openclaw openclaw-linear doctor --json             # JSON output
+
+# Code-run backends
+openclaw openclaw-linear code-run doctor           # Deep check all backends (binary, API key, live test)
+openclaw openclaw-linear code-run doctor --json    # JSON output
 ```
 
 ---
@@ -1089,7 +1129,8 @@ journalctl --user -u openclaw-gateway -f         # Watch live logs
 |---|---|
 | Agent goes silent | Watchdog auto-kills after `inactivitySec` and retries. Check logs for `Watchdog KILL`. |
 | Dispatch stuck after watchdog | Both retries failed. Check `.claw/log.jsonl`. Re-assign issue to restart. |
-| `code_run` uses wrong backend | Check `coding-tools.json` — explicit backend > per-agent > global default. |
+| `code_run` uses wrong backend | Check `coding-tools.json` — explicit backend > per-agent > global default. Run `code-run doctor` to see routing. |
+| `code_run` fails at runtime | Run `openclaw openclaw-linear code-run doctor` — checks binary, API key, and live callability for each backend. |
 | Webhook events not arriving | Run `openclaw openclaw-linear webhooks setup` to auto-provision. Both webhooks must point to `/linear/webhook`. Check tunnel is running. |
 | OAuth token expired | Auto-refreshes. If stuck, re-run `openclaw openclaw-linear auth` and restart. |
 | Audit always fails | Run `openclaw openclaw-linear prompts validate` to check prompt syntax. |

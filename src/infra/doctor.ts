@@ -6,13 +6,13 @@
 import { existsSync, readFileSync, statSync, accessSync, unlinkSync, chmodSync, constants } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 
 import { resolveLinearToken, LinearAgentApi, AUTH_PROFILES_PATH, LINEAR_GRAPHQL_URL } from "../api/linear-api.js";
 import { readDispatchState, listActiveDispatches, listStaleDispatches, pruneCompleted, type DispatchState } from "../pipeline/dispatch-state.js";
 import { loadPrompts, clearPromptCache } from "../pipeline/pipeline.js";
 import { listWorktrees } from "./codex-worktree.js";
-import { loadCodingConfig, type CodingBackend } from "../tools/code-tool.js";
+import { loadCodingConfig, resolveCodingBackend, type CodingBackend } from "../tools/code-tool.js";
 import { getWebhookStatus, provisionWebhook, REQUIRED_RESOURCE_TYPES } from "./webhook-provision.js";
 
 // ---------------------------------------------------------------------------
@@ -767,19 +767,209 @@ export async function runDoctor(opts: DoctorOptions): Promise<DoctorReport> {
     }
   }
 
-  // Build summary
-  let passed = 0, warnings = 0, errors = 0;
-  for (const section of sections) {
-    for (const check of section.checks) {
-      switch (check.severity) {
-        case "pass": passed++; break;
-        case "warn": warnings++; break;
-        case "fail": errors++; break;
-      }
+  return { sections, summary: buildSummary(sections) };
+}
+
+// ---------------------------------------------------------------------------
+// Code Run Deep Checks
+// ---------------------------------------------------------------------------
+
+interface BackendSpec {
+  id: CodingBackend;
+  label: string;
+  bin: string;
+  /** CLI args for a minimal live invocation test */
+  testArgs: string[];
+  /** Environment variable names that provide an API key */
+  envKeys: string[];
+  /** Plugin config key for API key (if any) */
+  configKey?: string;
+  /** Env vars to unset before spawning (e.g. CLAUDECODE) */
+  unsetEnv?: string[];
+}
+
+const BACKEND_SPECS: BackendSpec[] = [
+  {
+    id: "claude",
+    label: "Claude Code (Anthropic)",
+    bin: "/home/claw/.npm-global/bin/claude",
+    testArgs: ["--print", "-p", "Respond with the single word hello", "--output-format", "stream-json", "--max-turns", "1", "--dangerously-skip-permissions"],
+    envKeys: ["ANTHROPIC_API_KEY"],
+    configKey: "claudeApiKey",
+    unsetEnv: ["CLAUDECODE"],
+  },
+  {
+    id: "codex",
+    label: "Codex (OpenAI)",
+    bin: "/home/claw/.npm-global/bin/codex",
+    testArgs: ["exec", "--json", "--ephemeral", "--full-auto", "echo hello"],
+    envKeys: ["OPENAI_API_KEY"],
+  },
+  {
+    id: "gemini",
+    label: "Gemini CLI (Google)",
+    bin: "/home/claw/.npm-global/bin/gemini",
+    testArgs: ["-p", "Respond with the single word hello", "-o", "stream-json", "--yolo"],
+    envKeys: ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENAI_API_KEY"],
+  },
+];
+
+function checkBackendBinary(spec: BackendSpec): { installed: boolean; checks: CheckResult[] } {
+  const checks: CheckResult[] = [];
+
+  // Binary existence
+  try {
+    accessSync(spec.bin, constants.X_OK);
+  } catch {
+    checks.push(fail(
+      `Binary: not found at ${spec.bin}`,
+      undefined,
+      `Install ${spec.id}: npm install -g <package>`,
+    ));
+    return { installed: false, checks };
+  }
+
+  // Version check
+  try {
+    const env = { ...process.env } as Record<string, string | undefined>;
+    for (const key of spec.unsetEnv ?? []) delete env[key];
+    const raw = execFileSync(spec.bin, ["--version"], {
+      encoding: "utf8",
+      timeout: 15_000,
+      env: env as NodeJS.ProcessEnv,
+    }).trim();
+    checks.push(pass(`Binary: ${raw || "installed"} (${spec.bin})`));
+  } catch {
+    checks.push(pass(`Binary: installed (${spec.bin})`));
+  }
+
+  return { installed: true, checks };
+}
+
+function checkBackendApiKey(spec: BackendSpec, pluginConfig?: Record<string, unknown>): CheckResult {
+  // Check plugin config first
+  if (spec.configKey) {
+    const configVal = pluginConfig?.[spec.configKey];
+    if (typeof configVal === "string" && configVal) {
+      return pass(`API key: configured (${spec.configKey} in plugin config)`);
     }
   }
 
-  return { sections, summary: { passed, warnings, errors } };
+  // Check env vars
+  for (const envKey of spec.envKeys) {
+    if (process.env[envKey]) {
+      return pass(`API key: configured (${envKey})`);
+    }
+  }
+
+  return warn(
+    `API key: not found`,
+    `Checked: ${spec.envKeys.join(", ")}${spec.configKey ? `, pluginConfig.${spec.configKey}` : ""}`,
+    { fix: `Set ${spec.envKeys[0]} environment variable or configure in plugin config` },
+  );
+}
+
+function checkBackendLive(spec: BackendSpec, pluginConfig?: Record<string, unknown>): CheckResult {
+  const env = { ...process.env } as Record<string, string | undefined>;
+  for (const key of spec.unsetEnv ?? []) delete env[key];
+
+  // Pass API key from plugin config if available (Claude-specific)
+  if (spec.configKey) {
+    const configVal = pluginConfig?.[spec.configKey] as string | undefined;
+    if (configVal && spec.envKeys[0]) {
+      env[spec.envKeys[0]] = configVal;
+    }
+  }
+
+  const start = Date.now();
+  try {
+    const result = spawnSync(spec.bin, spec.testArgs, {
+      encoding: "utf8",
+      timeout: 30_000,
+      env: env as NodeJS.ProcessEnv,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    const elapsed = ((Date.now() - start) / 1000).toFixed(1);
+
+    if (result.error) {
+      const msg = result.error.message ?? String(result.error);
+      if (msg.includes("ETIMEDOUT") || msg.includes("timed out")) {
+        return warn(`Live test: timed out after 30s`);
+      }
+      return warn(`Live test: spawn error — ${msg.slice(0, 200)}`);
+    }
+
+    if (result.status === 0) {
+      return pass(`Live test: responded in ${elapsed}s`);
+    }
+
+    // Non-zero exit
+    const stderr = (result.stderr ?? "").trim().slice(0, 200);
+    const stdout = (result.stdout ?? "").trim().slice(0, 200);
+    const detail = stderr || stdout || "(no output)";
+    return warn(`Live test: exit code ${result.status} (${elapsed}s) — ${detail}`);
+  } catch (err) {
+    const elapsed = ((Date.now() - start) / 1000).toFixed(1);
+    return warn(`Live test: error (${elapsed}s) — ${err instanceof Error ? err.message.slice(0, 200) : String(err)}`);
+  }
+}
+
+/**
+ * Deep health checks for coding tool backends.
+ *
+ * Verifies binary installation, API key configuration, and live callability
+ * for each backend (Claude, Codex, Gemini). Also shows agent routing.
+ *
+ * Usage: openclaw openclaw-linear code-run doctor [--json]
+ */
+export async function checkCodeRunDeep(
+  pluginConfig?: Record<string, unknown>,
+): Promise<CheckSection[]> {
+  const sections: CheckSection[] = [];
+  const config = loadCodingConfig();
+  let callableCount = 0;
+
+  for (const spec of BACKEND_SPECS) {
+    const checks: CheckResult[] = [];
+
+    // 1. Binary check
+    const { installed, checks: binChecks } = checkBackendBinary(spec);
+    checks.push(...binChecks);
+
+    if (installed) {
+      // 2. API key check
+      checks.push(checkBackendApiKey(spec, pluginConfig));
+
+      // 3. Live invocation test
+      const liveResult = checkBackendLive(spec, pluginConfig);
+      checks.push(liveResult);
+
+      if (liveResult.severity === "pass") callableCount++;
+    }
+
+    sections.push({ name: `Code Run: ${spec.label}`, checks });
+  }
+
+  // Routing summary section
+  const routingChecks: CheckResult[] = [];
+  const defaultBackend = resolveCodingBackend(config);
+  routingChecks.push(pass(`Default backend: ${defaultBackend}`));
+
+  const profiles = loadAgentProfiles();
+  for (const [agentId, profile] of Object.entries(profiles)) {
+    const resolved = resolveCodingBackend(config, agentId);
+    const isOverride = config.agentCodingTools?.[agentId] != null;
+    const label = profile.label ?? agentId;
+    routingChecks.push(pass(
+      `${label} → ${resolved}${isOverride ? " (override)" : " (default)"}`,
+    ));
+  }
+
+  routingChecks.push(pass(`Callable backends: ${callableCount}/${BACKEND_SPECS.length}`));
+  sections.push({ name: "Code Run: Routing", checks: routingChecks });
+
+  return sections;
 }
 
 // ---------------------------------------------------------------------------
@@ -830,4 +1020,19 @@ export function formatReport(report: DoctorReport): string {
 
 export function formatReportJson(report: DoctorReport): string {
   return JSON.stringify(report, null, 2);
+}
+
+/** Build a summary by counting pass/warn/fail across sections. */
+export function buildSummary(sections: CheckSection[]): { passed: number; warnings: number; errors: number } {
+  let passed = 0, warnings = 0, errors = 0;
+  for (const section of sections) {
+    for (const check of section.checks) {
+      switch (check.severity) {
+        case "pass": passed++; break;
+        case "warn": warnings++; break;
+        case "fail": errors++; break;
+      }
+    }
+  }
+  return { passed, warnings, errors };
 }

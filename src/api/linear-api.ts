@@ -307,6 +307,7 @@ export class LinearAgentApi {
     description: string | null;
     estimate: number | null;
     state: { name: string; type: string };
+    creator: { name: string; email: string | null } | null;
     assignee: { name: string } | null;
     labels: { nodes: Array<{ id: string; name: string }> };
     team: { id: string; name: string; issueEstimationType: string };
@@ -324,6 +325,7 @@ export class LinearAgentApi {
           description
           estimate
           state { name type }
+          creator { name email }
           assignee { name }
           labels { nodes { id name } }
           team { id name issueEstimationType }

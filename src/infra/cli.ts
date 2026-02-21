@@ -645,6 +645,33 @@ export function registerCli(program: Command, api: OpenClawPluginApi): void {
       }
     });
 
+  // --- openclaw openclaw-linear code-run ---
+  const codeRunCmd = linear
+    .command("code-run")
+    .description("Manage and diagnose coding tool backends");
+
+  codeRunCmd
+    .command("doctor")
+    .description("Deep health check: verify each coding backend (Claude, Codex, Gemini) is callable")
+    .option("--json", "Output results as JSON")
+    .action(async (opts: { json?: boolean }) => {
+      const { checkCodeRunDeep, buildSummary, formatReport, formatReportJson } = await import("./doctor.js");
+      const pluginConfig = (api as any).pluginConfig as Record<string, unknown> | undefined;
+
+      const sections = await checkCodeRunDeep(pluginConfig);
+      const report = { sections, summary: buildSummary(sections) };
+
+      if (opts.json) {
+        console.log(formatReportJson(report));
+      } else {
+        console.log(formatReport(report));
+      }
+
+      if (report.summary.errors > 0) {
+        process.exitCode = 1;
+      }
+    });
+
   // --- openclaw openclaw-linear webhooks ---
   const webhooksCmd = linear
     .command("webhooks")

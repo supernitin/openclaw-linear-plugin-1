@@ -50,14 +50,18 @@ vi.mock("./codex-worktree.js", () => ({
 
 vi.mock("../tools/code-tool.js", () => ({
   loadCodingConfig: vi.fn(() => ({
-    codingTool: "claude",
-    agentCodingTools: {},
+    codingTool: "codex",
+    agentCodingTools: { inara: "claude" },
     backends: {
       claude: { aliases: ["claude", "anthropic"] },
       codex: { aliases: ["codex", "openai"] },
       gemini: { aliases: ["gemini", "google"] },
     },
   })),
+  resolveCodingBackend: vi.fn((config: any, agentId?: string) => {
+    if (agentId && config?.agentCodingTools?.[agentId]) return config.agentCodingTools[agentId];
+    return config?.codingTool ?? "codex";
+  }),
 }));
 
 vi.mock("./webhook-provision.js", () => ({
@@ -78,6 +82,8 @@ import {
   checkConnectivity,
   checkDispatchHealth,
   checkWebhooks,
+  checkCodeRunDeep,
+  buildSummary,
   runDoctor,
   formatReport,
   formatReportJson,
@@ -199,7 +205,7 @@ describe("checkCodingTools", () => {
     const checks = checkCodingTools();
     const configCheck = checks.find((c) => c.label.includes("coding-tools.json"));
     expect(configCheck?.severity).toBe("pass");
-    expect(configCheck?.label).toContain("claude");
+    expect(configCheck?.label).toContain("codex");
   });
 
   it("reports warn for missing CLIs", () => {
@@ -429,5 +435,126 @@ describe("formatReportJson", () => {
     const parsed = JSON.parse(json);
     expect(parsed.sections).toHaveLength(1);
     expect(parsed.summary.passed).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildSummary
+// ---------------------------------------------------------------------------
+
+describe("buildSummary", () => {
+  it("counts pass/warn/fail across sections", () => {
+    const sections = [
+      { name: "A", checks: [{ label: "ok", severity: "pass" as const }, { label: "meh", severity: "warn" as const }] },
+      { name: "B", checks: [{ label: "bad", severity: "fail" as const }] },
+    ];
+    const summary = buildSummary(sections);
+    expect(summary).toEqual({ passed: 1, warnings: 1, errors: 1 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// checkCodeRunDeep
+// ---------------------------------------------------------------------------
+
+describe("checkCodeRunDeep", () => {
+  // Run a single invocation and share results across assertions to avoid
+  // repeated 30s live CLI calls (the live test spawns all 3 backends).
+  let sections: Awaited<ReturnType<typeof checkCodeRunDeep>>;
+
+  beforeEach(async () => {
+    if (!sections) {
+      sections = await checkCodeRunDeep();
+    }
+  }, 120_000);
+
+  it("returns 4 sections (3 backends + routing)", () => {
+    expect(sections).toHaveLength(4);
+    expect(sections.map((s) => s.name)).toEqual([
+      "Code Run: Claude Code (Anthropic)",
+      "Code Run: Codex (OpenAI)",
+      "Code Run: Gemini CLI (Google)",
+      "Code Run: Routing",
+    ]);
+  });
+
+  it("each backend section has binary, API key, and live test checks", () => {
+    for (const section of sections.slice(0, 3)) {
+      const labels = section.checks.map((c) => c.label);
+      expect(labels.some((l) => l.includes("Binary:"))).toBe(true);
+      expect(labels.some((l) => l.includes("API key:"))).toBe(true);
+      expect(labels.some((l) => l.includes("Live test:"))).toBe(true);
+    }
+  });
+
+  it("all check results have valid severity", () => {
+    for (const section of sections) {
+      for (const check of section.checks) {
+        expect(check).toHaveProperty("label");
+        expect(check).toHaveProperty("severity");
+        expect(["pass", "warn", "fail"]).toContain(check.severity);
+      }
+    }
+  });
+
+  it("shows routing with default backend and callable count", () => {
+    const routing = sections.find((s) => s.name === "Code Run: Routing")!;
+    expect(routing).toBeDefined();
+
+    const defaultCheck = routing.checks.find((c) => c.label.includes("Default backend:"));
+    expect(defaultCheck?.severity).toBe("pass");
+    expect(defaultCheck?.label).toContain("codex");
+
+    const callableCheck = routing.checks.find((c) => c.label.includes("Callable backends:"));
+    expect(callableCheck?.severity).toBe("pass");
+    expect(callableCheck?.label).toMatch(/Callable backends: \d+\/3/);
+  });
+
+  it("shows agent override routing for inara", () => {
+    const routing = sections.find((s) => s.name === "Code Run: Routing")!;
+    const inaraCheck = routing.checks.find((c) => c.label.toLowerCase().includes("inara"));
+    if (inaraCheck) {
+      expect(inaraCheck.label).toContain("claude");
+      expect(inaraCheck.label).toContain("override");
+    }
+  });
+
+  // API key tests — these are fast (no live invocation), use separate calls
+  it("detects API key from plugin config", async () => {
+    const origKey = process.env.ANTHROPIC_API_KEY;
+    delete process.env.ANTHROPIC_API_KEY;
+
+    try {
+      const result = await checkCodeRunDeep({ claudeApiKey: "sk-from-config" });
+      const claudeKey = result[0].checks.find((c) => c.label.includes("API key:"));
+      expect(claudeKey?.severity).toBe("pass");
+      expect(claudeKey?.label).toContain("claudeApiKey");
+    } finally {
+      if (origKey) process.env.ANTHROPIC_API_KEY = origKey;
+      else delete process.env.ANTHROPIC_API_KEY;
+    }
+  });
+
+  it("warns when API key missing", async () => {
+    const origKeys = {
+      GEMINI_API_KEY: process.env.GEMINI_API_KEY,
+      GOOGLE_API_KEY: process.env.GOOGLE_API_KEY,
+      GOOGLE_GENAI_API_KEY: process.env.GOOGLE_GENAI_API_KEY,
+    };
+    delete process.env.GEMINI_API_KEY;
+    delete process.env.GOOGLE_API_KEY;
+    delete process.env.GOOGLE_GENAI_API_KEY;
+
+    try {
+      const result = await checkCodeRunDeep();
+      const geminiKey = result[2].checks.find((c) => c.label.includes("API key:"));
+      expect(geminiKey?.severity).toBe("warn");
+      expect(geminiKey?.label).toContain("not found");
+    } finally {
+      for (const [k, v] of Object.entries(origKeys)) {
+        if (v) process.env[k] = v;
+        else delete process.env[k];
+      }
+    }
   });
 });
