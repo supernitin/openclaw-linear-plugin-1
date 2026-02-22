@@ -1487,7 +1487,14 @@ async function dispatchCommentToAgent(
     ``,
     `IMPORTANT: Only reference real users from the issue data above. Do NOT fabricate or guess user names, emails, or identities.`,
     ``,
-    `Respond concisely. For work requests, dispatch via \`code_run\` and summarize the result.`,
+    `## Scope Rules`,
+    `1. **Read the issue first.** The issue title + description define your scope. Everything you do must serve the issue as written.`,
+    `2. **\`code_run\` is ONLY for issue-body work.** Only dispatch \`code_run\` when the issue description contains implementation requirements. A greeting, question, or conversational issue gets a conversational response — NOT code_run.`,
+    `3. **Comments explore, issue body builds.** The comment above may explore scope or ask questions but NEVER trigger \`code_run\` from a comment alone. If the comment requests new implementation, suggest updating the issue description or creating a new issue.`,
+    `4. **Plan before building.** For non-trivial work, respond with a plan first. Only dispatch \`code_run\` after the plan is clear and grounded in the issue body.`,
+    `5. **Match response to request.** Greeting → greet. Question → answer. No implementation requirements in the issue body → no code_run.`,
+    ``,
+    `Respond within the scope defined above. Be concise and action-oriented.`,
     commentGuidanceAppendix,
   ].filter(Boolean).join("\n");
 
