@@ -38,9 +38,12 @@ function resolveAgentDirs(agentId: string, config: Record<string, any>): AgentDi
 let _extensionAPI: any | null = null;
 async function getExtensionAPI() {
   if (!_extensionAPI) {
-    // Resolve the openclaw package location dynamically, then import extensionAPI
+    // Resolve the openclaw package location dynamically, then import extensionAPI.
+    // openclaw's package.json exports don't expose ./package.json, so resolve
+    // via the main entry point and walk up to the package root.
     const _require = createRequire(import.meta.url);
-    const openclawDir = dirname(_require.resolve("openclaw/package.json"));
+    const mainEntry = _require.resolve("openclaw");
+    const openclawDir = dirname(dirname(mainEntry));
     _extensionAPI = await import(join(openclawDir, "dist", "extensionAPI.js"));
   }
   return _extensionAPI;
@@ -415,17 +418,47 @@ async function runSubprocess(
   const raw = result.stdout || "";
   api.logger.info(`Agent ${agentId} completed for session ${sessionId}`);
 
-  // Extract clean text from --json output
-  try {
-    const parsed = JSON.parse(raw);
-    const payloads = parsed?.result?.payloads;
-    if (Array.isArray(payloads) && payloads.length > 0) {
-      const text = payloads.map((p: any) => p.text).filter(Boolean).join("\n\n");
-      if (text) return { success: true, output: text };
-    }
-  } catch {
-    // Not JSON — use raw output as-is
-  }
+  // Extract clean text from --json output.
+  // The subprocess stdout may contain plugin init log lines before the JSON blob.
+  // Strip everything before the first `{` to isolate the JSON envelope.
+  const extracted = extractJsonFromOutput(raw);
+  if (extracted) return { success: true, output: extracted };
 
   return { success: true, output: raw };
+}
+
+/**
+ * Extract text from subprocess --json output. Handles:
+ * - Log noise before the JSON blob (plugin init lines)
+ * - Both envelope shapes: `{ payloads }` (flat) and `{ result: { payloads } }` (nested)
+ */
+function extractJsonFromOutput(raw: string): string | null {
+  // The subprocess stdout may contain plugin init log lines before the JSON
+  // result blob. Try parsing the whole thing first; if that fails, scan lines
+  // backwards for a `{` that starts a valid JSON envelope with payloads.
+  const candidates: string[] = [raw];
+
+  // Also try from each line that starts with `{` (the JSON blob typically
+  // starts on its own line after log noise).
+  const lines = raw.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].trimStart().startsWith("{")) {
+      candidates.push(lines.slice(i).join("\n"));
+    }
+  }
+
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      // Try both envelope shapes: flat `{ payloads }` and nested `{ result: { payloads } }`
+      const payloads = parsed?.payloads ?? parsed?.result?.payloads;
+      if (Array.isArray(payloads) && payloads.length > 0) {
+        const text = payloads.map((p: any) => p.text).filter(Boolean).join("\n\n");
+        if (text) return text;
+      }
+    } catch {
+      // Not valid JSON at this position — try next candidate
+    }
+  }
+  return null;
 }

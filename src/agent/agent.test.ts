@@ -204,6 +204,52 @@ describe("runAgent subprocess", () => {
   });
 });
 
+  it("extracts text from flat envelope (payloads at top level)", async () => {
+    const api = createApi();
+    (api.runtime.system as any).runCommandWithTimeout = vi.fn().mockResolvedValue({
+      code: 0,
+      stdout: JSON.stringify({ payloads: [{ text: "flat response" }], meta: {} }),
+      stderr: "",
+    });
+
+    const result = await runAgent({
+      api,
+      agentId: "test",
+      sessionId: "s1",
+      message: "test",
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.output).toBe("flat response");
+  });
+
+  it("strips plugin init log noise before JSON blob", async () => {
+    const api = createApi();
+    const noisyOutput = [
+      "[plugins] Dispatch gateway methods registered",
+      "[plugins] Linear agent extension registered (agent: zoe)",
+      '[plugins] code_run: default backend=codex, aliases={"claude":"claude"}',
+      JSON.stringify({ payloads: [{ text: "clean response" }], meta: {} }),
+    ].join("\n");
+    (api.runtime.system as any).runCommandWithTimeout = vi.fn().mockResolvedValue({
+      code: 0,
+      stdout: noisyOutput,
+      stderr: "",
+    });
+
+    const result = await runAgent({
+      api,
+      agentId: "test",
+      sessionId: "s1",
+      message: "test",
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.output).toBe("clean response");
+    expect(result.output).not.toContain("[plugins]");
+    expect(result.output).not.toContain("payloads");
+  });
+
 describe("runAgent date/time injection", () => {
   it("injects current date/time into the message sent to subprocess", async () => {
     const api = createApi();
