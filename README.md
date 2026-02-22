@@ -23,6 +23,7 @@ Connect Linear to AI agents. Issues get triaged, implemented, and audited — au
 - [x] Linear OAuth app webhook (AgentSessionEvent created/prompted)
 - [x] Linear API integration (issues, comments, labels, state transitions)
 - [x] Agent routing (`@mentions`, natural language intent classifier)
+- [x] Intent gate + scope enforcement (all 4 webhook paths, 3-layer defense)
 - [x] Auto-triage (story points, labels, priority — read-only)
 - [x] Complexity-tier dispatch (small → Haiku, medium → Sonnet, high → Opus)
 - [x] Isolated git worktrees per dispatch
@@ -107,7 +108,8 @@ The end result: you work in Linear. You create issues, assign them, comment in p
 ### Multi-Agent & Routing
 
 - **Named agents** — Define agents with different roles and expertise. Route work by `@mention` or natural language ("hey kaylee look at this").
-- **Intent classification** — An LLM classifier (~300 tokens, ~2s) understands what you want from any comment. Regex fallback if the classifier fails.
+- **Intent classification** — An LLM classifier (~300 tokens, ~2s) runs on every user request across all webhook paths — not just comments. Classifies intent and gates work requests on untriaged issues. Regex fallback if the classifier fails.
+- **Scope enforcement** — Three-layer defense prevents agents from building code on issues that haven't been planned. Intent gate blocks `request_work` pre-dispatch; prompt-level constraints limit `code_run` to planning-only; a `before_tool_call` hook prepends hard constraints to worker prompts.
 - **One-time detour** — `@mention` a different agent in a session and it handles that single interaction. The session stays with the original agent.
 
 ### Multi-Backend & Multi-Repo
@@ -698,24 +700,53 @@ flowchart LR
 | "hey kaylee can you look at this?" | Routes to Kaylee (no `@` needed) |
 | "@mal close this issue" | Routes to Mal (one-time detour) and closes the issue |
 | "what can I do here?" | Default agent responds (not silently dropped) |
-| "fix the search bug" | Default agent dispatches work |
+| "fix the search bug" | Default agent dispatches work (if issue is In Progress) |
+| "build me a stock trading app" (on Backlog issue) | Blocked — agent explains the issue needs scoping first |
 | "close this" / "mark as done" / "this is resolved" | Generates closure report, transitions issue to completed |
 
-`@mentions` still work as a fast path — if you write `@kaylee`, the classifier is skipped entirely for speed.
+Intent classification runs on **all webhook paths** — not just `Comment.create`. `AgentSessionEvent.created`, `AgentSessionEvent.prompted`, and `@mention` fast paths all classify intent and enforce scope.
 
 > **Tip:** Configure `classifierAgentId` to point to a small/fast model agent (like Haiku) for low-latency, low-cost intent classification. The classifier only needs ~300 tokens per call.
+
+### Scope Enforcement — Work Request Gate
+
+When a user's intent is classified as `request_work`, the plugin checks the issue's workflow state before dispatching. Issues that haven't reached **In Progress** get a polite rejection instead of an agent run:
+
+```
+This issue (ENG-123) is in Backlog — it needs planning and scoping before implementation.
+
+To move forward:
+1. Update the issue description with requirements and acceptance criteria
+2. Move the issue to In Progress
+3. Then ask me to implement it
+
+I can help you scope and plan — just ask questions or discuss the approach.
+```
+
+This prevents the most common failure mode: an agent receiving a casual comment like "build X" on an unscoped issue and immediately spinning up `code_run` to build something that was never planned.
+
+**What's allowed on untriaged issues:**
+- Questions, discussion, scope refinement
+- Planning (`plan_start`, `plan_continue`, `plan_finalize`)
+- Agent routing (`@mention` or natural language)
+- Issue closure
+- `code_run` in **planning mode only** — workers can explore code and write plan files but cannot create, modify, or delete source code
+
+**What's blocked on untriaged issues:**
+- `request_work` intent — the gate returns a rejection message before any agent runs
+- Full `code_run` implementation — even if the orchestrator LLM ignores prompt rules, a `before_tool_call` hook prepends hard planning-only constraints to the worker's prompt
 
 ### Agent Routing
 
 The plugin supports a multi-agent team where one agent is the default (`isDefault: true` in agent profiles) and others are routed to on demand. Routing works across all webhook paths:
 
-| Webhook Path | How agent is selected |
-|---|---|
-| `Comment.create` | `@mention` in comment text → specific agent. No mention → intent classifier may detect agent name ("hey kaylee") → `ask_agent` intent. Otherwise → default agent. |
-| `AgentSessionEvent.created` | Scans user's message for `@mention` aliases → routes to mentioned agent for that interaction. No mention → default agent. |
-| `AgentSessionEvent.prompted` | Same as `created` — scans follow-up message for `@mention` → one-time detour to mentioned agent. No mention → default agent. |
-| `Issue.update` (assignment) | Always dispatches to default agent. |
-| `Issue.create` (triage) | Always dispatches to default agent. |
+| Webhook Path | How agent is selected | Scope gate |
+|---|---|---|
+| `Comment.create` | `@mention` → specific agent (with intent gate). No mention → intent classifier may detect agent name ("hey kaylee") → `ask_agent` intent. Otherwise → default agent. | `request_work` blocked on untriaged |
+| `AgentSessionEvent.created` | Scans user's message for `@mention` aliases → routes to mentioned agent. No mention → default agent. | `request_work` blocked on untriaged |
+| `AgentSessionEvent.prompted` | Same as `created` — scans follow-up message for `@mention` → one-time detour. No mention → default agent. | `request_work` blocked on untriaged |
+| `Issue.update` (assignment) | Always dispatches to default agent. | Full dispatch pipeline |
+| `Issue.create` (triage) | Always dispatches to default agent. | Read-only triage |
 
 **One-time detour:** When you `@mention` an agent in a session that belongs to a different default agent, the mentioned agent handles that single interaction. The session itself stays owned by whoever created it — subsequent messages without `@mentions` go back to the default. This lets you ask a specific agent for help without permanently switching context.
 
@@ -1302,7 +1333,7 @@ Tool access varies by context. Orchestrators get the full toolset; workers and a
 | Context | `linear_issues` | `code_run` | `spawn_agent` / `ask_agent` | Filesystem |
 |---|---|---|---|---|
 | Orchestrator (triaged issue) | Full (read, create, update, comment) | Yes | Yes | Read + write |
-| Orchestrator (untriaged issue) | Read only | Yes | Yes | Read + write |
+| Orchestrator (untriaged issue) | Read only | Planning only | Yes | Read + write |
 | Worker | None | None | None | Read + write |
 | Auditor | Prompt-constrained (has tool, instructed to verify only) | None | None | Read only (by prompt) |
 | Sub-agent (spawn/ask) | None | None | Yes (can chain) | Inherited from parent |
@@ -1372,9 +1403,9 @@ The handler dispatches by `type + action`:
 ```mermaid
 flowchart TD
     A["POST /linear/webhook"] --> B{"Event Type"}
-    B --> C["AgentSessionEvent.created<br/>→ dedup → scan @mentions → run agent"]
-    B --> D["AgentSessionEvent.prompted<br/>→ dedup → scan @mentions → resume agent"]
-    B --> E["Comment.create<br/>→ filter self → dedup → intent classify → route"]
+    B --> C["AgentSessionEvent.created<br/>→ dedup → scan @mentions → intent classify → scope gate → run agent"]
+    B --> D["AgentSessionEvent.prompted<br/>→ dedup → scan @mentions → intent classify → scope gate → resume agent"]
+    B --> E["Comment.create<br/>→ filter self → dedup → intent classify → scope gate → route"]
     B --> F["Issue.update<br/>→ check assignment → dispatch"]
     B --> G["Issue.create<br/>→ triage (estimate, labels, priority)"]
     B --> H["AppUserNotification<br/>→ discarded (duplicates workspace events)"]
@@ -1382,26 +1413,39 @@ flowchart TD
 
 ### Intent Classification
 
-When a `Comment.create` event arrives, the plugin classifies the user's intent using a two-tier system:
+Every user request — across all 4 webhook dispatch paths — is classified through a two-tier intent system before the agent runs:
 
-1. **LLM classifier** (~300 tokens, ~2-5s) — a small/fast model parses the comment and returns structured JSON with intent + reasoning
+1. **LLM classifier** (~300 tokens, ~2-5s) — a small/fast model parses the message and returns structured JSON with intent + reasoning
 2. **Regex fallback** — if the LLM call fails or times out, static patterns catch common cases
 
-| Intent | Trigger | Handler |
-|---|---|---|
-| `plan_start` | "let's plan the features" | Start planner interview session |
-| `plan_finalize` | "looks good, ship it" | Run plan audit + cross-model review |
-| `plan_abandon` | "cancel planning" | End planning session |
-| `plan_continue` | Any message during active planning | Continue planner conversation |
-| `ask_agent` | "@kaylee" or "hey kaylee" | Route to specific agent by name |
-| `request_work` | "fix the search bug" | Dispatch to default agent |
-| `question` | "what's the status?" | Agent answers without code changes |
-| `close_issue` | "close this" / "mark as done" | Generate closure report + transition state |
-| `general` | Noise, automated messages | Silently dropped |
+**Where it runs:**
+
+| Webhook Path | Classification Point |
+|---|---|
+| `Comment.create` (no @mention) | Before routing by intent |
+| `Comment.create` (@mention fast path) | After resolving agent, before dispatch |
+| `AgentSessionEvent.created` | After enriching issue, before building prompt |
+| `AgentSessionEvent.prompted` | After enriching issue, before building follow-up prompt |
+
+**Intents:**
+
+| Intent | Trigger | Handler | Blocked on untriaged? |
+|---|---|---|---|
+| `plan_start` | "let's plan the features" | Start planner interview session | No |
+| `plan_finalize` | "looks good, ship it" | Run plan audit + cross-model review | No |
+| `plan_abandon` | "cancel planning" | End planning session | No |
+| `plan_continue` | Any message during active planning | Continue planner conversation | No |
+| `ask_agent` | "@kaylee" or "hey kaylee" | Route to specific agent by name | No |
+| `request_work` | "fix the search bug" | Dispatch to default agent | **Yes** |
+| `question` | "what's the status?" | Agent answers without code changes | No |
+| `close_issue` | "close this" / "mark as done" | Generate closure report + transition state | No |
+| `general` | Noise, automated messages | Silently dropped | No |
+
+The `request_work` intent is the only one gated by issue state. When the issue is not in **In Progress** (i.e., `stateType !== "started"`), the gate returns a rejection message explaining what the user needs to do. All other intents are allowed regardless of issue state — you can always plan, ask questions, discuss scope, and close issues.
 
 ### Hook Lifecycle
 
-The plugin registers three lifecycle hooks via `api.on()` in `index.ts`:
+The plugin registers four lifecycle hooks via `api.on()` in `index.ts`:
 
 **`agent_end`** — Dispatch pipeline state machine. When a sub-agent (worker or auditor) finishes:
 - Looks up the session key in dispatch state to find the active dispatch
@@ -1412,6 +1456,13 @@ The plugin registers three lifecycle hooks via `api.on()` in `index.ts`:
 **`before_agent_start`** — Context injection. For `linear-worker-*` and `linear-audit-*` sessions:
 - Reads dispatch state and finds up to 3 active dispatches
 - Prepends a `<dispatch-history>` block so the agent has situational awareness of concurrent work
+
+**`before_tool_call`** — Planning-only enforcement for `code_run`. When the active issue is not in "started" state:
+- Fetches the issue's current workflow state from the Linear API
+- If the issue is in Triage, Todo, Backlog, or any non-started state, prepends hard constraints to the worker's prompt:
+  - Workers may read/explore files and write plan files (PLAN.md, design docs)
+  - Workers must NOT create/modify/delete source code, run deployments, or make system changes
+- This is the deepest layer of scope enforcement — even if the orchestrator LLM ignores prompt-level scope rules and calls `code_run` anyway, the worker receives constraints that prevent implementation
 
 **`message_sending`** — Narration guard. Catches short (~250 char) "Let me explore..." responses where the agent narrates intent without actually calling tools:
 - Appends a warning: "Agent acknowledged but may not have completed the task"
