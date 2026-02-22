@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { LinearAgentApi, resolveLinearToken } from "../api/linear-api.js";
-import { spawnWorker, type HookContext } from "./pipeline.js";
+import { spawnWorker, buildProjectContext, type HookContext } from "./pipeline.js";
 import { setActiveSession, clearActiveSession, getIssueAffinity, _configureAffinityTtl, _resetAffinityForTesting } from "./active-session.js";
 import { readDispatchState, getActiveDispatch, registerDispatch, updateDispatchStatus, completeDispatch, removeActiveDispatch } from "./dispatch-state.js";
 import { createNotifierFromConfig, type NotifyFn } from "../infra/notify.js";
@@ -477,7 +477,14 @@ export async function handleLinearWebhook(
       commentContext ? `\n**Conversation:**\n${commentContext}` : "",
       userMessage ? `\n**Latest message:**\n> ${userMessage}` : "",
       ``,
-      `Respond to the user's request. For work requests, dispatch via \`code_run\` and summarize the result. Be concise and action-oriented.`,
+      `## Scope Rules`,
+      `1. **Read the issue first.** The issue title + description define your scope. Everything you do must serve the issue as written.`,
+      `2. **\`code_run\` is ONLY for issue-body work.** Only dispatch \`code_run\` when the issue description contains implementation requirements. A greeting, question, or conversational issue gets a conversational response — NOT code_run.`,
+      `3. **Comments explore, issue body builds.** User comments may explore scope or ask questions but NEVER trigger \`code_run\` alone. If a comment requests new implementation, update the issue description first, then build from the issue text.`,
+      `4. **Plan before building.** For non-trivial work, respond with a plan first. Only dispatch \`code_run\` after the plan is clear and grounded in the issue body.`,
+      `5. **Match response to request.** Greeting → greet. Question → answer. No implementation requirements → no code_run.`,
+      ``,
+      `Respond within the scope defined above. Be concise and action-oriented.`,
     ].filter(Boolean).join("\n");
 
     // Run agent directly (non-blocking)
@@ -720,7 +727,12 @@ export async function handleLinearWebhook(
         commentContext ? `\n**Recent conversation:**\n${commentContext}` : "",
         `\n**User's follow-up message:**\n> ${userMessage}`,
         ``,
-        `Respond to the user's follow-up. For work requests, dispatch via \`code_run\`. Be concise and action-oriented.`,
+        `## Scope Rules`,
+        `1. **The issue body is your scope.** Re-read the description above before acting.`,
+        `2. **Comments explore, issue body builds.** The follow-up may refine understanding or ask questions — NEVER dispatch \`code_run\` from a comment alone. If the user requests implementation, suggest updating the issue description first.`,
+        `3. **Match response to request.** Answer questions with answers. Do NOT escalate conversational messages into builds.`,
+        ``,
+        `Respond to the follow-up within the scope defined above. Be concise and action-oriented.`,
       ].filter(Boolean).join("\n");
 
       setActiveSession({
@@ -1236,6 +1248,7 @@ export async function handleLinearWebhook(
           ? formatGuidanceAppendix(triageGuidance)
           : "";
 
+        const projectCtx = buildProjectContext(pluginConfig);
         const message = [
           `IMPORTANT: You are triaging a new Linear issue. You MUST respond with a JSON block containing your triage decisions, followed by your assessment as plain text.`,
           ``,
@@ -1246,6 +1259,7 @@ export async function handleLinearWebhook(
           `**Description:**`,
           description,
           ``,
+          ...(projectCtx ? [projectCtx, ``] : []),
           `## Your Triage Tasks`,
           ``,
           `1. **Story Points** — Estimate complexity using ${estimationType} scale (1=trivial, 2=small, 3=medium, 5=large, 8=very large, 13=epic)`,

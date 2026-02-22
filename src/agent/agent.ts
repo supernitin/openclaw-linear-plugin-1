@@ -323,7 +323,7 @@ async function runEmbedded(
       }
     },
 
-    // Raw agent events — capture tool starts/ends
+    // Raw agent events — capture tool starts/ends/updates
     onAgentEvent: (evt) => {
       watchdog.tick();
       const { stream, data } = evt;
@@ -333,16 +333,30 @@ async function runEmbedded(
       const phase = String(data.phase ?? "");
       const toolName = String(data.name ?? "tool");
       const meta = typeof data.meta === "string" ? data.meta : "";
+      const input = typeof data.input === "string" ? data.input : "";
 
-      // Tool execution start — emit action with tool name + meta
+      // Tool execution start — emit action with tool name + available context
       if (phase === "start") {
         lastToolAction = toolName;
-        emit({ type: "action", action: `Running ${toolName}`, parameter: meta.slice(0, 200) || toolName });
+        const detail = input || meta || toolName;
+        emit({ type: "action", action: `Running ${toolName}`, parameter: detail.slice(0, 300) });
+      }
+
+      // Tool execution update — partial progress (keeps Linear UI alive for long tools)
+      if (phase === "update") {
+        const detail = meta || input || "in progress";
+        emit({ type: "action", action: `${toolName}`, parameter: detail.slice(0, 300) });
+      }
+
+      // Tool execution completed successfully
+      if (phase === "result" && !data.isError) {
+        const detail = meta ? meta.slice(0, 300) : "completed";
+        emit({ type: "action", action: `${toolName} done`, parameter: detail });
       }
 
       // Tool execution result with error
       if (phase === "result" && data.isError) {
-        emit({ type: "action", action: `${toolName} failed`, parameter: meta.slice(0, 200) || "error" });
+        emit({ type: "action", action: `${toolName} failed`, parameter: (meta || "error").slice(0, 300) });
       }
     },
 

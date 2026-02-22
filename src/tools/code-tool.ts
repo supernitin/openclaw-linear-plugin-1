@@ -178,6 +178,11 @@ export function createCodeTool(
       required: ["prompt"],
     },
     execute: async (toolCallId: string, params: CliToolParams & { backend?: string }, ...rest: unknown[]) => {
+      // Extract onUpdate callback for progress reporting to Linear
+      const onUpdate = typeof rest[1] === "function"
+        ? rest[1] as (update: Record<string, unknown>) => void
+        : undefined;
+
       // Resolve backend: explicit alias → per-agent config → global default
       const currentSession = getCurrentSession();
       const agentId = currentSession?.agentId;
@@ -188,6 +193,13 @@ export function createCodeTool(
       const runner = BACKEND_RUNNERS[backend];
 
       api.logger.info(`code_run: backend=${backend} agent=${agentId ?? "unknown"}`);
+
+      // Emit prompt summary so Linear users see what's being built
+      const promptSummary = (params.prompt ?? "").slice(0, 200);
+      api.logger.info(`code_run prompt: [${backend}] ${promptSummary}`);
+      if (onUpdate) {
+        try { onUpdate({ status: "running", summary: `[${backend}] ${promptSummary}` }); } catch {}
+      }
 
       const result = await runner(api, params, pluginConfig);
 
