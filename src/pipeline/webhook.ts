@@ -336,6 +336,7 @@ export async function handleLinearWebhook(
     const profiles = loadAgentProfiles();
     const mentionPattern = buildMentionPattern(profiles);
     let agentId = resolveAgentId(api);
+    let mentionOverride = false;
     if (mentionPattern && userMessage) {
       const mentionMatch = userMessage.match(mentionPattern);
       if (mentionMatch) {
@@ -344,11 +345,12 @@ export async function handleLinearWebhook(
         if (resolved) {
           api.logger.info(`AgentSession routed to ${resolved.agentId} via @${alias} mention`);
           agentId = resolved.agentId;
+          mentionOverride = true;
         }
       }
     }
     // Session affinity: if no @mention override, prefer the agent that last handled this issue
-    if (agentId === resolveAgentId(api) && issue?.id) {
+    if (!mentionOverride && issue?.id) {
       const affinityAgent = getIssueAffinity(issue.id);
       if (affinityAgent) {
         api.logger.info(`AgentSession routed to ${affinityAgent} via session affinity for ${issue.identifier ?? issue.id}`);
@@ -555,6 +557,7 @@ export async function handleLinearWebhook(
     const promptedProfiles = loadAgentProfiles();
     const promptedMentionPattern = buildMentionPattern(promptedProfiles);
     let agentId = resolveAgentId(api);
+    let mentionOverride = false;
     if (promptedMentionPattern && userMessage) {
       const mentionMatch = userMessage.match(promptedMentionPattern);
       if (mentionMatch) {
@@ -563,11 +566,12 @@ export async function handleLinearWebhook(
         if (resolved) {
           api.logger.info(`AgentSession prompted: routed to ${resolved.agentId} via @${alias} mention`);
           agentId = resolved.agentId;
+          mentionOverride = true;
         }
       }
     }
     // Session affinity: if no @mention override, prefer the agent that last handled this issue
-    if (agentId === resolveAgentId(api) && issue?.id) {
+    if (!mentionOverride && issue?.id) {
       const affinityAgent = getIssueAffinity(issue.id);
       if (affinityAgent) {
         api.logger.info(`AgentSession prompted: routed to ${affinityAgent} via session affinity for ${issue.identifier ?? issue.id}`);

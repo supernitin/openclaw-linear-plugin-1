@@ -24,6 +24,9 @@ const {
   resetGuidanceCacheMock,
   setActiveSessionMock,
   clearActiveSessionMock,
+  getIssueAffinityMock,
+  configureAffinityTtlMock,
+  resetAffinityForTestingMock,
   readDispatchStateMock,
   getActiveDispatchMock,
   registerDispatchMock,
@@ -97,6 +100,9 @@ const {
   resetGuidanceCacheMock: vi.fn(),
   setActiveSessionMock: vi.fn(),
   clearActiveSessionMock: vi.fn(),
+  getIssueAffinityMock: vi.fn().mockReturnValue(null),
+  configureAffinityTtlMock: vi.fn(),
+  resetAffinityForTestingMock: vi.fn(),
   readDispatchStateMock: vi.fn().mockResolvedValue({ activeDispatches: {} }),
   getActiveDispatchMock: vi.fn().mockReturnValue(null),
   registerDispatchMock: vi.fn().mockResolvedValue(undefined),
@@ -167,9 +173,9 @@ vi.mock("./guidance.js", () => ({
 vi.mock("./active-session.js", () => ({
   setActiveSession: setActiveSessionMock,
   clearActiveSession: clearActiveSessionMock,
-  getIssueAffinity: vi.fn().mockReturnValue(null),
-  _configureAffinityTtl: vi.fn(),
-  _resetAffinityForTesting: vi.fn(),
+  getIssueAffinity: getIssueAffinityMock,
+  _configureAffinityTtl: configureAffinityTtlMock,
+  _resetAffinityForTesting: resetAffinityForTestingMock,
 }));
 
 vi.mock("./dispatch-state.js", () => ({
@@ -358,6 +364,9 @@ afterEach(() => {
   isGuidanceEnabledMock.mockReset().mockReturnValue(false);
   setActiveSessionMock.mockReset();
   clearActiveSessionMock.mockReset();
+  getIssueAffinityMock.mockReset().mockReturnValue(null);
+  configureAffinityTtlMock.mockReset();
+  resetAffinityForTestingMock.mockReset();
   readDispatchStateMock.mockReset().mockResolvedValue({ activeDispatches: {} });
   getActiveDispatchMock.mockReset().mockReturnValue(null);
   registerDispatchMock.mockReset().mockResolvedValue(undefined);
@@ -4831,5 +4840,196 @@ describe("handleDispatch error via Issue.update .catch wrapper", () => {
     await new Promise((r) => setTimeout(r, 300));
     const errorCalls = (result.api.logger.error as any).mock.calls.map((c: any[]) => c[0]);
     expect(errorCalls.some((msg: string) => msg.includes("Dispatch pipeline error"))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Session affinity routing
+// ---------------------------------------------------------------------------
+
+describe("session affinity routing", () => {
+  it("request_work uses affinity agent instead of default", async () => {
+    getIssueAffinityMock.mockReturnValue("kaylee");
+    classifyIntentMock.mockResolvedValue({
+      intent: "request_work",
+      reasoning: "User wants work done",
+      fromFallback: false,
+    });
+    mockLinearApiInstance.getIssueDetails.mockResolvedValue({
+      id: "issue-affinity-rw",
+      identifier: "ENG-AFF-RW",
+      title: "Affinity Request Work",
+      description: "desc",
+      state: { name: "Backlog", type: "backlog" },
+      team: { id: "team-aff" },
+      comments: { nodes: [] },
+    });
+
+    const result = await postWebhook({
+      type: "Comment",
+      action: "create",
+      data: {
+        id: "comment-affinity-rw",
+        body: "Please implement this",
+        user: { id: "human-aff", name: "Human" },
+        issue: { id: "issue-affinity-rw", identifier: "ENG-AFF-RW" },
+      },
+    });
+
+    expect(result.status).toBe(200);
+    await new Promise((r) => setTimeout(r, 300));
+    const infoCalls = (result.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
+    expect(infoCalls.some((msg: string) => msg.includes("request_work") && msg.includes("kaylee"))).toBe(true);
+  });
+
+  it("null affinity falls through to default agent", async () => {
+    getIssueAffinityMock.mockReturnValue(null);
+    classifyIntentMock.mockResolvedValue({
+      intent: "request_work",
+      reasoning: "User wants work done",
+      fromFallback: false,
+    });
+    mockLinearApiInstance.getIssueDetails.mockResolvedValue({
+      id: "issue-no-aff",
+      identifier: "ENG-NO-AFF",
+      title: "No Affinity",
+      description: "desc",
+      state: { name: "Backlog", type: "backlog" },
+      team: { id: "team-noaff" },
+      comments: { nodes: [] },
+    });
+
+    const result = await postWebhook({
+      type: "Comment",
+      action: "create",
+      data: {
+        id: "comment-no-aff",
+        body: "Do something",
+        user: { id: "human-noaff", name: "Human" },
+        issue: { id: "issue-no-aff", identifier: "ENG-NO-AFF" },
+      },
+    });
+
+    expect(result.status).toBe(200);
+    await new Promise((r) => setTimeout(r, 300));
+    // Default agent is "mal" (from loadAgentProfilesMock isDefault: true)
+    const infoCalls = (result.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
+    expect(infoCalls.some((msg: string) => msg.includes("request_work") && msg.includes("mal"))).toBe(true);
+  });
+
+  it("AgentSessionEvent.created uses affinity when no @mention", async () => {
+    getIssueAffinityMock.mockReturnValue("kaylee");
+
+    const result = await postWebhook({
+      type: "AgentSessionEvent",
+      action: "created",
+      agentSession: {
+        id: "sess-aff-created",
+        issue: { id: "issue-aff-created", identifier: "ENG-AFF-C" },
+      },
+      previousComments: [
+        { body: "Can you investigate?", user: { name: "Dev" } },
+      ],
+    });
+
+    expect(result.status).toBe(200);
+    await new Promise((r) => setTimeout(r, 50));
+    const infoCalls = (result.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
+    expect(infoCalls.some((msg: string) => msg.includes("session affinity") && msg.includes("kaylee"))).toBe(true);
+  });
+
+  it("@mention overrides affinity in AgentSessionEvent.created", async () => {
+    getIssueAffinityMock.mockReturnValue("kaylee");
+    resolveAgentFromAliasMock.mockReturnValue({ agentId: "mal", profile: { label: "Mal" } });
+
+    const result = await postWebhook({
+      type: "AgentSessionEvent",
+      action: "created",
+      agentSession: {
+        id: "sess-mention-override",
+        issue: { id: "issue-mention-override", identifier: "ENG-MO" },
+      },
+      previousComments: [
+        { body: "@mal please fix this", user: { name: "Dev" } },
+      ],
+    });
+
+    expect(result.status).toBe(200);
+    await new Promise((r) => setTimeout(r, 50));
+    const infoCalls = (result.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
+    // @mention should win over affinity
+    expect(infoCalls.some((msg: string) => msg.includes("routed to mal via @mal mention"))).toBe(true);
+    // Affinity should NOT appear in log because @mention took priority
+    expect(infoCalls.some((msg: string) => msg.includes("session affinity"))).toBe(false);
+  });
+
+  it("close_issue uses affinity agent", async () => {
+    getIssueAffinityMock.mockReturnValue("kaylee");
+    classifyIntentMock.mockResolvedValue({
+      intent: "close_issue",
+      reasoning: "User wants to close",
+      fromFallback: false,
+    });
+    mockLinearApiInstance.getIssueDetails.mockResolvedValue({
+      id: "issue-aff-close",
+      identifier: "ENG-AFF-CL",
+      title: "Affinity Close",
+      description: "desc",
+      state: { name: "In Progress", type: "started" },
+      team: { id: "team-aff-cl" },
+      comments: { nodes: [] },
+    });
+
+    const result = await postWebhook({
+      type: "Comment",
+      action: "create",
+      data: {
+        id: "comment-aff-close",
+        body: "close this please",
+        user: { id: "human-aff-cl", name: "Human" },
+        issue: { id: "issue-aff-close", identifier: "ENG-AFF-CL" },
+      },
+    });
+
+    expect(result.status).toBe(200);
+    await new Promise((r) => setTimeout(r, 300));
+    const infoCalls = (result.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
+    expect(infoCalls.some((msg: string) => msg.includes("close_issue") && msg.includes("kaylee"))).toBe(true);
+  });
+
+  it("ask_agent with explicit agentId overrides affinity", async () => {
+    getIssueAffinityMock.mockReturnValue("kaylee");
+    classifyIntentMock.mockResolvedValue({
+      intent: "ask_agent",
+      agentId: "mal",
+      reasoning: "User asked mal explicitly",
+      fromFallback: false,
+    });
+    mockLinearApiInstance.getIssueDetails.mockResolvedValue({
+      id: "issue-ask-override",
+      identifier: "ENG-ASK-O",
+      title: "Ask Agent Override",
+      description: "desc",
+      state: { name: "Backlog", type: "backlog" },
+      team: { id: "team-ask-o" },
+      comments: { nodes: [] },
+    });
+
+    const result = await postWebhook({
+      type: "Comment",
+      action: "create",
+      data: {
+        id: "comment-ask-override",
+        body: "@mal what do you think?",
+        user: { id: "human-ask-o", name: "Human" },
+        issue: { id: "issue-ask-override", identifier: "ENG-ASK-O" },
+      },
+    });
+
+    expect(result.status).toBe(200);
+    await new Promise((r) => setTimeout(r, 300));
+    const infoCalls = (result.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
+    // ask_agent uses intentResult.agentId directly, not affinity
+    expect(infoCalls.some((msg: string) => msg.includes("ask_agent") && msg.includes("mal"))).toBe(true);
   });
 });
