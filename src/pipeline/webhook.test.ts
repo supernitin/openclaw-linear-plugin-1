@@ -141,6 +141,7 @@ vi.mock("./pipeline.js", () => ({
   runFullPipeline: runFullPipelineMock,
   resumePipeline: resumePipelineMock,
   spawnWorker: spawnWorkerMock,
+  buildProjectContext: () => "",
 }));
 
 vi.mock("../api/linear-api.js", () => ({

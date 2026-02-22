@@ -847,6 +847,7 @@ Add settings under the plugin entry in `openclaw.json`:
 | `codexBaseRepo` | string | `"/home/claw/ai-workspace"` | Git repo for worktrees |
 | `worktreeBaseDir` | string | `"~/.openclaw/worktrees"` | Where worktrees are created |
 | `repos` | object | — | Multi-repo map (see [Multi-Repo](#multi-repo)) |
+| `projectName` | string | — | Human-readable project name (injected into agent prompts) |
 | `dispatchStatePath` | string | `"~/.openclaw/linear-dispatch-state.json"` | Dispatch state file |
 | `planningStatePath` | string | `"~/.openclaw/linear-planning-state.json"` | Planning session state file |
 | `promptsPath` | string | — | Custom prompts file path |
@@ -1044,6 +1045,17 @@ Guidance is cached per-team (24h TTL) so comment webhooks (which don't carry gui
 }
 ```
 
+### Project Context — CLAUDE.md & AGENTS.md
+
+Agents are instructed to read two files from the repo root before starting work:
+
+- **CLAUDE.md** — Project conventions, tech stack, build/test commands, architecture. This is the same convention used by Claude Code and other AI coding tools.
+- **AGENTS.md** — Behavioral guidelines, code style rules, workflow conventions (branch naming, commit format, etc.).
+
+These files are the primary way agents learn about your project. Without them, agents will explore the codebase but may miss conventions.
+
+Run `openclaw openclaw-linear doctor` to check if these files exist. The doctor output includes templates to get started.
+
 ### Example Custom Prompts
 
 ```yaml
@@ -1083,6 +1095,7 @@ rework:
 | `{{reviewModel}}` | Name of cross-model reviewer (planner review) |
 | `{{crossModelFeedback}}` | Review recommendations (planner review) |
 | `{{guidance}}` | Linear workspace/team guidance (if available, empty string otherwise) |
+| `{{projectContext}}` | Project context from config (project name, repo paths). Framework/build/test info belongs in CLAUDE.md. |
 
 ### CLI
 

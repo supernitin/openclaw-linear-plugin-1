@@ -484,6 +484,112 @@ export async function checkFilesAndDirs(pluginConfig?: Record<string, unknown>, 
     checks.push(fail(`Base repo does not exist: ${baseRepo}`, undefined, "Set codexBaseRepo in plugin config to your git repository path"));
   }
 
+  // CLAUDE.md in base repo
+  if (existsSync(baseRepo)) {
+    const claudeMdPath = join(baseRepo, "CLAUDE.md");
+    if (existsSync(claudeMdPath)) {
+      try {
+        const stat = statSync(claudeMdPath);
+        const sizeKb = Math.round(stat.size / 1024);
+        checks.push(pass(`CLAUDE.md found in base repo (${sizeKb}KB)`));
+      } catch {
+        checks.push(pass("CLAUDE.md found in base repo"));
+      }
+    } else {
+      checks.push(warn(
+        "No CLAUDE.md in base repo",
+        `Expected at: ${claudeMdPath}`,
+        {
+          fix: [
+            `Create ${claudeMdPath} — this is how agents learn your project.`,
+            "",
+            "Template:",
+            "  # Project Name",
+            "",
+            "  ## Tech Stack",
+            "  - Language/framework here",
+            "",
+            "  ## Build",
+            "  ```bash",
+            "  your build command here",
+            "  ```",
+            "",
+            "  ## Test",
+            "  ```bash",
+            "  your test command here",
+            "  ```",
+            "",
+            "  ## Architecture",
+            "  Brief description of directory structure and key patterns.",
+          ].join("\n"),
+        },
+      ));
+    }
+  }
+
+  // AGENTS.md in base repo
+  if (existsSync(baseRepo)) {
+    const agentsMdPath = join(baseRepo, "AGENTS.md");
+    if (existsSync(agentsMdPath)) {
+      try {
+        const stat = statSync(agentsMdPath);
+        const sizeKb = Math.round(stat.size / 1024);
+        checks.push(pass(`AGENTS.md found in base repo (${sizeKb}KB)`));
+      } catch {
+        checks.push(pass("AGENTS.md found in base repo"));
+      }
+    } else {
+      checks.push(warn(
+        "No AGENTS.md in base repo",
+        `Expected at: ${agentsMdPath}`,
+        {
+          fix: [
+            `Create ${agentsMdPath} — this tells agents how to work on your project.`,
+            "",
+            "Template:",
+            "  # Agent Guidelines",
+            "",
+            "  ## Code Style",
+            "  - Patterns and conventions to follow",
+            "",
+            "  ## Workflow",
+            "  - Branch naming, commit messages, PR process",
+            "",
+            "  ## Do / Don't",
+            "  - Rules agents must follow in this codebase",
+          ].join("\n"),
+        },
+      ));
+    }
+  }
+
+  // Multi-repo path validation
+  const repos = pluginConfig?.repos as Record<string, string> | undefined;
+  if (repos && typeof repos === "object") {
+    for (const [name, repoPath] of Object.entries(repos)) {
+      if (typeof repoPath !== "string") continue;
+      const resolved = repoPath.startsWith("~/") ? repoPath.replace("~", homedir()) : repoPath;
+      if (!existsSync(resolved)) {
+        checks.push(fail(
+          `Repo "${name}": path does not exist: ${resolved}`,
+          undefined,
+          `Verify the path in plugin config repos.${name}, or create the directory and run: git init ${resolved}`,
+        ));
+      } else {
+        try {
+          execFileSync("git", ["rev-parse", "--git-dir"], { cwd: resolved, encoding: "utf8", timeout: 5_000 });
+          checks.push(pass(`Repo "${name}": valid git repo`));
+        } catch {
+          checks.push(fail(
+            `Repo "${name}": not a git repo at ${resolved}`,
+            undefined,
+            `Run: git init ${resolved}`,
+          ));
+        }
+      }
+    }
+  }
+
   // Prompts
   try {
     clearPromptCache();

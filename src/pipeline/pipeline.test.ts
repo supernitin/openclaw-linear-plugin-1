@@ -52,6 +52,7 @@ import {
   parseVerdict,
   buildWorkerTask,
   buildAuditTask,
+  buildProjectContext,
   loadPrompts,
   loadRawPromptYaml,
   clearPromptCache,
@@ -235,6 +236,100 @@ describe("buildAuditTask", () => {
     const noDesc = { ...issue, description: null };
     const { task } = buildAuditTask(noDesc, "/wt/API-99");
     expect(task).toContain("(no description)");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildProjectContext
+// ---------------------------------------------------------------------------
+
+describe("buildProjectContext", () => {
+  it("returns empty string when no config", () => {
+    expect(buildProjectContext()).toBe("");
+    expect(buildProjectContext(undefined)).toBe("");
+  });
+
+  it("returns empty string when config has no relevant keys", () => {
+    expect(buildProjectContext({ someOtherKey: "value" })).toBe("");
+  });
+
+  it("includes project name", () => {
+    const ctx = buildProjectContext({ projectName: "CallTelemetry" });
+    expect(ctx).toContain("Project: CallTelemetry");
+  });
+
+  it("includes single repo from codexBaseRepo", () => {
+    const ctx = buildProjectContext({ codexBaseRepo: "/home/claw/ai-workspace" });
+    expect(ctx).toContain("Repo: /home/claw/ai-workspace");
+  });
+
+  it("includes multi-repo map", () => {
+    const ctx = buildProjectContext({
+      repos: { api: "/home/repos/api", frontend: "/home/repos/frontend" },
+    });
+    expect(ctx).toContain("Repos:");
+    expect(ctx).toContain("api (/home/repos/api)");
+    expect(ctx).toContain("frontend (/home/repos/frontend)");
+  });
+
+  it("prefers repos over codexBaseRepo when both present", () => {
+    const ctx = buildProjectContext({
+      codexBaseRepo: "/home/claw/fallback",
+      repos: { main: "/home/claw/main" },
+    });
+    expect(ctx).toContain("Repos:");
+    expect(ctx).not.toContain("Repo: /home/claw/fallback");
+  });
+
+  it("ignores framework, buildCommand, testCommand (belong in CLAUDE.md)", () => {
+    const ctx = buildProjectContext({
+      framework: "Phoenix/Elixir",
+      buildCommand: "mix compile",
+      testCommand: "mix test",
+    });
+    expect(ctx).toBe("");
+  });
+
+  it("includes projectName + repo together", () => {
+    const ctx = buildProjectContext({
+      projectName: "MyApp",
+      codexBaseRepo: "/repo",
+    });
+    expect(ctx).toContain("## Project Context");
+    expect(ctx).toContain("Project: MyApp");
+    expect(ctx).toContain("Repo: /repo");
+  });
+
+  it("injects projectContext into worker prompt", () => {
+    clearPromptCache();
+    const issue: IssueContext = { id: "1", identifier: "X-1", title: "test", description: "desc" };
+    const { task } = buildWorkerTask(issue, "/wt", {
+      pluginConfig: { projectName: "TestProject" },
+    });
+    expect(task).toContain("Project: TestProject");
+  });
+
+  it("injects projectContext into audit prompt", () => {
+    clearPromptCache();
+    const issue: IssueContext = { id: "1", identifier: "X-1", title: "test", description: "desc" };
+    const { task } = buildAuditTask(issue, "/wt", { projectName: "TestProject" });
+    expect(task).toContain("Project: TestProject");
+  });
+
+  it("worker prompt instructs reading CLAUDE.md and AGENTS.md", () => {
+    clearPromptCache();
+    const issue: IssueContext = { id: "1", identifier: "X-1", title: "test", description: "desc" };
+    const { task } = buildWorkerTask(issue, "/wt");
+    expect(task).toContain("CLAUDE.md");
+    expect(task).toContain("AGENTS.md");
+  });
+
+  it("audit prompt instructs reading CLAUDE.md and AGENTS.md", () => {
+    clearPromptCache();
+    const issue: IssueContext = { id: "1", identifier: "X-1", title: "test", description: "desc" };
+    const { task } = buildAuditTask(issue, "/wt");
+    expect(task).toContain("CLAUDE.md");
+    expect(task).toContain("AGENTS.md");
   });
 });
 

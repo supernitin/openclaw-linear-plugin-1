@@ -1630,621 +1630,120 @@ describe("checkFilesAndDirs — dispatch state non-Error exception", () => {
 });
 
 // ---------------------------------------------------------------------------
-// checkFilesAndDirs — lock file branches
+// checkFilesAndDirs — CLAUDE.md and AGENTS.md checks
 // ---------------------------------------------------------------------------
 
-describe("checkFilesAndDirs — lock file branches", () => {
+describe("checkFilesAndDirs — CLAUDE.md and AGENTS.md", () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), "doctor-lock-"));
+    tmpDir = mkdtempSync(join(tmpdir(), "doctor-md-"));
+    const { execFileSync } = require("node:child_process");
+    execFileSync("git", ["init"], { cwd: tmpDir, stdio: "ignore" });
   });
 
-  it("warns about stale lock file without --fix", async () => {
-    const statePath = join(tmpDir, "state.json");
-    const lockPath = statePath + ".lock";
-    writeFileSync(statePath, '{}');
-    writeFileSync(lockPath, "locked");
-    // Make the lock file appear stale by backdating its mtime
-    const staleTime = Date.now() - 60_000; // 60 seconds old (> 30s LOCK_STALE_MS)
-    const { utimesSync } = await import("node:fs");
-    utimesSync(lockPath, staleTime / 1000, staleTime / 1000);
-
-    vi.mocked(readDispatchState).mockResolvedValueOnce({
-      dispatches: { active: {}, completed: {} },
-      sessionMap: {},
-      processedEvents: [],
-    });
-
-    const checks = await checkFilesAndDirs({ dispatchStatePath: statePath }, false);
-    const lockCheck = checks.find((c) => c.label.includes("Stale lock file"));
-    expect(lockCheck?.severity).toBe("warn");
-    expect(lockCheck?.fixable).toBe(true);
+  it("passes when CLAUDE.md exists in base repo", async () => {
+    writeFileSync(join(tmpDir, "CLAUDE.md"), "# My Project\n## Tech Stack\n- TypeScript");
+    const checks = await checkFilesAndDirs({ codexBaseRepo: tmpDir });
+    const claudeCheck = checks.find((c) => c.label.includes("CLAUDE.md found"));
+    expect(claudeCheck).toBeDefined();
+    expect(claudeCheck?.severity).toBe("pass");
   });
 
-  it("removes stale lock file with --fix", async () => {
-    const statePath = join(tmpDir, "state.json");
-    const lockPath = statePath + ".lock";
-    writeFileSync(statePath, '{}');
-    writeFileSync(lockPath, "locked");
-    const staleTime = Date.now() - 60_000;
-    const { utimesSync } = await import("node:fs");
-    utimesSync(lockPath, staleTime / 1000, staleTime / 1000);
-
-    vi.mocked(readDispatchState).mockResolvedValueOnce({
-      dispatches: { active: {}, completed: {} },
-      sessionMap: {},
-      processedEvents: [],
-    });
-
-    const checks = await checkFilesAndDirs({ dispatchStatePath: statePath }, true);
-    const lockCheck = checks.find((c) => c.label.includes("Stale lock file removed"));
-    expect(lockCheck?.severity).toBe("pass");
-    expect(existsSync(lockPath)).toBe(false);
+  it("warns when CLAUDE.md is missing from base repo", async () => {
+    const checks = await checkFilesAndDirs({ codexBaseRepo: tmpDir });
+    const claudeCheck = checks.find((c) => c.label.includes("No CLAUDE.md"));
+    expect(claudeCheck).toBeDefined();
+    expect(claudeCheck?.severity).toBe("warn");
+    expect(claudeCheck?.fix).toContain("CLAUDE.md");
   });
 
-  it("warns about active (non-stale) lock file", async () => {
-    const statePath = join(tmpDir, "state.json");
-    const lockPath = statePath + ".lock";
-    writeFileSync(statePath, '{}');
-    writeFileSync(lockPath, "locked");
-    // Lock file is fresh (just created), so lockAge < LOCK_STALE_MS
+  it("passes when AGENTS.md exists in base repo", async () => {
+    writeFileSync(join(tmpDir, "AGENTS.md"), "# Agent Guidelines\n## Code Style");
+    const checks = await checkFilesAndDirs({ codexBaseRepo: tmpDir });
+    const agentsCheck = checks.find((c) => c.label.includes("AGENTS.md found"));
+    expect(agentsCheck).toBeDefined();
+    expect(agentsCheck?.severity).toBe("pass");
+  });
 
-    vi.mocked(readDispatchState).mockResolvedValueOnce({
-      dispatches: { active: {}, completed: {} },
-      sessionMap: {},
-      processedEvents: [],
-    });
+  it("warns when AGENTS.md is missing from base repo", async () => {
+    const checks = await checkFilesAndDirs({ codexBaseRepo: tmpDir });
+    const agentsCheck = checks.find((c) => c.label.includes("No AGENTS.md"));
+    expect(agentsCheck).toBeDefined();
+    expect(agentsCheck?.severity).toBe("warn");
+    expect(agentsCheck?.fix).toContain("AGENTS.md");
+  });
 
-    const checks = await checkFilesAndDirs({ dispatchStatePath: statePath }, false);
-    const lockCheck = checks.find((c) => c.label.includes("Lock file active"));
-    expect(lockCheck?.severity).toBe("warn");
-    expect(lockCheck?.label).toContain("may be in use");
+  it("passes both when both files exist", async () => {
+    writeFileSync(join(tmpDir, "CLAUDE.md"), "# Project");
+    writeFileSync(join(tmpDir, "AGENTS.md"), "# Guidelines");
+    const checks = await checkFilesAndDirs({ codexBaseRepo: tmpDir });
+    const claudeCheck = checks.find((c) => c.label.includes("CLAUDE.md found"));
+    const agentsCheck = checks.find((c) => c.label.includes("AGENTS.md found"));
+    expect(claudeCheck?.severity).toBe("pass");
+    expect(agentsCheck?.severity).toBe("pass");
+  });
+
+  it("shows file size in KB when CLAUDE.md exists", async () => {
+    writeFileSync(join(tmpDir, "CLAUDE.md"), "x".repeat(2048));
+    const checks = await checkFilesAndDirs({ codexBaseRepo: tmpDir });
+    const claudeCheck = checks.find((c) => c.label.includes("CLAUDE.md found"));
+    expect(claudeCheck?.label).toContain("2KB");
   });
 });
 
 // ---------------------------------------------------------------------------
-// checkFilesAndDirs — prompt variable edge cases
+// checkFilesAndDirs — multi-repo path validation
 // ---------------------------------------------------------------------------
 
-describe("checkFilesAndDirs — prompt variable edge cases", () => {
-  it("reports when variable missing from worker.task but present in audit.task", async () => {
-    vi.mocked(loadPrompts).mockReturnValueOnce({
-      worker: {
-        system: "ok",
-        task: "Do something", // missing all vars
-      },
-      audit: {
-        system: "ok",
-        task: "Audit {{identifier}} {{title}} {{description}} in {{worktreePath}}", // has all vars
-      },
-      rework: { addendum: "Fix these gaps: {{gaps}}" },
-    } as any);
-
-    const checks = await checkFilesAndDirs();
-    const promptCheck = checks.find((c) => c.label.includes("Prompt issues"));
-    expect(promptCheck?.severity).toBe("fail");
-    expect(promptCheck?.label).toContain("worker.task missing");
-    // Crucially, audit.task should NOT be missing
-    expect(promptCheck?.label).not.toContain("audit.task missing");
-  });
-
-  it("reports loadPrompts throwing non-Error value", async () => {
-    vi.mocked(loadPrompts).mockImplementationOnce(() => { throw "raw string error"; });
-
-    const checks = await checkFilesAndDirs();
-    const promptCheck = checks.find((c) => c.label.includes("Failed to load prompts"));
-    expect(promptCheck?.severity).toBe("fail");
-    expect(promptCheck?.detail).toContain("raw string error");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// checkFilesAndDirs — worktree & base repo edge cases
-// ---------------------------------------------------------------------------
-
-describe("checkFilesAndDirs — worktree & base repo edge cases", () => {
-  it("reports worktree base dir does not exist", async () => {
-    const checks = await checkFilesAndDirs({
-      worktreeBaseDir: "/tmp/nonexistent-worktree-dir-" + Date.now(),
-    });
-    const wtCheck = checks.find((c) => c.label.includes("Worktree base dir does not exist"));
-    expect(wtCheck?.severity).toBe("warn");
-    expect(wtCheck?.detail).toContain("Will be created on first dispatch");
-  });
-
-  it("reports base repo does not exist", async () => {
-    const checks = await checkFilesAndDirs({
-      codexBaseRepo: "/tmp/nonexistent-repo-" + Date.now(),
-    });
-    const repoCheck = checks.find((c) => c.label.includes("Base repo does not exist"));
-    expect(repoCheck?.severity).toBe("fail");
-    expect(repoCheck?.fix).toContain("codexBaseRepo");
-  });
-
-  it("reports base repo exists but is not a git repo", async () => {
-    const tmpDir = mkdtempSync(join(tmpdir(), "doctor-nongit-"));
-    const checks = await checkFilesAndDirs({
-      codexBaseRepo: tmpDir,
-    });
-    const repoCheck = checks.find((c) => c.label.includes("Base repo is not a git repo"));
-    expect(repoCheck?.severity).toBe("fail");
-    expect(repoCheck?.fix).toContain("git init");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// checkFilesAndDirs — tilde path resolution branches
-// ---------------------------------------------------------------------------
-
-describe("checkFilesAndDirs — tilde path resolution", () => {
-  it("resolves ~/... dispatch state path", async () => {
-    vi.mocked(readDispatchState).mockRejectedValueOnce(new Error("ENOENT"));
-
-    // Providing a path with ~/ triggers the tilde resolution branch
-    const checks = await checkFilesAndDirs({
-      dispatchStatePath: "~/nonexistent-state-file.json",
-    });
-    // The file won't exist (tilde-resolved), so we get the "no file yet" message
-    const stateCheck = checks.find((c) => c.label.includes("Dispatch state"));
-    expect(stateCheck).toBeDefined();
-  });
-
-  it("resolves ~/... worktree base dir path", async () => {
-    const checks = await checkFilesAndDirs({
-      worktreeBaseDir: "~/nonexistent-worktree-base",
-    });
-    const wtCheck = checks.find((c) => c.label.includes("Worktree base dir"));
-    expect(wtCheck).toBeDefined();
-  });
-});
-
-// ---------------------------------------------------------------------------
-// checkDispatchHealth — orphaned worktree singular
-// ---------------------------------------------------------------------------
-
-describe("checkDispatchHealth — edge cases", () => {
-  it("reports single orphaned worktree (singular)", async () => {
-    vi.mocked(listWorktrees).mockReturnValueOnce([
-      { issueIdentifier: "ORPHAN-1", path: "/tmp/wt1" } as any,
-    ]);
-
-    const checks = await checkDispatchHealth();
-    const orphanCheck = checks.find((c) => c.label.includes("orphaned worktree"));
-    expect(orphanCheck?.severity).toBe("warn");
-    expect(orphanCheck?.label).toContain("1 orphaned worktree");
-    expect(orphanCheck?.label).not.toContain("worktrees"); // singular, not plural
-  });
-
-  it("prunes multiple old completed dispatches (plural)", async () => {
-    vi.mocked(readDispatchState).mockResolvedValueOnce({
-      dispatches: {
-        active: {},
-        completed: {
-          "A-1": { completedAt: new Date(Date.now() - 10 * 24 * 3_600_000).toISOString() } as any,
-          "A-2": { completedAt: new Date(Date.now() - 10 * 24 * 3_600_000).toISOString() } as any,
-        },
-      },
-      sessionMap: {},
-      processedEvents: [],
-    });
-    vi.mocked(pruneCompleted).mockResolvedValueOnce(2);
-
-    const checks = await checkDispatchHealth(undefined, true);
-    const pruneCheck = checks.find((c) => c.label.includes("Pruned"));
-    expect(pruneCheck?.severity).toBe("pass");
-    expect(pruneCheck?.label).toContain("2 old completed dispatches");
-  });
-
-  it("reports single stale dispatch (singular)", async () => {
-    vi.mocked(listStaleDispatches).mockReturnValueOnce([
-      { issueIdentifier: "API-1", status: "working" } as any,
-    ]);
-
-    const checks = await checkDispatchHealth();
-    const staleCheck = checks.find((c) => c.label.includes("stale dispatch"));
-    expect(staleCheck?.severity).toBe("warn");
-    // Singular: "1 stale dispatch" not "1 stale dispatches"
-    expect(staleCheck?.label).toMatch(/1 stale dispatch(?!es)/);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// checkConnectivity — webhook self-test with ok but body !== "ok"
-// ---------------------------------------------------------------------------
-
-describe("checkConnectivity — webhook non-ok body", () => {
-  it("warns when webhook returns ok status but body is not 'ok'", async () => {
-    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
-      if (url.includes("localhost")) {
-        return { ok: true, text: async () => "pong" };
-      }
-      throw new Error("unexpected");
-    }));
-
-    const checks = await checkConnectivity({}, { viewer: { name: "T" } });
-    const webhookCheck = checks.find((c) => c.label.includes("Webhook self-test:"));
-    // ok is true but body is "pong" not "ok" — the condition is `res.ok && body === "ok"`
-    // Since body !== "ok", it falls into the warn branch
-    expect(webhookCheck?.severity).toBe("warn");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// formatReport — icon function TTY branches
-// ---------------------------------------------------------------------------
-
-describe("formatReport — TTY icon rendering", () => {
-  it("renders colored icons when stdout.isTTY is true", () => {
-    const origIsTTY = process.stdout.isTTY;
-    try {
-      Object.defineProperty(process.stdout, "isTTY", { value: true, writable: true, configurable: true });
-
-      const report = {
-        sections: [{
-          name: "Test",
-          checks: [
-            { label: "pass check", severity: "pass" as const },
-            { label: "warn check", severity: "warn" as const },
-            { label: "fail check", severity: "fail" as const },
-          ],
-        }],
-        summary: { passed: 1, warnings: 1, errors: 1 },
-      };
-
-      const output = formatReport(report);
-      // TTY output includes ANSI escape codes
-      expect(output).toContain("\x1b[32m"); // green for pass
-      expect(output).toContain("\x1b[33m"); // yellow for warn
-      expect(output).toContain("\x1b[31m"); // red for fail
-    } finally {
-      Object.defineProperty(process.stdout, "isTTY", { value: origIsTTY, writable: true, configurable: true });
-    }
-  });
-});
-
-// ---------------------------------------------------------------------------
-// checkCodingTools — codingTool fallback to "codex" in label
-// ---------------------------------------------------------------------------
-
-describe("checkCodingTools — codingTool null fallback", () => {
-  it("shows 'codex' as default when codingTool is undefined but backends exist", () => {
-    vi.mocked(loadCodingConfig).mockReturnValueOnce({
-      codingTool: undefined,
-      backends: { codex: { aliases: ["codex"] } },
-    } as any);
-
-    const checks = checkCodingTools();
-    const configCheck = checks.find((c) => c.label.includes("coding-tools.json loaded"));
-    expect(configCheck?.severity).toBe("pass");
-    expect(configCheck?.label).toContain("codex"); // falls back to "codex" via ??
-  });
-});
-
-// ---------------------------------------------------------------------------
-// checkFilesAndDirs — dispatch state non-Error catch branch
-// ---------------------------------------------------------------------------
-
-describe("checkFilesAndDirs — dispatch state non-Error exception", () => {
-  it("handles non-Error thrown during dispatch state read", async () => {
-    const tmpDir = mkdtempSync(join(tmpdir(), "doctor-nonError-"));
-    const statePath = join(tmpDir, "state.json");
-    writeFileSync(statePath, '{}');
-    vi.mocked(readDispatchState).mockRejectedValueOnce("raw string dispatch error");
-
-    const checks = await checkFilesAndDirs({ dispatchStatePath: statePath });
-    const stateCheck = checks.find((c) => c.label.includes("Dispatch state corrupt"));
-    expect(stateCheck?.severity).toBe("fail");
-    expect(stateCheck?.detail).toContain("raw string dispatch error");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// checkFilesAndDirs — lock file branches
-// ---------------------------------------------------------------------------
-
-describe("checkFilesAndDirs — lock file branches", () => {
+describe("checkFilesAndDirs — multi-repo validation", () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), "doctor-lock-"));
+    tmpDir = mkdtempSync(join(tmpdir(), "doctor-repos-"));
+    const { execFileSync } = require("node:child_process");
+    execFileSync("git", ["init"], { cwd: tmpDir, stdio: "ignore" });
   });
 
-  it("warns about stale lock file without --fix", async () => {
-    const statePath = join(tmpDir, "state.json");
-    const lockPath = statePath + ".lock";
-    writeFileSync(statePath, '{}');
-    writeFileSync(lockPath, "locked");
-    // Make the lock file appear stale by backdating its mtime
-    const staleTime = Date.now() - 60_000; // 60 seconds old (> 30s LOCK_STALE_MS)
-    const { utimesSync } = await import("node:fs");
-    utimesSync(lockPath, staleTime / 1000, staleTime / 1000);
+  it("passes for valid git repo paths", async () => {
+    const repoDir = join(tmpDir, "myrepo");
+    mkdirSync(repoDir);
+    const { execFileSync } = require("node:child_process");
+    execFileSync("git", ["init"], { cwd: repoDir, stdio: "ignore" });
 
-    vi.mocked(readDispatchState).mockResolvedValueOnce({
-      dispatches: { active: {}, completed: {} },
-      sessionMap: {},
-      processedEvents: [],
-    });
-
-    const checks = await checkFilesAndDirs({ dispatchStatePath: statePath }, false);
-    const lockCheck = checks.find((c) => c.label.includes("Stale lock file"));
-    expect(lockCheck?.severity).toBe("warn");
-    expect(lockCheck?.fixable).toBe(true);
-  });
-
-  it("removes stale lock file with --fix", async () => {
-    const statePath = join(tmpDir, "state.json");
-    const lockPath = statePath + ".lock";
-    writeFileSync(statePath, '{}');
-    writeFileSync(lockPath, "locked");
-    const staleTime = Date.now() - 60_000;
-    const { utimesSync } = await import("node:fs");
-    utimesSync(lockPath, staleTime / 1000, staleTime / 1000);
-
-    vi.mocked(readDispatchState).mockResolvedValueOnce({
-      dispatches: { active: {}, completed: {} },
-      sessionMap: {},
-      processedEvents: [],
-    });
-
-    const checks = await checkFilesAndDirs({ dispatchStatePath: statePath }, true);
-    const lockCheck = checks.find((c) => c.label.includes("Stale lock file removed"));
-    expect(lockCheck?.severity).toBe("pass");
-    expect(existsSync(lockPath)).toBe(false);
-  });
-
-  it("warns about active (non-stale) lock file", async () => {
-    const statePath = join(tmpDir, "state.json");
-    const lockPath = statePath + ".lock";
-    writeFileSync(statePath, '{}');
-    writeFileSync(lockPath, "locked");
-    // Lock file is fresh (just created), so lockAge < LOCK_STALE_MS
-
-    vi.mocked(readDispatchState).mockResolvedValueOnce({
-      dispatches: { active: {}, completed: {} },
-      sessionMap: {},
-      processedEvents: [],
-    });
-
-    const checks = await checkFilesAndDirs({ dispatchStatePath: statePath }, false);
-    const lockCheck = checks.find((c) => c.label.includes("Lock file active"));
-    expect(lockCheck?.severity).toBe("warn");
-    expect(lockCheck?.label).toContain("may be in use");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// checkFilesAndDirs — prompt variable edge cases
-// ---------------------------------------------------------------------------
-
-describe("checkFilesAndDirs — prompt variable edge cases", () => {
-  it("reports when variable missing from worker.task but present in audit.task", async () => {
-    vi.mocked(loadPrompts).mockReturnValueOnce({
-      worker: {
-        system: "ok",
-        task: "Do something", // missing all vars
-      },
-      audit: {
-        system: "ok",
-        task: "Audit {{identifier}} {{title}} {{description}} in {{worktreePath}}", // has all vars
-      },
-      rework: { addendum: "Fix these gaps: {{gaps}}" },
-    } as any);
-
-    const checks = await checkFilesAndDirs();
-    const promptCheck = checks.find((c) => c.label.includes("Prompt issues"));
-    expect(promptCheck?.severity).toBe("fail");
-    expect(promptCheck?.label).toContain("worker.task missing");
-    // Crucially, audit.task should NOT be missing
-    expect(promptCheck?.label).not.toContain("audit.task missing");
-  });
-
-  it("reports loadPrompts throwing non-Error value", async () => {
-    vi.mocked(loadPrompts).mockImplementationOnce(() => { throw "raw string error"; });
-
-    const checks = await checkFilesAndDirs();
-    const promptCheck = checks.find((c) => c.label.includes("Failed to load prompts"));
-    expect(promptCheck?.severity).toBe("fail");
-    expect(promptCheck?.detail).toContain("raw string error");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// checkFilesAndDirs — worktree & base repo edge cases
-// ---------------------------------------------------------------------------
-
-describe("checkFilesAndDirs — worktree & base repo edge cases", () => {
-  it("reports worktree base dir does not exist", async () => {
-    const checks = await checkFilesAndDirs({
-      worktreeBaseDir: "/tmp/nonexistent-worktree-dir-" + Date.now(),
-    });
-    const wtCheck = checks.find((c) => c.label.includes("Worktree base dir does not exist"));
-    expect(wtCheck?.severity).toBe("warn");
-    expect(wtCheck?.detail).toContain("Will be created on first dispatch");
-  });
-
-  it("reports base repo does not exist", async () => {
-    const checks = await checkFilesAndDirs({
-      codexBaseRepo: "/tmp/nonexistent-repo-" + Date.now(),
-    });
-    const repoCheck = checks.find((c) => c.label.includes("Base repo does not exist"));
-    expect(repoCheck?.severity).toBe("fail");
-    expect(repoCheck?.fix).toContain("codexBaseRepo");
-  });
-
-  it("reports base repo exists but is not a git repo", async () => {
-    const tmpDir = mkdtempSync(join(tmpdir(), "doctor-nongit-"));
     const checks = await checkFilesAndDirs({
       codexBaseRepo: tmpDir,
+      repos: { frontend: repoDir },
     });
-    const repoCheck = checks.find((c) => c.label.includes("Base repo is not a git repo"));
+    const repoCheck = checks.find((c) => c.label.includes('Repo "frontend"'));
+    expect(repoCheck).toBeDefined();
+    expect(repoCheck?.severity).toBe("pass");
+    expect(repoCheck?.label).toContain("valid git repo");
+  });
+
+  it("fails for non-existent repo paths", async () => {
+    const checks = await checkFilesAndDirs({
+      codexBaseRepo: tmpDir,
+      repos: { backend: "/tmp/nonexistent-repo-path-12345" },
+    });
+    const repoCheck = checks.find((c) => c.label.includes('Repo "backend"'));
+    expect(repoCheck).toBeDefined();
     expect(repoCheck?.severity).toBe("fail");
-    expect(repoCheck?.fix).toContain("git init");
+    expect(repoCheck?.label).toContain("does not exist");
   });
-});
 
-// ---------------------------------------------------------------------------
-// checkFilesAndDirs — tilde path resolution branches
-// ---------------------------------------------------------------------------
+  it("fails for paths that exist but are not git repos", async () => {
+    // Create a dir outside the git repo so git rev-parse fails
+    const nonGitDir = mkdtempSync(join(tmpdir(), "doctor-nongit-"));
 
-describe("checkFilesAndDirs — tilde path resolution", () => {
-  it("resolves ~/... dispatch state path", async () => {
-    vi.mocked(readDispatchState).mockRejectedValueOnce(new Error("ENOENT"));
-
-    // Providing a path with ~/ triggers the tilde resolution branch
     const checks = await checkFilesAndDirs({
-      dispatchStatePath: "~/nonexistent-state-file.json",
+      codexBaseRepo: tmpDir,
+      repos: { api: nonGitDir },
     });
-    // The file won't exist (tilde-resolved), so we get the "no file yet" message
-    const stateCheck = checks.find((c) => c.label.includes("Dispatch state"));
-    expect(stateCheck).toBeDefined();
-  });
-
-  it("resolves ~/... worktree base dir path", async () => {
-    const checks = await checkFilesAndDirs({
-      worktreeBaseDir: "~/nonexistent-worktree-base",
-    });
-    const wtCheck = checks.find((c) => c.label.includes("Worktree base dir"));
-    expect(wtCheck).toBeDefined();
+    const repoCheck = checks.find((c) => c.label.includes('Repo "api"'));
+    expect(repoCheck).toBeDefined();
+    expect(repoCheck?.severity).toBe("fail");
+    expect(repoCheck?.label).toContain("not a git repo");
   });
 });
 
-// ---------------------------------------------------------------------------
-// checkDispatchHealth — orphaned worktree singular
-// ---------------------------------------------------------------------------
-
-describe("checkDispatchHealth — edge cases", () => {
-  it("reports single orphaned worktree (singular)", async () => {
-    vi.mocked(listWorktrees).mockReturnValueOnce([
-      { issueIdentifier: "ORPHAN-1", path: "/tmp/wt1" } as any,
-    ]);
-
-    const checks = await checkDispatchHealth();
-    const orphanCheck = checks.find((c) => c.label.includes("orphaned worktree"));
-    expect(orphanCheck?.severity).toBe("warn");
-    expect(orphanCheck?.label).toContain("1 orphaned worktree");
-    expect(orphanCheck?.label).not.toContain("worktrees"); // singular, not plural
-  });
-
-  it("prunes multiple old completed dispatches (plural)", async () => {
-    vi.mocked(readDispatchState).mockResolvedValueOnce({
-      dispatches: {
-        active: {},
-        completed: {
-          "A-1": { completedAt: new Date(Date.now() - 10 * 24 * 3_600_000).toISOString() } as any,
-          "A-2": { completedAt: new Date(Date.now() - 10 * 24 * 3_600_000).toISOString() } as any,
-        },
-      },
-      sessionMap: {},
-      processedEvents: [],
-    });
-    vi.mocked(pruneCompleted).mockResolvedValueOnce(2);
-
-    const checks = await checkDispatchHealth(undefined, true);
-    const pruneCheck = checks.find((c) => c.label.includes("Pruned"));
-    expect(pruneCheck?.severity).toBe("pass");
-    expect(pruneCheck?.label).toContain("2 old completed dispatches");
-  });
-
-  it("reports single stale dispatch (singular)", async () => {
-    vi.mocked(listStaleDispatches).mockReturnValueOnce([
-      { issueIdentifier: "API-1", status: "working" } as any,
-    ]);
-
-    const checks = await checkDispatchHealth();
-    const staleCheck = checks.find((c) => c.label.includes("stale dispatch"));
-    expect(staleCheck?.severity).toBe("warn");
-    // Singular: "1 stale dispatch" not "1 stale dispatches"
-    expect(staleCheck?.label).toMatch(/1 stale dispatch(?!es)/);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// checkConnectivity — webhook self-test with ok but body !== "ok"
-// ---------------------------------------------------------------------------
-
-describe("checkConnectivity — webhook non-ok body", () => {
-  it("warns when webhook returns ok status but body is not 'ok'", async () => {
-    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
-      if (url.includes("localhost")) {
-        return { ok: true, text: async () => "pong" };
-      }
-      throw new Error("unexpected");
-    }));
-
-    const checks = await checkConnectivity({}, { viewer: { name: "T" } });
-    const webhookCheck = checks.find((c) => c.label.includes("Webhook self-test:"));
-    // ok is true but body is "pong" not "ok" — the condition is `res.ok && body === "ok"`
-    // Since body !== "ok", it falls into the warn branch
-    expect(webhookCheck?.severity).toBe("warn");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// formatReport — icon function TTY branches
-// ---------------------------------------------------------------------------
-
-describe("formatReport — TTY icon rendering", () => {
-  it("renders colored icons when stdout.isTTY is true", () => {
-    const origIsTTY = process.stdout.isTTY;
-    try {
-      Object.defineProperty(process.stdout, "isTTY", { value: true, writable: true, configurable: true });
-
-      const report = {
-        sections: [{
-          name: "Test",
-          checks: [
-            { label: "pass check", severity: "pass" as const },
-            { label: "warn check", severity: "warn" as const },
-            { label: "fail check", severity: "fail" as const },
-          ],
-        }],
-        summary: { passed: 1, warnings: 1, errors: 1 },
-      };
-
-      const output = formatReport(report);
-      // TTY output includes ANSI escape codes
-      expect(output).toContain("\x1b[32m"); // green for pass
-      expect(output).toContain("\x1b[33m"); // yellow for warn
-      expect(output).toContain("\x1b[31m"); // red for fail
-    } finally {
-      Object.defineProperty(process.stdout, "isTTY", { value: origIsTTY, writable: true, configurable: true });
-    }
-  });
-});
-
-// ---------------------------------------------------------------------------
-// checkCodingTools — codingTool fallback to "codex" in label
-// ---------------------------------------------------------------------------
-
-describe("checkCodingTools — codingTool null fallback", () => {
-  it("shows 'codex' as default when codingTool is undefined but backends exist", () => {
-    vi.mocked(loadCodingConfig).mockReturnValueOnce({
-      codingTool: undefined,
-      backends: { codex: { aliases: ["codex"] } },
-    } as any);
-
-    const checks = checkCodingTools();
-    const configCheck = checks.find((c) => c.label.includes("coding-tools.json loaded"));
-    expect(configCheck?.severity).toBe("pass");
-    expect(configCheck?.label).toContain("codex"); // falls back to "codex" via ??
-  });
-});
-
-// ---------------------------------------------------------------------------
-// checkFilesAndDirs — dispatch state non-Error catch branch
-// ---------------------------------------------------------------------------
-
-describe("checkFilesAndDirs — dispatch state non-Error exception", () => {
-  it("handles non-Error thrown during dispatch state read", async () => {
-    const tmpDir = mkdtempSync(join(tmpdir(), "doctor-nonError-"));
-    const statePath = join(tmpDir, "state.json");
-    writeFileSync(statePath, '{}');
-    vi.mocked(readDispatchState).mockRejectedValueOnce("raw string dispatch error");
-
-    const checks = await checkFilesAndDirs({ dispatchStatePath: statePath });
-    const stateCheck = checks.find((c) => c.label.includes("Dispatch state corrupt"));
-    expect(stateCheck?.severity).toBe("fail");
-    expect(stateCheck?.detail).toContain("raw string dispatch error");
-  });
-});

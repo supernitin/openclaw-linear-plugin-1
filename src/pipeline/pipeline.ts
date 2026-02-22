@@ -63,11 +63,11 @@ interface PromptTemplates {
 const DEFAULT_PROMPTS: PromptTemplates = {
   worker: {
     system: "You are a coding worker implementing a Linear issue. Your ONLY job is to write code and return a text summary. Do NOT attempt to update, close, comment on, or modify the Linear issue. Do NOT mark the issue as Done.",
-    task: "Implement issue {{identifier}}: {{title}}\n\nIssue body:\n{{description}}\n\nWorktree: {{worktreePath}}\n\nImplement the solution, run tests, commit your work, and return a text summary.",
+    task: "Implement issue {{identifier}}: {{title}}\n\nIssue body:\n{{description}}\n\nWorktree: {{worktreePath}}\n{{projectContext}}\n\nBefore coding, read CLAUDE.md and AGENTS.md in the worktree root for project conventions and guidelines. If they don't exist, explore the codebase first.\n\nImplement the solution, run tests, commit your work, and return a text summary.",
   },
   audit: {
     system: "You are an independent auditor. The Linear issue body is the SOURCE OF TRUTH. Worker comments are secondary evidence.",
-    task: 'Audit issue {{identifier}}: {{title}}\n\nIssue body:\n{{description}}\n\nWorktree: {{worktreePath}}\n\nReturn JSON verdict: {"pass": true/false, "criteria": [...], "gaps": [...], "testResults": "..."}',
+    task: 'Audit issue {{identifier}}: {{title}}\n\nIssue body:\n{{description}}\n\nWorktree: {{worktreePath}}\n{{projectContext}}\n\nRead CLAUDE.md and AGENTS.md in the worktree root for project standards.\n\nReturn JSON verdict: {"pass": true/false, "criteria": [...], "gaps": [...], "testResults": "..."}',
   },
   rework: {
     addendum: "PREVIOUS AUDIT FAILED (attempt {{attempt}}). Gaps:\n{{gaps}}\n\nAddress these specific issues. Preserve correct code from prior attempts.",
@@ -168,6 +168,39 @@ export function clearPromptCache(): void {
 }
 
 // ---------------------------------------------------------------------------
+// Project context builder
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a project context block from plugin config.
+ *
+ * Provides structural info only: project name and repo paths.
+ * Framework, build/test commands, and conventions belong in CLAUDE.md
+ * and AGENTS.md in the repo root — agents are instructed to read those.
+ */
+export function buildProjectContext(pluginConfig?: Record<string, unknown>): string {
+  if (!pluginConfig) return "";
+
+  const lines: string[] = [];
+
+  // Project name
+  const projectName = pluginConfig.projectName as string | undefined;
+  if (projectName) lines.push(`Project: ${projectName}`);
+
+  // Repo(s)
+  const repos = pluginConfig.repos as Record<string, string> | undefined;
+  const baseRepo = pluginConfig.codexBaseRepo as string | undefined;
+  if (repos && Object.keys(repos).length > 0) {
+    lines.push(`Repos: ${Object.entries(repos).map(([k, v]) => `${k} (${v})`).join(", ")}`);
+  } else if (baseRepo) {
+    lines.push(`Repo: ${baseRepo}`);
+  }
+
+  if (lines.length === 0) return "";
+  return "## Project Context\n" + lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
 // Task builders
 // ---------------------------------------------------------------------------
 
@@ -199,6 +232,7 @@ export function buildWorkerTask(
     guidance: opts?.guidance
       ? `\n---\n## IMPORTANT — Workspace Guidance (MUST follow)\nThe workspace owner has set the following mandatory instructions. You MUST incorporate these into your response:\n\n${opts.guidance.slice(0, 2000)}\n---`
       : "",
+    projectContext: buildProjectContext(opts?.pluginConfig),
   };
 
   let task = renderTemplate(prompts.worker.task, vars);
@@ -233,6 +267,7 @@ export function buildAuditTask(
     guidance: opts?.guidance
       ? `\n---\n## IMPORTANT — Workspace Guidance (MUST follow)\nThe workspace owner has set the following mandatory instructions. You MUST incorporate these into your response:\n\n${opts.guidance.slice(0, 2000)}\n---`
       : "",
+    projectContext: buildProjectContext(pluginConfig),
   };
 
   return {

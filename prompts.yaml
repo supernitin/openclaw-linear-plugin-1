@@ -1,7 +1,8 @@
 # prompts.yaml — Externalized phase prompts for the Linear dispatch pipeline.
 #
 # Template variables: {{identifier}}, {{title}}, {{description}},
-#   {{worktreePath}}, {{gaps}}, {{tier}}, {{attempt}}, {{guidance}}
+#   {{worktreePath}}, {{gaps}}, {{tier}}, {{attempt}}, {{guidance}},
+#   {{projectContext}}
 #
 # Edit these to customize worker/audit behavior without rebuilding the plugin.
 # Override path via `promptsPath` in plugin config.
@@ -25,16 +26,24 @@ worker:
     {{description}}
 
     Worktree: {{worktreePath}}
+    {{projectContext}}
+
+    Before writing any code, read these files in the worktree root (if they exist):
+    - CLAUDE.md — project conventions, tech stack, build/test commands, architecture
+    - AGENTS.md — behavioral guidelines, code style, workflow rules
+    These files are your primary source of truth for how this project works.
+    If they don't exist, explore the codebase to understand conventions before coding.
 
     Instructions:
     1. Read the issue body carefully — it defines what needs to be done
     2. If the description is vague or missing, implement a reasonable interpretation and note your assumptions
-    3. Plan your approach
-    4. Implement the solution in the worktree
-    5. Run tests to verify your changes
-    6. If tests fail, diagnose and fix the failures before returning — do not return with failing tests unless you've exhausted your ability to fix them
-    7. Commit your work with a clear commit message
-    8. Return a text summary: what you changed, what tests passed, any assumptions you made, and any open questions
+    3. Read CLAUDE.md and AGENTS.md in the worktree, then explore the codebase to understand the existing architecture
+    4. Plan your approach
+    5. Implement the solution in the worktree
+    6. Run tests to verify your changes
+    7. If tests fail, diagnose and fix the failures before returning — do not return with failing tests unless you've exhausted your ability to fix them
+    8. Commit your work with a clear commit message
+    9. Return a text summary: what you changed, what tests passed, any assumptions you made, and any open questions
 
     Your text output will be captured automatically. Do NOT use linear_issues or attempt to post comments.
     {{guidance}}
@@ -60,6 +69,12 @@ audit:
     {{description}}
 
     Worktree: {{worktreePath}}
+    {{projectContext}}
+
+    Before auditing, read these files in the worktree root (if they exist):
+    - CLAUDE.md — project conventions, tech stack, build/test commands
+    - AGENTS.md — behavioral guidelines, code style, workflow rules
+    These define the project's standards. Use them to evaluate code quality.
 
     Checklist:
     1. Identify ALL acceptance criteria from the issue body
