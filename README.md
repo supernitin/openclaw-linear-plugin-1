@@ -27,7 +27,7 @@ Connect Linear to AI agents. Issues get triaged, implemented, and audited — au
 - [x] Complexity-tier dispatch (small → Haiku, medium → Sonnet, high → Opus)
 - [x] Isolated git worktrees per dispatch
 - [x] Worker → Auditor pipeline (hard-enforced, not LLM-mediated)
-- [ ] Audit rework loop (gaps fed back, automatic retry)
+- [x] Audit rework loop (gaps fed back, automatic retry)
 - [x] Watchdog timeout + escalation
 - [x] Webhook deduplication (60s sliding window across session/comment/assignment)
 - [ ] Multi-repo worktree support
@@ -585,6 +585,61 @@ Agent runs ─────────── output ──→ timer resets (120s
 ```json
 { "agents": { "mal": { "watchdog": { "inactivitySec": 180 } } } }
 ```
+
+### Audit rework loop
+
+When the auditor finds problems, it doesn't just fail — it tells the worker exactly what's wrong, and the worker tries again automatically.
+
+```
+Worker implements ──→ Auditor reviews
+                          │
+                     ┌────┴────┐
+                     ▼         ▼
+                   PASS      FAIL
+                     │         │
+                     ▼         ▼
+                   Done    Gaps extracted
+                              │
+                              ▼
+                     Worker gets gaps as context ──→ "PREVIOUS AUDIT FAILED:
+                              │                       - Missing input validation
+                              │                       - No test for empty query"
+                              ▼
+                     Rework attempt (same worktree)
+                              │
+                         ┌────┴────┐
+                         ▼         ▼
+                       PASS    FAIL again?
+                         │         │
+                         ▼         ▼
+                       Done    Retries left?
+                                   │
+                              ┌────┴────┐
+                              ▼         ▼
+                            Retry    STUCK → you're notified
+```
+
+**How gaps flow back:**
+1. Auditor returns a structured verdict: `{ pass: false, gaps: ["missing validation", "no empty query test"], criteria: [...] }`
+2. Pipeline extracts the `gaps` array
+3. Next worker prompt gets a "PREVIOUS AUDIT FAILED" addendum with the gap list
+4. Worker sees exactly what to fix — no guessing
+
+**What you control:**
+- `maxReworkAttempts` (default: `2`) — how many audit failures before escalation
+- After max attempts, issue goes to `stuck` with reason `audit_failed_Nx`
+- You get a Linear comment with what went wrong and a notification
+
+**What the worker sees on rework:**
+```
+PREVIOUS AUDIT FAILED — fix these gaps before proceeding:
+1. Missing input validation on the search endpoint
+2. No test for empty query string
+
+Your previous work is still in the worktree. Fix the issues above and run tests again.
+```
+
+**Artifacts per attempt:** Each rework cycle writes `worker-{N}.md` and `audit-{N}.json` to `.claw/`, so you can see what happened at every attempt.
 
 ### Project-level progress
 
