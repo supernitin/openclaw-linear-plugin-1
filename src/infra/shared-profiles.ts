@@ -5,7 +5,7 @@
  * resolveAgentFromAlias() implementations that were previously in
  * webhook.ts, intent-classify.ts, and tier-assess.ts.
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
@@ -105,6 +105,64 @@ export function resolveDefaultAgent(api: { pluginConfig?: Record<string, unknown
   } catch { /* fall through */ }
 
   return "default";
+}
+
+// ---------------------------------------------------------------------------
+// Profile validation — returns a user-facing error string or null if OK.
+// ---------------------------------------------------------------------------
+
+/**
+ * Validate that agent-profiles.json exists, is parseable, and has at least
+ * one agent.  Returns a human-readable error string suitable for posting
+ * back to Linear, or null when everything looks good.
+ */
+export function validateProfiles(): string | null {
+  if (!existsSync(PROFILES_PATH)) {
+    return (
+      `**Critical setup error:** \`agent-profiles.json\` not found.\n\n` +
+      `The Linear plugin requires this file to route messages to your agent.\n\n` +
+      `**Create it now:**\n` +
+      "```\n" +
+      `cat > ${PROFILES_PATH} << 'EOF'\n` +
+      `{\n` +
+      `  "agents": {\n` +
+      `    "my-agent": {\n` +
+      `      "label": "My Agent",\n` +
+      `      "mission": "AI assistant",\n` +
+      `      "isDefault": true,\n` +
+      `      "mentionAliases": ["my-agent"]\n` +
+      `    }\n` +
+      `  }\n` +
+      `}\n` +
+      `EOF\n` +
+      "```\n\n" +
+      `Then restart the gateway: \`systemctl --user restart openclaw-gateway\`\n\n` +
+      `Run \`openclaw openclaw-linear doctor\` to verify your setup.`
+    );
+  }
+
+  let profiles: Record<string, unknown>;
+  try {
+    const raw = readFileSync(PROFILES_PATH, "utf8");
+    profiles = JSON.parse(raw).agents ?? {};
+  } catch (err) {
+    return (
+      `**Critical setup error:** \`agent-profiles.json\` exists but could not be parsed.\n\n` +
+      `Error: ${err instanceof Error ? err.message : String(err)}\n\n` +
+      `Fix the JSON syntax in \`${PROFILES_PATH}\` and restart the gateway.\n` +
+      `Run \`openclaw openclaw-linear doctor\` to verify.`
+    );
+  }
+
+  if (Object.keys(profiles).length === 0) {
+    return (
+      `**Critical setup error:** \`agent-profiles.json\` has no agents configured.\n\n` +
+      `Add at least one agent entry to the \`"agents"\` object in \`${PROFILES_PATH}\`.\n` +
+      `Run \`openclaw openclaw-linear doctor\` for a guided setup check.`
+    );
+  }
+
+  return null;
 }
 
 // ---------------------------------------------------------------------------

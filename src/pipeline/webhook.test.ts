@@ -14,6 +14,7 @@ const {
   loadAgentProfilesMock,
   buildMentionPatternMock,
   resolveAgentFromAliasMock,
+  validateProfilesMock,
   resetProfilesCacheMock,
   classifyIntentMock,
   extractGuidanceMock,
@@ -86,6 +87,7 @@ const {
   }),
   buildMentionPatternMock: vi.fn().mockReturnValue(/@(mal|mason|kaylee|eureka)/i),
   resolveAgentFromAliasMock: vi.fn().mockReturnValue(null),
+  validateProfilesMock: vi.fn().mockReturnValue(null),
   resetProfilesCacheMock: vi.fn(),
   classifyIntentMock: vi.fn().mockResolvedValue({
     intent: "general",
@@ -154,6 +156,7 @@ vi.mock("../infra/shared-profiles.js", () => ({
   loadAgentProfiles: loadAgentProfilesMock,
   buildMentionPattern: buildMentionPatternMock,
   resolveAgentFromAlias: resolveAgentFromAliasMock,
+  validateProfiles: validateProfilesMock,
   _resetProfilesCacheForTesting: resetProfilesCacheMock,
 }));
 
@@ -352,6 +355,7 @@ afterEach(() => {
   });
   buildMentionPatternMock.mockReset().mockReturnValue(/@(mal|mason|kaylee|eureka)/i);
   resolveAgentFromAliasMock.mockReset().mockReturnValue(null);
+  validateProfilesMock.mockReset().mockReturnValue(null);
   classifyIntentMock.mockReset().mockResolvedValue({
     intent: "general",
     reasoning: "Not actionable",

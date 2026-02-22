@@ -152,6 +152,11 @@ vi.mock("../pipeline/dag-dispatch.js", () => ({
   startProjectDispatch: vi.fn().mockResolvedValue(undefined),
 }));
 
+vi.mock("../infra/shared-profiles.js", async (importOriginal) => {
+  const actual = await importOriginal() as Record<string, unknown>;
+  return { ...actual, validateProfiles: vi.fn().mockReturnValue(null) };
+});
+
 // ── Imports (after mocks) ────────────────────────────────────────
 
 import { handleLinearWebhook, _resetForTesting } from "../pipeline/webhook.js";

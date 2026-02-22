@@ -17,7 +17,7 @@ import { startProjectDispatch } from "./dag-dispatch.js";
 import { emitDiagnostic } from "../infra/observability.js";
 import { classifyIntent } from "./intent-classify.js";
 import { extractGuidance, formatGuidanceAppendix, cacheGuidanceForTeam, getCachedGuidanceForTeam, isGuidanceEnabled, _resetGuidanceCacheForTesting } from "./guidance.js";
-import { loadAgentProfiles, buildMentionPattern, resolveAgentFromAlias, _resetProfilesCacheForTesting, type AgentProfile } from "../infra/shared-profiles.js";
+import { loadAgentProfiles, buildMentionPattern, resolveAgentFromAlias, validateProfiles, _resetProfilesCacheForTesting, type AgentProfile } from "../infra/shared-profiles.js";
 
 // ── Prompt input sanitization ─────────────────────────────────────
 
@@ -322,6 +322,21 @@ export async function handleLinearWebhook(
       return true;
     }
 
+    // Validate agent profiles before doing any work
+    const profilesError = validateProfiles();
+    if (profilesError) {
+      api.logger.error("Agent profiles validation failed — posting setup error to Linear");
+      await linearApi.emitActivity(session.id, {
+        type: "error",
+        body: profilesError,
+      }).catch(() => {});
+      // Also try posting as a comment in case emitActivity doesn't render markdown
+      try {
+        await createCommentWithDedup(linearApi, issue.id, profilesError);
+      } catch {}
+      return true;
+    }
+
     const previousComments = payload.previousComments ?? [];
     const guidanceCtx = extractGuidance(payload);
 
@@ -331,21 +346,54 @@ export async function handleLinearWebhook(
       : null;
     const userMessage = lastComment?.body ?? "";
 
+    // Also extract the session prompt from promptContext — on initial session
+    // creation, previousComments is empty but the user's message lives here.
+    const promptContext = typeof payload.promptContext === "string" ? payload.promptContext : "";
+
     // Route to the mentioned agent if the user's message contains an @mention.
     // AgentSessionEvent doesn't carry mention routing — we must check manually.
+    // Check the last comment body, promptContext, AND agentSession prompt for @mentions.
     const profiles = loadAgentProfiles();
     const mentionPattern = buildMentionPattern(profiles);
     let agentId = resolveAgentId(api);
     let mentionOverride = false;
-    if (mentionPattern && userMessage) {
-      const mentionMatch = userMessage.match(mentionPattern);
-      if (mentionMatch) {
-        const alias = mentionMatch[1];
-        const resolved = resolveAgentFromAlias(alias, profiles);
-        if (resolved) {
-          api.logger.info(`AgentSession routed to ${resolved.agentId} via @${alias} mention`);
-          agentId = resolved.agentId;
-          mentionOverride = true;
+    const sessionPrompt = typeof (payload.agentSession as any)?.prompt === "string"
+      ? (payload.agentSession as any).prompt : "";
+    const textsToScan = [userMessage, sessionPrompt, promptContext].filter(Boolean);
+    for (const text of textsToScan) {
+      if (mentionOverride) break;
+      if (mentionPattern) {
+        mentionPattern.lastIndex = 0;
+        const mentionMatch = text.match(mentionPattern);
+        if (mentionMatch) {
+          const alias = mentionMatch[1];
+          const resolved = resolveAgentFromAlias(alias, profiles);
+          if (resolved) {
+            api.logger.info(`AgentSession routed to ${resolved.agentId} via @${alias} mention in ${text === userMessage ? "comment" : text === sessionPrompt ? "session prompt" : "promptContext"}`);
+            agentId = resolved.agentId;
+            mentionOverride = true;
+          }
+        }
+      }
+    }
+    // Also try bare-name matching (e.g. "hey mal" without @) in the user's text
+    if (!mentionOverride) {
+      for (const text of textsToScan) {
+        if (mentionOverride) break;
+        const lowerText = text.toLowerCase();
+        for (const [id, profile] of Object.entries(profiles)) {
+          const allNames = [...profile.mentionAliases, ...(profile.appAliases ?? [])];
+          for (const name of allNames) {
+            // Match bare name at word boundary (e.g. "hey mal" but not "malware")
+            const nameRe = new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i");
+            if (nameRe.test(lowerText)) {
+              api.logger.info(`AgentSession routed to ${id} via bare name "${name}" in ${text === userMessage ? "comment" : text === sessionPrompt ? "session prompt" : "promptContext"}`);
+              agentId = id;
+              mentionOverride = true;
+              break;
+            }
+          }
+          if (mentionOverride) break;
         }
       }
     }
@@ -550,6 +598,17 @@ export async function handleLinearWebhook(
     const linearApi = createLinearApi(api);
     if (!linearApi) {
       api.logger.error("No Linear access token configured");
+      return true;
+    }
+
+    // Validate agent profiles before doing any work
+    const profilesError = validateProfiles();
+    if (profilesError) {
+      api.logger.error("Agent profiles validation failed — posting setup error to Linear");
+      await linearApi.emitActivity(session.id, {
+        type: "error",
+        body: profilesError,
+      }).catch(() => {});
       return true;
     }
 
@@ -761,6 +820,16 @@ export async function handleLinearWebhook(
     // be discarded anyway by activeRuns check in dispatchCommentToAgent().
     if (activeRuns.has(issue.id)) {
       api.logger.info(`Comment on ${issue.identifier ?? issue.id}: active run — skipping`);
+      return true;
+    }
+
+    // Validate agent profiles before doing any work
+    const profilesError = validateProfiles();
+    if (profilesError) {
+      api.logger.error("Agent profiles validation failed — posting setup error to Linear");
+      try {
+        await createCommentWithDedup(linearApi, issue.id, profilesError);
+      } catch {}
       return true;
     }
 
@@ -1047,6 +1116,16 @@ export async function handleLinearWebhook(
     const linearApi = createLinearApi(api);
     if (!linearApi) {
       api.logger.error("No Linear access token — cannot triage new issue");
+      return true;
+    }
+
+    // Validate agent profiles
+    const profilesError = validateProfiles();
+    if (profilesError) {
+      api.logger.error("Agent profiles validation failed — cannot triage new issue");
+      try {
+        await createCommentWithDedup(linearApi, issue.id, profilesError);
+      } catch {}
       return true;
     }
 
