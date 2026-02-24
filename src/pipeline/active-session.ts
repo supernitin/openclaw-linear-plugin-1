@@ -2,7 +2,7 @@
  * active-session.ts — Idempotent registry of active Linear agent sessions.
  *
  * When the pipeline starts work on an issue, it registers the session here.
- * Any tool (code_run, etc.) can look up the active session for the current
+ * Any tool (cli_codex, cli_claude, etc.) can look up the active session for the current
  * issue to stream activities without relying on the LLM agent to pass params.
  *
  * This runs in the gateway process. Tool execution also happens in the gateway,
@@ -94,6 +94,24 @@ export function getCurrentSession(): ActiveSession | null {
     return sessions.values().next().value ?? null;
   }
   return null;
+}
+
+/**
+ * Look up the most recent active session for a given agent ID.
+ * When multiple sessions exist for the same agent, returns the most
+ * recently started one. This is the primary lookup for tool execution
+ * contexts where the agent ID is known but the issue isn't.
+ */
+export function getActiveSessionByAgentId(agentId: string): ActiveSession | null {
+  let best: ActiveSession | null = null;
+  for (const session of sessions.values()) {
+    if (session.agentId === agentId) {
+      if (!best || session.startedAt > best.startedAt) {
+        best = session;
+      }
+    }
+  }
+  return best;
 }
 
 /**

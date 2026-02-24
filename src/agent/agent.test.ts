@@ -228,7 +228,7 @@ describe("runAgent subprocess", () => {
     const noisyOutput = [
       "[plugins] Dispatch gateway methods registered",
       "[plugins] Linear agent extension registered (agent: zoe)",
-      '[plugins] code_run: default backend=codex, aliases={"claude":"claude"}',
+      '[plugins] cli tools registered: cli_codex, cli_claude, cli_gemini (agent default: cli_codex)',
       JSON.stringify({ payloads: [{ text: "clean response" }], meta: {} }),
     ].join("\n");
     (api.runtime.system as any).runCommandWithTimeout = vi.fn().mockResolvedValue({

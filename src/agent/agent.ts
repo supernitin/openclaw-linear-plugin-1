@@ -79,6 +79,8 @@ export async function runAgent(params: {
    * Subprocess fallback is blocked — only the embedded runner is safe.
    */
   readOnly?: boolean;
+  /** Additional tools to deny (merged with config + readOnly denies) */
+  toolsDeny?: string[];
 }): Promise<AgentRunResult> {
   const maxAttempts = 2;
 
@@ -138,8 +140,9 @@ async function runAgentOnce(params: {
   timeoutMs?: number;
   streaming?: AgentStreamCallbacks;
   readOnly?: boolean;
+  toolsDeny?: string[];
 }): Promise<AgentRunResult> {
-  const { api, agentId, sessionId, streaming, readOnly } = params;
+  const { api, agentId, sessionId, streaming, readOnly, toolsDeny } = params;
 
   // Inject current timestamp into every LLM request
   const message = `${buildDateContext()}\n\n${params.message}`;
@@ -153,7 +156,7 @@ async function runAgentOnce(params: {
   // Try embedded runner first (has streaming callbacks)
   if (streaming) {
     try {
-      return await runEmbedded(api, agentId, sessionId, message, timeoutMs, streaming, wdConfig.inactivityMs, readOnly);
+      return await runEmbedded(api, agentId, sessionId, message, timeoutMs, streaming, wdConfig.inactivityMs, readOnly, toolsDeny);
     } catch (err) {
       // Read-only mode MUST NOT fall back to subprocess — subprocess runs a
       // full agent with no way to enforce the tool deny policy.
@@ -211,11 +214,13 @@ async function runEmbedded(
   streaming: AgentStreamCallbacks,
   inactivityMs: number,
   readOnly?: boolean,
+  toolsDeny?: string[],
 ): Promise<AgentRunResult> {
   const ext = await getExtensionAPI();
 
   // Load config so we can resolve agent dirs and providers correctly.
-  let config = await api.runtime.config.loadConfig();
+  const origConfig = await api.runtime.config.loadConfig();
+  let config = origConfig;
   let configAny = config as Record<string, any>;
 
   // ── Read-only enforcement ──────────────────────────────────────────
@@ -229,6 +234,17 @@ async function runEmbedded(
     const existing: string[] = Array.isArray(configAny.tools.deny) ? configAny.tools.deny : [];
     configAny.tools.deny = [...new Set([...existing, ...READ_ONLY_DENY])];
     api.logger.info(`Read-only mode: tools.deny = [${configAny.tools.deny.join(", ")}]`);
+  }
+
+  // ── Additional toolsDeny entries ─────────────────────────────────────
+  if (toolsDeny?.length) {
+    if (config === origConfig) {
+      configAny = JSON.parse(JSON.stringify(origConfig));
+      config = configAny as typeof config;
+    }
+    if (!configAny.tools) configAny.tools = {};
+    const existing: string[] = Array.isArray(configAny.tools.deny) ? configAny.tools.deny : [];
+    configAny.tools.deny = [...new Set([...existing, ...toolsDeny])];
   }
 
   // Resolve workspace and agent dirs from config (ext API ignores agentId).
@@ -333,13 +349,30 @@ async function runEmbedded(
       const phase = String(data.phase ?? "");
       const toolName = String(data.name ?? "tool");
       const meta = typeof data.meta === "string" ? data.meta : "";
-      const input = typeof data.input === "string" ? data.input : "";
+      const rawInput = data.input;
+      const input = typeof rawInput === "string" ? rawInput : "";
+
+      // Parse structured input for richer detail on cli_* tools
+      let inputObj: Record<string, any> | null = null;
+      if (rawInput && typeof rawInput === "object") {
+        inputObj = rawInput as Record<string, any>;
+      } else if (input.startsWith("{")) {
+        try { inputObj = JSON.parse(input); } catch {}
+      }
 
       // Tool execution start — emit action with tool name + available context
       if (phase === "start") {
         lastToolAction = toolName;
-        const detail = input || meta || toolName;
-        emit({ type: "action", action: `Running ${toolName}`, parameter: detail.slice(0, 300) });
+
+        // cli_codex / cli_claude / cli_gemini: show working dir and prompt excerpt
+        if (toolName.startsWith("cli_") && inputObj) {
+          const prompt = String(inputObj.prompt ?? "").slice(0, 250);
+          const workDir = inputObj.workingDir ? ` in ${inputObj.workingDir}` : "";
+          emit({ type: "action", action: `Running ${toolName}${workDir}`, parameter: prompt });
+        } else {
+          const detail = input || meta || toolName;
+          emit({ type: "action", action: `Running ${toolName}`, parameter: detail.slice(0, 300) });
+        }
       }
 
       // Tool execution update — partial progress (keeps Linear UI alive for long tools)

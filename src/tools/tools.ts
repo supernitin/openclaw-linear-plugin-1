@@ -1,17 +1,18 @@
 import type { AnyAgentTool, OpenClawPluginApi } from "openclaw/plugin-sdk";
-import { createCodeTool } from "./code-tool.js";
+import { createCodeTools } from "./code-tool.js";
 import { createOrchestrationTools } from "./orchestration-tools.js";
 import { createLinearIssuesTool } from "./linear-issues-tool.js";
+import { createSteeringTools } from "./steering-tools.js";
 
 export function createLinearTools(api: OpenClawPluginApi, ctx: Record<string, unknown>): any[] {
   const pluginConfig = (api as any).pluginConfig as Record<string, unknown> | undefined;
 
-  // Unified code_run tool — dispatches to configured backend (claude/codex/gemini)
+  // Per-backend coding CLI tools: cli_codex, cli_claude, cli_gemini
   const codeTools: AnyAgentTool[] = [];
   try {
-    codeTools.push(createCodeTool(api, ctx));
+    codeTools.push(...createCodeTools(api, ctx));
   } catch (err) {
-    api.logger.warn(`code_run tool not available: ${err}`);
+    api.logger.warn(`CLI coding tools not available: ${err}`);
   }
 
   // Orchestration tools (conditional on config — defaults to enabled)
@@ -33,9 +34,21 @@ export function createLinearTools(api: OpenClawPluginApi, ctx: Record<string, un
     api.logger.warn(`linear_issues tool not available: ${err}`);
   }
 
+  // Steering tools (steer/capture/abort active tmux agent sessions)
+  const steeringTools: AnyAgentTool[] = [];
+  const enableTmux = pluginConfig?.enableTmux !== false;
+  if (enableTmux) {
+    try {
+      steeringTools.push(...createSteeringTools(api, ctx));
+    } catch (err) {
+      api.logger.warn(`Steering tools not available: ${err}`);
+    }
+  }
+
   return [
     ...codeTools,
     ...orchestrationTools,
     ...linearIssuesTools,
+    ...steeringTools,
   ];
 }

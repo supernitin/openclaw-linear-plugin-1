@@ -18,6 +18,9 @@ import { emitDiagnostic } from "../infra/observability.js";
 import { classifyIntent, type Intent } from "./intent-classify.js";
 import { extractGuidance, formatGuidanceAppendix, cacheGuidanceForTeam, getCachedGuidanceForTeam, isGuidanceEnabled, _resetGuidanceCacheForTesting } from "./guidance.js";
 import { loadAgentProfiles, buildMentionPattern, resolveAgentFromAlias, validateProfiles, _resetProfilesCacheForTesting, type AgentProfile } from "../infra/shared-profiles.js";
+import { getActiveTmuxSession } from "../infra/tmux-runner.js";
+import { capturePane } from "../infra/tmux.js";
+import { loadCodingConfig, resolveToolName } from "../tools/code-tool.js";
 
 // ── Prompt input sanitization ─────────────────────────────────────
 
@@ -96,6 +99,7 @@ function wasRecentlyProcessed(key: string): boolean {
 export function _resetForTesting(): void {
   activeRuns.clear();
   recentlyProcessed.clear();
+  recentlyEmittedActivities.clear();
   _resetProfilesCacheForTesting();
   linearApiCache = null;
   lastSweep = Date.now();
@@ -103,6 +107,36 @@ export function _resetForTesting(): void {
   _sweepIntervalMs = 10_000;
   _resetGuidanceCacheForTesting();
   _resetAffinityForTesting();
+}
+
+// ── Feedback loop prevention for steering ─────────────────────────────
+// Track recently emitted activity body hashes to prevent our own emissions
+// from triggering the steering handler.
+const recentlyEmittedActivities = new Map<string, number>();
+const EMITTED_TTL_MS = 30_000;
+
+function hashActivityBody(body: string): string {
+  // Simple fast hash — not crypto, just dedup
+  let hash = 0;
+  for (let i = 0; i < Math.min(body.length, 200); i++) {
+    hash = ((hash << 5) - hash + body.charCodeAt(i)) | 0;
+  }
+  return String(hash);
+}
+
+export function trackEmittedActivity(body: string): void {
+  const hash = hashActivityBody(body);
+  recentlyEmittedActivities.set(hash, Date.now());
+  // Prune entries older than TTL
+  const now = Date.now();
+  for (const [k, ts] of recentlyEmittedActivities) {
+    if (now - ts > EMITTED_TTL_MS) recentlyEmittedActivities.delete(k);
+  }
+}
+
+function wasRecentlyEmitted(body: string): boolean {
+  const hash = hashActivityBody(body);
+  return recentlyEmittedActivities.has(hash);
 }
 
 /** @internal — test-only; add an issue ID to the activeRuns set. */
@@ -428,15 +462,26 @@ export async function handleLinearWebhook(
       }
     }
 
-    api.logger.info(`AgentSession created: ${session.id} for issue ${issue?.identifier ?? issue?.id} agent=${agentId} (comments: ${previousComments.length}, guidance: ${guidanceCtx.guidance ? "yes" : "no"})`);
-
-    // Fetch full issue details
+    // Fetch full issue details (needed for team routing + description)
     let enrichedIssue: any = issue;
     try {
       enrichedIssue = await linearApi.getIssueDetails(issue.id);
     } catch (err) {
       api.logger.warn(`Could not fetch issue details: ${err}`);
     }
+
+    // Team-based agent routing: if no mention or affinity override, try team mapping
+    const teamKey = enrichedIssue?.team?.key as string | undefined;
+    if (!mentionOverride && agentId === resolveAgentId(api) && teamKey) {
+      const teamMappings = (pluginConfig as Record<string, unknown>)?.teamMappings as Record<string, any> | undefined;
+      const teamDefault = teamMappings?.[teamKey]?.defaultAgent;
+      if (typeof teamDefault === "string") {
+        api.logger.info(`AgentSession routed to ${teamDefault} via team mapping (${teamKey})`);
+        agentId = teamDefault;
+      }
+    }
+
+    api.logger.info(`AgentSession created: ${session.id} for issue ${issue?.identifier ?? issue?.id} agent=${agentId} team=${teamKey ?? "?"} (comments: ${previousComments.length}, guidance: ${guidanceCtx.guidance ? "yes" : "no"})`);
 
     const description = enrichedIssue?.description ?? issue?.description ?? "(no description)";
 
@@ -456,12 +501,13 @@ export async function handleLinearWebhook(
     const issueRef = enrichedIssue?.identifier ?? issue.identifier ?? issue.id;
     const stateType = enrichedIssue?.state?.type ?? "";
     const isTriaged = stateType === "started" || stateType === "completed" || stateType === "canceled";
+    const cliTool = resolveToolName(loadCodingConfig(), agentId);
 
     const toolAccessLines = isTriaged
       ? [
         `**Tool access:**`,
         `- \`linear_issues\` tool: Full access. Use action="read" with issueId="${issueRef}" to get details, action="create" to create issues (with parentIssueId to create sub-issues for granular work breakdown), action="update" with status/priority/labels/estimate to modify issues, action="comment" to post comments, action="list_states" to see available workflow states.`,
-        `- \`code_run\`: Dispatch coding work to a worker. Workers return text — they cannot access linear_issues.`,
+        `- \`${cliTool}\`: Dispatch coding work to a worker. Workers return text — they cannot access linear_issues.`,
         `- \`spawn_agent\`/\`ask_agent\`: Delegate to other crew agents.`,
         `- Standard tools: exec, read, edit, write, web_search, etc.`,
         ``,
@@ -470,14 +516,14 @@ export async function handleLinearWebhook(
       : [
         `**Tool access:**`,
         `- \`linear_issues\` tool: READ ONLY. Use action="read" with issueId="${issueRef}" to get details, action="list_states"/"list_labels" for metadata. Do NOT use action="update", action="create", or action="comment".`,
-        `- \`code_run\`: **Planning mode only.** Workers may explore code and write plan files (PLAN.md, design docs). Workers MUST NOT create, modify, or delete source code, run deployments, or make system changes. Use for codebase exploration and planning only.`,
+        `- \`${cliTool}\`: **Planning mode only.** Workers may explore code and write plan files (PLAN.md, design docs). Workers MUST NOT create, modify, or delete source code, run deployments, or make system changes. Use for codebase exploration and planning only.`,
         `- \`spawn_agent\`/\`ask_agent\`: Delegate to other crew agents.`,
         `- Standard tools: exec, read, edit, write, web_search, etc.`,
       ];
 
     const roleLines = isTriaged
-      ? [`**Your role:** Orchestrator with full Linear access. You can update issue fields, change status, and dispatch work via \`code_run\`. Do NOT post comments yourself — the handler posts your text output.`]
-      : [`**Your role:** You are the dispatcher. For any coding or implementation work, use \`code_run\` to dispatch it. Workers return text output. You summarize results. You do NOT update issue status or post comments via linear_issues — the audit system handles lifecycle transitions.`];
+      ? [`**Your role:** Orchestrator with full Linear access. You can update issue fields, change status, and dispatch work via \`${cliTool}\`. Do NOT post comments yourself — the handler posts your text output.`]
+      : [`**Your role:** You are the dispatcher. For any coding or implementation work, use \`${cliTool}\` to dispatch it. Workers return text output. You summarize results. You do NOT update issue status or post comments via linear_issues — the audit system handles lifecycle transitions.`];
 
     if (guidanceAppendix) {
       api.logger.info(`Guidance injected (${guidanceCtx.source}): ${guidanceCtx.guidance?.slice(0, 120)}...`);
@@ -530,10 +576,10 @@ export async function handleLinearWebhook(
       ``,
       `## Scope Rules`,
       `1. **Read the issue first.** The issue title + description define your scope. Everything you do must serve the issue as written.`,
-      `2. **\`code_run\` is ONLY for issue-body work.** Only dispatch \`code_run\` when the issue description contains implementation requirements. A greeting, question, or conversational issue gets a conversational response — NOT code_run.`,
-      `3. **Comments explore, issue body builds.** User comments may explore scope or ask questions but NEVER trigger \`code_run\` alone. If a comment requests new implementation, update the issue description first, then build from the issue text.`,
-      `4. **Plan before building.** For non-trivial work, respond with a plan first. Only dispatch \`code_run\` after the plan is clear and grounded in the issue body.`,
-      `5. **Match response to request.** Greeting → greet. Question → answer. No implementation requirements → no code_run.`,
+      `2. **\`${cliTool}\` is ONLY for issue-body work.** Only dispatch \`${cliTool}\` when the issue description contains implementation requirements. A greeting, question, or conversational issue gets a conversational response — NOT ${cliTool}.`,
+      `3. **Comments explore, issue body builds.** User comments may explore scope or ask questions but NEVER trigger \`${cliTool}\` alone. If a comment requests new implementation, update the issue description first, then build from the issue text.`,
+      `4. **Plan before building.** For non-trivial work, respond with a plan first. Only dispatch \`${cliTool}\` after the plan is clear and grounded in the issue body.`,
+      `5. **Match response to request.** Greeting → greet. Question → answer. No implementation requirements → no ${cliTool}.`,
       ``,
       `Respond within the scope defined above. Be concise and action-oriented.`,
     ].filter(Boolean).join("\n");
@@ -544,7 +590,7 @@ export async function handleLinearWebhook(
       const profiles = loadAgentProfiles();
       const label = profiles[agentId]?.label ?? agentId;
 
-      // Register active session for tool resolution (code_run, etc.)
+      // Register active session for tool resolution (cli_codex, etc.)
       // Also eagerly records affinity so follow-ups route to the same agent.
       setActiveSession({
         agentSessionId: session.id,
@@ -631,10 +677,45 @@ export async function handleLinearWebhook(
       return true;
     }
 
-    // If an agent run is already active for this issue, this is feedback from
-    // our own activity emissions — ignore to prevent loops.
+    // ── Steering gate: three-way routing during active runs ──
+    // 1. Filter our own emitted activities (feedback loop prevention)
+    const activityType = activity?.content?.type;
+    const activityBody = activity?.content?.body ?? activity?.body ?? "";
+    const isOurFeedback =
+      activityType === "thought" ||
+      activityType === "action" ||
+      activityType === "response" ||
+      activityType === "error" ||
+      activityType === "elicitation" ||
+      (typeof activityBody === "string" && wasRecentlyEmitted(activityBody));
+    if (isOurFeedback) {
+      api.logger.info(`AgentSession prompted: ${session.id} — feedback from own activity (${activityType ?? "hash-match"}), ignoring`);
+      return true;
+    }
+
+    // 2. If active dispatch with tmux session → route to steering orchestrator
+    const tmuxSession = getActiveTmuxSession(issue.id);
+    if (tmuxSession) {
+      const userText = activityBody;
+      if (!userText || typeof userText !== "string" || !userText.trim()) {
+        api.logger.info(`AgentSession prompted: ${session.id} — tmux active but empty user message, ignoring`);
+        return true;
+      }
+
+      api.logger.info(`AgentSession prompted: ${session.id} issue=${issue?.identifier ?? issue?.id} — routing to steering orchestrator (${tmuxSession.backend})`);
+      void handleSteeringInput(api, {
+        session,
+        issue,
+        userMessage: userText,
+        tmuxSession,
+        pluginConfig: pluginConfig as Record<string, unknown> | undefined,
+      });
+      return true;
+    }
+
+    // 3. No tmux session but active run → existing behavior (ignore feedback)
     if (activeRuns.has(issue.id)) {
-      api.logger.info(`AgentSession prompted: ${session.id} issue=${issue?.identifier ?? issue?.id} — agent active, ignoring (feedback)`);
+      api.logger.info(`AgentSession prompted: ${session.id} issue=${issue?.identifier ?? issue?.id} — agent active, no tmux, ignoring (feedback)`);
       return true;
     }
 
@@ -735,12 +816,13 @@ export async function handleLinearWebhook(
       const followUpIssueRef = enrichedIssue?.identifier ?? issue.identifier ?? issue.id;
       const followUpStateType = enrichedIssue?.state?.type ?? "";
       const followUpIsTriaged = followUpStateType === "started" || followUpStateType === "completed" || followUpStateType === "canceled";
+      const followUpCliTool = resolveToolName(loadCodingConfig(), agentId);
 
       const followUpToolAccessLines = followUpIsTriaged
         ? [
           `**Tool access:**`,
           `- \`linear_issues\` tool: Full access. Use action="read" with issueId="${followUpIssueRef}" to get details, action="create" to create issues (with parentIssueId to create sub-issues for granular work breakdown), action="update" with status/priority/labels/estimate to modify issues, action="comment" to post comments, action="list_states" to see available workflow states.`,
-          `- \`code_run\`: Dispatch coding work to a worker. Workers return text — they cannot access linear_issues.`,
+          `- \`${followUpCliTool}\`: Dispatch coding work to a worker. Workers return text — they cannot access linear_issues.`,
           `- \`spawn_agent\`/\`ask_agent\`: Delegate to other crew agents.`,
           `- Standard tools: exec, read, edit, write, web_search, etc.`,
           ``,
@@ -749,14 +831,14 @@ export async function handleLinearWebhook(
         : [
           `**Tool access:**`,
           `- \`linear_issues\` tool: READ ONLY. Use action="read" with issueId="${followUpIssueRef}" to get details, action="list_states"/"list_labels" for metadata. Do NOT use action="update", action="create", or action="comment".`,
-          `- \`code_run\`: **Planning mode only.** Workers may explore code and write plan files (PLAN.md, design docs). Workers MUST NOT create, modify, or delete source code, run deployments, or make system changes. Use for codebase exploration and planning only.`,
+          `- \`${followUpCliTool}\`: **Planning mode only.** Workers may explore code and write plan files (PLAN.md, design docs). Workers MUST NOT create, modify, or delete source code, run deployments, or make system changes. Use for codebase exploration and planning only.`,
           `- \`spawn_agent\`/\`ask_agent\`: Delegate to other crew agents.`,
           `- Standard tools: exec, read, edit, write, web_search, etc.`,
         ];
 
       const followUpRoleLines = followUpIsTriaged
-        ? [`**Your role:** Orchestrator with full Linear access. You can update issue fields, change status, and dispatch work via \`code_run\`. Do NOT post comments yourself — the handler posts your text output.`]
-        : [`**Your role:** Dispatcher. For work requests, use \`code_run\`. You do NOT update issue status — the audit system handles lifecycle.`];
+        ? [`**Your role:** Orchestrator with full Linear access. You can update issue fields, change status, and dispatch work via \`${followUpCliTool}\`. Do NOT post comments yourself — the handler posts your text output.`]
+        : [`**Your role:** Dispatcher. For work requests, use \`${followUpCliTool}\`. You do NOT update issue status — the audit system handles lifecycle.`];
 
       if (followUpGuidanceAppendix) {
         api.logger.info(`Follow-up guidance injected: ${(guidanceCtxPrompted.guidance ?? "cached").slice(0, 120)}...`);
@@ -811,7 +893,7 @@ export async function handleLinearWebhook(
         ``,
         `## Scope Rules`,
         `1. **The issue body is your scope.** Re-read the description above before acting.`,
-        `2. **Comments explore, issue body builds.** The follow-up may refine understanding or ask questions — NEVER dispatch \`code_run\` from a comment alone. If the user requests implementation, suggest updating the issue description first.`,
+        `2. **Comments explore, issue body builds.** The follow-up may refine understanding or ask questions — NEVER dispatch \`${followUpCliTool}\` from a comment alone. If the user requests implementation, suggest updating the issue description first.`,
         `3. **Match response to request.** Answer questions with answers. Do NOT escalate conversational messages into builds.`,
         ``,
         `Respond to the follow-up within the scope defined above. Be concise and action-oriented.`,
@@ -1579,12 +1661,13 @@ async function dispatchCommentToAgent(
   const issueRef = enrichedIssue?.identifier ?? issue.identifier ?? issue.id;
   const stateType = enrichedIssue?.state?.type ?? "";
   const isTriaged = stateType === "started" || stateType === "completed" || stateType === "canceled";
+  const cliTool = resolveToolName(loadCodingConfig(), agentId);
 
   const toolAccessLines = isTriaged
     ? [
       `**Tool access:**`,
       `- \`linear_issues\` tool: Full access. Use action="read" with issueId="${issueRef}" to get details, action="create" to create issues (with parentIssueId to create sub-issues for granular work breakdown), action="update" with status/priority/labels/estimate to modify issues, action="comment" to post comments, action="list_states" to see available workflow states.`,
-      `- \`code_run\`: Dispatch coding work to a worker. Workers return text — they cannot access linear_issues.`,
+      `- \`${cliTool}\`: Dispatch coding work to a worker. Workers return text — they cannot access linear_issues.`,
       `- Standard tools: exec, read, edit, write, web_search, etc.`,
       ``,
       `**Sub-issue guidance:** When a task is too large or has multiple distinct parts, break it into sub-issues using action="create" with parentIssueId="${issueRef}". Each sub-issue should be an atomic, independently testable unit of work with its own acceptance criteria. This enables parallel dispatch and clearer progress tracking.`,
@@ -1592,13 +1675,13 @@ async function dispatchCommentToAgent(
     : [
       `**Tool access:**`,
       `- \`linear_issues\` tool: READ ONLY. Use action="read" with issueId="${issueRef}" to get details, action="list_states"/"list_labels" for metadata. Do NOT use action="update", action="create", or action="comment".`,
-      `- \`code_run\`: **Planning mode only.** Workers may explore code and write plan files (PLAN.md, design docs). Workers MUST NOT create, modify, or delete source code, run deployments, or make system changes. Use for codebase exploration and planning only.`,
+      `- \`${cliTool}\`: **Planning mode only.** Workers may explore code and write plan files (PLAN.md, design docs). Workers MUST NOT create, modify, or delete source code, run deployments, or make system changes. Use for codebase exploration and planning only.`,
       `- Standard tools: exec, read, edit, write, web_search, etc.`,
     ];
 
   const roleLines = isTriaged
-    ? [`**Your role:** Orchestrator with full Linear access. You can update issue fields, change status, and dispatch work via \`code_run\`. Do NOT post comments yourself — the handler posts your text output.`]
-    : [`**Your role:** Dispatcher. For work requests, use \`code_run\`. You do NOT update issue status — the audit system handles lifecycle.`];
+    ? [`**Your role:** Orchestrator with full Linear access. You can update issue fields, change status, and dispatch work via \`${cliTool}\`. Do NOT post comments yourself — the handler posts your text output.`]
+    : [`**Your role:** Dispatcher. For work requests, use \`${cliTool}\`. You do NOT update issue status — the audit system handles lifecycle.`];
 
   const message = [
     `You are an orchestrator responding to a Linear comment. Your text output will be automatically posted as a comment on the issue (do NOT post a comment yourself — the handler does it).`,
@@ -1620,10 +1703,10 @@ async function dispatchCommentToAgent(
     ``,
     `## Scope Rules`,
     `1. **Read the issue first.** The issue title + description define your scope. Everything you do must serve the issue as written.`,
-    `2. **\`code_run\` is ONLY for issue-body work.** Only dispatch \`code_run\` when the issue description contains implementation requirements. A greeting, question, or conversational issue gets a conversational response — NOT code_run.`,
-    `3. **Comments explore, issue body builds.** The comment above may explore scope or ask questions but NEVER trigger \`code_run\` from a comment alone. If the comment requests new implementation, suggest updating the issue description or creating a new issue.`,
-    `4. **Plan before building.** For non-trivial work, respond with a plan first. Only dispatch \`code_run\` after the plan is clear and grounded in the issue body.`,
-    `5. **Match response to request.** Greeting → greet. Question → answer. No implementation requirements in the issue body → no code_run.`,
+    `2. **\`${cliTool}\` is ONLY for issue-body work.** Only dispatch \`${cliTool}\` when the issue description contains implementation requirements. A greeting, question, or conversational issue gets a conversational response — NOT ${cliTool}.`,
+    `3. **Comments explore, issue body builds.** The comment above may explore scope or ask questions but NEVER trigger \`${cliTool}\` from a comment alone. If the comment requests new implementation, suggest updating the issue description or creating a new issue.`,
+    `4. **Plan before building.** For non-trivial work, respond with a plan first. Only dispatch \`${cliTool}\` after the plan is clear and grounded in the issue body.`,
+    `5. **Match response to request.** Greeting → greet. Question → answer. No implementation requirements in the issue body → no ${cliTool}.`,
     ``,
     `Respond within the scope defined above. Be concise and action-oriented.`,
     commentGuidanceAppendix,
@@ -1973,9 +2056,11 @@ async function handleDispatch(
 
   const labels = enrichedIssue.labels?.nodes?.map((l: any) => l.name) ?? [];
   const commentCount = enrichedIssue.comments?.nodes?.length ?? 0;
+  const dispatchTeamKey = enrichedIssue?.team?.key as string | undefined;
 
-  // Resolve repos for this dispatch (issue body markers, labels, or config default)
-  const repoResolution = resolveRepos(enrichedIssue.description, labels, pluginConfig);
+  // Resolve repos for this dispatch (issue body markers → labels → team mapping → config default)
+  const repoResolution = resolveRepos(enrichedIssue.description, labels, pluginConfig, dispatchTeamKey);
+  api.logger.info(`@dispatch: ${identifier} team=${dispatchTeamKey ?? "none"} repos=${repoResolution.repos.map(r => r.name).join(",")} source=${repoResolution.source}`);
 
   // 4. Assess complexity tier
   const assessment = await assessTier(api, {
@@ -2092,6 +2177,20 @@ async function handleDispatch(
     worktrees,
   }, statePath);
 
+  // 7b. Linear state transition: set issue to "In Progress" (best-effort)
+  if (enrichedIssue?.team?.id) {
+    try {
+      const teamStates = await linearApi.getTeamStates(enrichedIssue.team.id);
+      const inProgress = teamStates.find((s: any) => s.type === "started");
+      if (inProgress) {
+        await linearApi.updateIssue(issue.id, { stateId: inProgress.id });
+        api.logger.info(`@dispatch: ${identifier} → ${inProgress.name} (In Progress)`);
+      }
+    } catch (err) {
+      api.logger.warn(`@dispatch: ${identifier} — failed to set In Progress state: ${err}`);
+    }
+  }
+
   // 8. Register active session for tool resolution
   setActiveSession({
     agentSessionId: agentSessionId ?? "",
@@ -2193,4 +2292,146 @@ async function handleDispatch(
       activeRuns.delete(issue.id);
       clearActiveSession(issue.id);
     });
+}
+
+// ── Steering handler ──────────────────────────────────────────────
+//
+// Handle user input during an active tmux-wrapped dispatch.
+// Routes to a short orchestrator agent session that can steer, capture, or abort.
+
+async function handleSteeringInput(
+  api: OpenClawPluginApi,
+  ctx: {
+    session: any;
+    issue: any;
+    userMessage: string;
+    tmuxSession: { sessionName: string; backend: string; issueIdentifier: string; issueId: string; steeringMode: string };
+    pluginConfig?: Record<string, unknown>;
+  },
+): Promise<void> {
+  const { session, issue, userMessage, tmuxSession, pluginConfig } = ctx;
+
+  const linearApi = createLinearApi(api);
+  if (!linearApi) {
+    api.logger.error("handleSteeringInput: no Linear API");
+    return;
+  }
+
+  // 1. Capture recent coding agent output for context
+  let agentOutput = "";
+  try {
+    agentOutput = capturePane(tmuxSession.sessionName, 50);
+  } catch (err) {
+    api.logger.warn(`handleSteeringInput: capturePane failed: ${err}`);
+  }
+
+  // 2. Read dispatch state for context
+  let dispatchCtx = "";
+  try {
+    const state = await readDispatchState(pluginConfig?.dispatchStatePath as string | undefined);
+    const dispatch = getActiveDispatch(state, tmuxSession.issueIdentifier);
+    if (dispatch) {
+      dispatchCtx = [
+        `Worktree: ${dispatch.worktreePath}`,
+        `Attempt: ${dispatch.attempt} | Status: ${dispatch.status}`,
+        `Tier: ${dispatch.tier}`,
+      ].join("\n");
+    }
+  } catch { /* proceed without dispatch context */ }
+
+  // 3. Build steering prompt
+  const prompt = [
+    `You are a steering orchestrator. A ${tmuxSession.backend} coding agent is currently ` +
+    `working on issue ${tmuxSession.issueIdentifier}. The user just sent a message in the Linear session.`,
+    ``,
+    `## Issue Context`,
+    `**${tmuxSession.issueIdentifier}**: ${issue?.title ?? "(untitled)"}`,
+    dispatchCtx || `Backend: ${tmuxSession.backend}`,
+    `Steering mode: ${tmuxSession.steeringMode}`,
+    ``,
+    `## Recent Agent Output (last 50 lines)`,
+    "```",
+    agentOutput || "(no output captured)",
+    "```",
+    ``,
+    `## User's Message`,
+    `> ${sanitizePromptInput(userMessage, 2000)}`,
+    ``,
+    `## Your Decision`,
+    `Analyze the user's message in the context of what the coding agent is doing.`,
+    ``,
+    `**Use \`steer_agent\`** (issueId="${issue.id}") if the user is:`,
+    `- Providing information the agent needs (docs location, tool name, API details)`,
+    `- Answering a question the agent asked`,
+    `- Redirecting the agent's approach ("focus on X first", "use library Y")`,
+    `→ Craft a PRECISE, actionable message. Don't forward raw user text.`,
+    `  Translate vague input into clear instructions with file paths, code refs, etc.`,
+    tmuxSession.steeringMode === "one-shot"
+      ? `⚠️ WARNING: ${tmuxSession.backend} is in ONE-SHOT mode — steer_agent will fail. You can only abort or respond directly.`
+      : "",
+    ``,
+    `**Use \`capture_agent_output\`** (issueId="${issue.id}") if you need more context before deciding.`,
+    ``,
+    `**Use \`abort_agent\`** (issueId="${issue.id}") if the user wants to stop/cancel the run.`,
+    ``,
+    `**Respond directly (just output text)** if the user is:`,
+    `- Asking a status question ("what's it doing?", "how far along?")`,
+    `- Making a request for you, not the coding agent`,
+    ``,
+    `Be fast and decisive. This is a mid-task steering call, not a conversation.`,
+  ].filter(Boolean).join("\n");
+
+  // 4. Emit acknowledgment
+  const ackBody = `Processing your input while ${tmuxSession.backend} agent is working...`;
+  trackEmittedActivity(ackBody);
+  await linearApi.emitActivity(session.id, {
+    type: "thought",
+    body: ackBody,
+  }).catch(() => {});
+
+  // 5. Run SHORT orchestrator session (60s timeout)
+  try {
+    const { runAgent } = await import("../agent/agent.js");
+    const result = await runAgent({
+      api,
+      agentId: resolveAgentId(api),
+      sessionId: `linear-steer-${session.id}-${Date.now()}`,
+      message: prompt,
+      timeoutMs: 60_000,
+      streaming: { linearApi, agentSessionId: session.id },
+      toolsDeny: [
+        "cli_codex",
+        "cli_claude",
+        "cli_gemini",
+        "dispatch_history",
+        "plan_audit",
+        "plan_create_issue",
+        "plan_link_issues",
+        "plan_update_issue",
+        "write",
+        "edit",
+        "apply_patch",
+        "spawn_agent",
+        "ask_agent",
+      ],
+    });
+
+    // 6. Post response if orchestrator responded directly (not via tool)
+    if (result.success && result.output.trim()) {
+      const responseBody = result.output;
+      trackEmittedActivity(responseBody);
+      await linearApi.emitActivity(session.id, {
+        type: "response",
+        body: responseBody,
+      }).catch(() => {});
+    }
+  } catch (err) {
+    api.logger.error(`handleSteeringInput error: ${err}`);
+    const errBody = `Steering failed: ${String(err).slice(0, 300)}`;
+    trackEmittedActivity(errBody);
+    await linearApi.emitActivity(session.id, {
+      type: "error",
+      body: errBody,
+    }).catch(() => {});
+  }
 }
