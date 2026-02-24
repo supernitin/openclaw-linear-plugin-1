@@ -17,7 +17,46 @@
       "codexBaseRepo": { "type": "string", "description": "Path to git repo for Codex worktrees", "default": "/home/claw/ai-workspace" },
       "enableOrchestration": { "type": "boolean", "description": "Allow agents to spawn sub-agents via spawn_agent/ask_agent tools", "default": true },
       "worktreeBaseDir": { "type": "string", "description": "Base directory for persistent git worktrees (default: ~/.openclaw/worktrees)" },
-      "repos": { "type": "object", "description": "Multi-repo map (name → path, e.g. {\"api\": \"/home/claw/api\", \"frontend\": \"/home/claw/frontend\"})", "additionalProperties": { "type": "string" } },
+      "repos": {
+        "type": "object",
+        "description": "Multi-repo map — each key is a repo name, value is a path string or object with path + GitHub identity",
+        "additionalProperties": {
+          "oneOf": [
+            { "type": "string", "description": "Filesystem path (backward compat)" },
+            {
+              "type": "object",
+              "required": ["path"],
+              "properties": {
+                "path": { "type": "string", "description": "Absolute filesystem path to git repo" },
+                "github": { "type": "string", "description": "GitHub owner/repo (e.g. 'calltelemetry/cisco-cdr')" },
+                "hostname": { "type": "string", "description": "Git host (default: 'github.com')", "default": "github.com" }
+              }
+            }
+          ]
+        }
+      },
+      "teamMappings": {
+        "type": "object",
+        "description": "Map Linear team keys to repos, agents, and team-specific context",
+        "additionalProperties": {
+          "type": "object",
+          "properties": {
+            "repos": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Repo names (keys in 'repos' config) for this team"
+            },
+            "defaultAgent": {
+              "type": "string",
+              "description": "OpenClaw agent ID to handle issues from this team"
+            },
+            "context": {
+              "type": "string",
+              "description": "Extra context injected into worker/audit prompts for this team"
+            }
+          }
+        }
+      },
       "dispatchStatePath": { "type": "string", "description": "Path to dispatch state JSON file (default: ~/.openclaw/linear-dispatch-state.json)" },
       "planningStatePath": { "type": "string", "description": "Path to planning state JSON file (default: ~/.openclaw/linear-planning-state.json)" },
       "notifications": {
@@ -61,7 +100,10 @@
       "toolTimeoutSec": { "type": "number", "description": "Max runtime for a single code_run CLI invocation in seconds (default: 600)", "default": 600 },
       "claudeApiKey": { "type": "string", "description": "Anthropic API key for Claude CLI backend (passed as ANTHROPIC_API_KEY env var)", "sensitive": true },
       "enableGuidance": { "type": "boolean", "description": "Inject Linear workspace/team guidance into agent prompts (default: true)", "default": true },
-      "teamGuidanceOverrides": { "type": "object", "description": "Per-team guidance toggle. Key = Linear team ID, value = boolean. Unset teams inherit enableGuidance.", "additionalProperties": { "type": "boolean" } }
+      "teamGuidanceOverrides": { "type": "object", "description": "Per-team guidance toggle. Key = Linear team ID, value = boolean. Unset teams inherit enableGuidance.", "additionalProperties": { "type": "boolean" } },
+      "enableTmux": { "type": "boolean", "default": true, "description": "Enable tmux wrapping for code_run CLI backends (enables steering)" },
+      "enableRetro": { "type": "boolean", "default": true, "description": "Enable post-task retrospective analysis" },
+      "retroDir": { "type": "string", "description": "Override path for coding retrospective files (default: {stateDir}/shared/coding)" }
     }
   }
 }

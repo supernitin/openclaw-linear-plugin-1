@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, type Mock } from "vitest";
-import { resolveLinearToken, LinearAgentApi, AUTH_PROFILES_PATH } from "./linear-api.js";
+import { resolveLinearToken, LinearAgentApi, AUTH_PROFILES_PATH, refreshTokenProactively } from "./linear-api.js";
 
 // ---------------------------------------------------------------------------
 // Mocks
@@ -619,5 +619,192 @@ describe("LinearAgentApi", () => {
       expect(result.error).toBeDefined();
       expect(result.error).toContain("Linear API 500");
     });
+  });
+});
+
+// ===========================================================================
+// refreshTokenProactively
+// ===========================================================================
+
+describe("refreshTokenProactively", () => {
+  beforeEach(() => {
+    delete process.env.LINEAR_CLIENT_ID;
+    delete process.env.LINEAR_CLIENT_SECRET;
+  });
+
+  it("skips refresh when token is still valid (not near expiry)", async () => {
+    const profileStore = {
+      profiles: {
+        "linear:default": {
+          accessToken: "still-good",
+          refreshToken: "r-tok",
+          expiresAt: Date.now() + 10 * 3_600_000, // 10 hours from now
+        },
+      },
+    };
+    mockReadFileSync.mockReturnValue(JSON.stringify(profileStore));
+
+    const result = await refreshTokenProactively({ clientId: "cid", clientSecret: "csecret" });
+
+    expect(result.refreshed).toBe(false);
+    expect(result.reason).toBe("token still valid");
+  });
+
+  it("skips refresh when credentials are missing", async () => {
+    const profileStore = {
+      profiles: {
+        "linear:default": {
+          accessToken: "expired-tok",
+          refreshToken: "r-tok",
+          expiresAt: Date.now() - 1000, // expired
+        },
+      },
+    };
+    mockReadFileSync.mockReturnValue(JSON.stringify(profileStore));
+
+    // No clientId or clientSecret provided
+    const result = await refreshTokenProactively();
+
+    expect(result.refreshed).toBe(false);
+    expect(result.reason).toContain("missing credentials");
+  });
+
+  it("skips refresh when auth-profiles.json is not readable", async () => {
+    // Default mockReadFileSync throws ENOENT (from outer beforeEach)
+
+    const result = await refreshTokenProactively();
+
+    expect(result.refreshed).toBe(false);
+    expect(result.reason).toBe("auth-profiles.json not readable");
+  });
+
+  it("skips refresh when no linear:default profile exists", async () => {
+    mockReadFileSync.mockReturnValue(JSON.stringify({ profiles: {} }));
+
+    const result = await refreshTokenProactively();
+
+    expect(result.refreshed).toBe(false);
+    expect(result.reason).toBe("no linear:default profile found");
+  });
+
+  it("refreshes expired token and persists to file", async () => {
+    const profileStore = {
+      profiles: {
+        "linear:default": {
+          accessToken: "old-tok",
+          access: "old-tok",
+          refreshToken: "old-refresh",
+          refresh: "old-refresh",
+          expiresAt: Date.now() - 1000, // expired
+          expires: Date.now() - 1000,
+        },
+      },
+    };
+    mockReadFileSync.mockReturnValue(JSON.stringify(profileStore));
+
+    mockRefreshLinearToken.mockResolvedValue({
+      access_token: "proactive-new-tok",
+      refresh_token: "proactive-new-refresh",
+      expires_in: 3600,
+    });
+
+    const result = await refreshTokenProactively({ clientId: "cid", clientSecret: "csecret" });
+
+    expect(result.refreshed).toBe(true);
+    expect(result.reason).toBe("token refreshed successfully");
+
+    // Verify refreshLinearToken was called with correct args
+    // (may have stale calls from outer tests, so check the latest call)
+    const calls = mockRefreshLinearToken.mock.calls;
+    const lastCall = calls[calls.length - 1];
+    expect(lastCall).toEqual(["cid", "csecret", "old-refresh"]);
+
+    // Verify it wrote back to the file
+    const writeCalls = mockWriteFileSync.mock.calls;
+    expect(writeCalls.length).toBeGreaterThanOrEqual(1);
+    // Get the LAST write call (which is ours)
+    const lastWrite = writeCalls[writeCalls.length - 1];
+    expect(lastWrite[0]).toBe(AUTH_PROFILES_PATH);
+    const writtenData = JSON.parse(lastWrite[1]);
+    const profile = writtenData.profiles["linear:default"];
+    // Tokens should NOT be the old values
+    expect(profile.accessToken).not.toBe("old-tok");
+    expect(profile.refreshToken).not.toBe("old-refresh");
+    // accessToken and access should match each other
+    expect(profile.accessToken).toBe(profile.access);
+    expect(profile.refreshToken).toBe(profile.refresh);
+    expect(profile.expiresAt).toBeGreaterThan(Date.now());
+    expect(profile.expiresAt).toBe(profile.expires);
+  });
+
+  it("refreshes token that is within the 1-hour buffer", async () => {
+    const profileStore = {
+      profiles: {
+        "linear:default": {
+          accessToken: "almost-expired-tok",
+          refreshToken: "r-tok",
+          expiresAt: Date.now() + 30 * 60 * 1000, // 30 min from now (within 1h buffer)
+        },
+      },
+    };
+    mockReadFileSync.mockReturnValue(JSON.stringify(profileStore));
+
+    mockRefreshLinearToken.mockResolvedValue({
+      access_token: "buffer-refreshed-tok",
+      expires_in: 3600,
+    });
+
+    const result = await refreshTokenProactively({ clientId: "cid", clientSecret: "csecret" });
+
+    expect(result.refreshed).toBe(true);
+    expect(result.reason).toBe("token refreshed successfully");
+  });
+
+  it("propagates refresh error to caller", async () => {
+    const profileStore = {
+      profiles: {
+        "linear:default": {
+          accessToken: "expired-tok",
+          refreshToken: "bad-refresh",
+          expiresAt: Date.now() - 1000,
+        },
+      },
+    };
+    mockReadFileSync.mockReturnValue(JSON.stringify(profileStore));
+
+    mockRefreshLinearToken.mockRejectedValue(new Error("Linear token refresh failed (400): invalid_grant"));
+
+    await expect(
+      refreshTokenProactively({ clientId: "cid", clientSecret: "csecret" }),
+    ).rejects.toThrow(/Linear token refresh failed/);
+  });
+
+  it("uses env vars when pluginConfig credentials are missing", async () => {
+    const profileStore = {
+      profiles: {
+        "linear:default": {
+          accessToken: "expired-tok",
+          refreshToken: "r-tok",
+          expiresAt: Date.now() - 1000,
+        },
+      },
+    };
+    mockReadFileSync.mockReturnValue(JSON.stringify(profileStore));
+
+    process.env.LINEAR_CLIENT_ID = "env-cid";
+    process.env.LINEAR_CLIENT_SECRET = "env-csecret";
+
+    mockRefreshLinearToken.mockResolvedValue({
+      access_token: "env-refreshed",
+      expires_in: 3600,
+    });
+
+    const result = await refreshTokenProactively(); // no pluginConfig
+
+    expect(result.refreshed).toBe(true);
+    // Verify env vars were used
+    const calls = mockRefreshLinearToken.mock.calls;
+    const lastCall = calls[calls.length - 1];
+    expect(lastCall).toEqual(["env-cid", "env-csecret", "r-tok"]);
   });
 });

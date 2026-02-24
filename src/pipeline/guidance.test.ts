@@ -6,6 +6,7 @@ import {
   getCachedGuidanceForTeam,
   formatGuidanceAppendix,
   isGuidanceEnabled,
+  resolveGuidance,
   _resetGuidanceCacheForTesting,
 } from "./guidance.js";
 
@@ -218,5 +219,57 @@ describe("isGuidanceEnabled", () => {
   it("works with undefined teamId", () => {
     expect(isGuidanceEnabled({ enableGuidance: false }, undefined)).toBe(false);
     expect(isGuidanceEnabled({ enableGuidance: true }, undefined)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveGuidance
+// ---------------------------------------------------------------------------
+
+describe("resolveGuidance", () => {
+  it("extracts guidance from webhook payload and caches it", () => {
+    const result = resolveGuidance("team-1", { guidance: "Use TypeScript." });
+    expect(result).toBe("Use TypeScript.");
+    // Should also be cached now
+    expect(getCachedGuidanceForTeam("team-1")).toBe("Use TypeScript.");
+  });
+
+  it("falls back to cache when payload has no guidance", () => {
+    cacheGuidanceForTeam("team-1", "Cached guidance");
+    const result = resolveGuidance("team-1", {});
+    expect(result).toBe("Cached guidance");
+  });
+
+  it("returns null when no guidance anywhere", () => {
+    const result = resolveGuidance("team-1", {});
+    expect(result).toBeNull();
+  });
+
+  it("returns null when guidance is disabled for team", () => {
+    cacheGuidanceForTeam("team-1", "Should be ignored");
+    const config = { teamGuidanceOverrides: { "team-1": false } };
+    const result = resolveGuidance("team-1", { guidance: "Direct guidance" }, config);
+    expect(result).toBeNull();
+  });
+
+  it("returns null when teamId is undefined and no payload guidance", () => {
+    const result = resolveGuidance(undefined, {});
+    expect(result).toBeNull();
+  });
+
+  it("extracts from payload even with undefined teamId", () => {
+    const result = resolveGuidance(undefined, { guidance: "Global guidance" });
+    expect(result).toBe("Global guidance");
+  });
+
+  it("returns null when payload is null and cache is empty", () => {
+    const result = resolveGuidance("team-1", null);
+    expect(result).toBeNull();
+  });
+
+  it("uses cached guidance when payload is null", () => {
+    cacheGuidanceForTeam("team-1", "Cached");
+    const result = resolveGuidance("team-1", null);
+    expect(result).toBe("Cached");
   });
 });

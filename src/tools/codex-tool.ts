@@ -1,17 +1,22 @@
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
+import path from "node:path";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import type { ActivityContent } from "../api/linear-api.js";
 import {
   buildLinearApi,
   resolveSession,
   extractPrompt,
-  DEFAULT_TIMEOUT_MS,
   DEFAULT_BASE_REPO,
+  formatActivityLogLine,
+  createProgressEmitter,
   type CliToolParams,
   type CliResult,
+  type OnProgressUpdate,
 } from "./cli-shared.js";
 import { InactivityWatchdog, resolveWatchdogConfig } from "../agent/watchdog.js";
+import { isTmuxAvailable, buildSessionName, shellEscape } from "../infra/tmux.js";
+import { runInTmux } from "../infra/tmux-runner.js";
 
 const CODEX_BIN = "codex";
 
@@ -51,7 +56,7 @@ function mapCodexEventToActivity(event: any): ActivityContent | null {
     const cleaned = typeof cmd === "string"
       ? cmd.replace(/^\/usr\/bin\/\w+ -lc ['"]?/, "").replace(/['"]?$/, "")
       : JSON.stringify(cmd);
-    const truncated = output.length > 500 ? output.slice(0, 500) + "..." : output;
+    const truncated = output.length > 1000 ? output.slice(0, 1000) + "..." : output;
     return {
       type: "action",
       action: `${cleaned.slice(0, 150)}`,
@@ -63,7 +68,8 @@ function mapCodexEventToActivity(event: any): ActivityContent | null {
   if (eventType === "item.completed" && item?.type === "file_changes") {
     const files = item.files ?? [];
     const fileList = Array.isArray(files) ? files.join(", ") : String(files);
-    return { type: "action", action: "Modified files", parameter: fileList || "unknown files" };
+    const preview = (item.diff ?? item.content ?? "").slice(0, 500) || undefined;
+    return { type: "action", action: "Modified files", parameter: fileList || "unknown files", result: preview };
   }
 
   if (eventType === "turn.completed") {
@@ -87,6 +93,7 @@ export async function runCodex(
   api: OpenClawPluginApi,
   params: CliToolParams,
   pluginConfig?: Record<string, unknown>,
+  onUpdate?: OnProgressUpdate,
 ): Promise<CliResult> {
   api.logger.info(`codex_run params: ${JSON.stringify(params).slice(0, 500)}`);
 
@@ -100,7 +107,7 @@ export async function runCodex(
   }
 
   const { model, timeoutMs } = params;
-  const { agentSessionId, issueIdentifier } = resolveSession(params);
+  const { agentSessionId, issueId, issueIdentifier } = resolveSession(params);
 
   api.logger.info(`codex_run: session=${agentSessionId ?? "none"}, issue=${issueIdentifier ?? "none"}`);
 
@@ -127,11 +134,50 @@ export async function runCodex(
   args.push("-C", workingDir);
   args.push(prompt);
 
-  api.logger.info(`Codex exec: ${CODEX_BIN} ${args.join(" ").slice(0, 200)}...`);
+  const fullCommand = `${CODEX_BIN} ${args.join(" ")}`;
+  api.logger.info(`Codex exec: ${fullCommand.slice(0, 200)}...`);
 
+  const progressHeader = `[codex] ${workingDir}\n$ ${fullCommand.slice(0, 500)}\n\nPrompt: ${prompt}`;
+
+  // --- tmux path: run inside a tmux session with pipe-pane streaming ---
+  const tmuxEnabled = pluginConfig?.enableTmux !== false;
+  if (tmuxEnabled && isTmuxAvailable()) {
+    const sessionName = buildSessionName(issueIdentifier ?? "unknown", "codex", 0);
+    const tmuxIssueId = issueId ?? sessionName;
+    const modelArgs = (model ?? pluginConfig?.codexModel)
+      ? `--model ${shellEscape((model ?? pluginConfig?.codexModel) as string)}`
+      : "";
+    const cmdStr = [
+      CODEX_BIN, "exec", "--full-auto", "--json", "--ephemeral",
+      modelArgs,
+      "-C", shellEscape(workingDir),
+      shellEscape(prompt),
+    ].filter(Boolean).join(" ");
+
+    return runInTmux({
+      issueId: tmuxIssueId,
+      issueIdentifier: issueIdentifier ?? "unknown",
+      sessionName,
+      command: cmdStr,
+      cwd: workingDir,
+      timeoutMs: timeout,
+      watchdogMs: wdConfig.inactivityMs,
+      logPath: path.join(workingDir, ".claw", `tmux-${sessionName}.jsonl`),
+      mapEvent: mapCodexEventToActivity,
+      linearApi: linearApi ?? undefined,
+      agentSessionId: agentSessionId ?? undefined,
+      steeringMode: "one-shot",
+      logger: api.logger,
+      onUpdate,
+      progressHeader,
+    });
+  }
+
+  // --- fallback: direct spawn ---
   return new Promise<CliResult>((resolve) => {
     const child = spawn(CODEX_BIN, args, {
       stdio: ["ignore", "pipe", "pipe"],
+      cwd: workingDir,
       env: { ...process.env },
       timeout: 0,
     });
@@ -161,6 +207,9 @@ export async function runCodex(
     const collectedMessages: string[] = [];
     const collectedCommands: string[] = [];
     let stderrOutput = "";
+
+    const progress = createProgressEmitter({ header: progressHeader, onUpdate });
+    progress.emitHeader();
 
     const rl = createInterface({ input: child.stdout! });
     rl.on("line", (line) => {
@@ -200,10 +249,13 @@ export async function runCodex(
       }
 
       const activity = mapCodexEventToActivity(event);
-      if (activity && linearApi && agentSessionId) {
-        linearApi.emitActivity(agentSessionId, activity).catch((err) => {
-          api.logger.warn(`Failed to emit Codex activity: ${err}`);
-        });
+      if (activity) {
+        if (linearApi && agentSessionId) {
+          linearApi.emitActivity(agentSessionId, activity).catch((err) => {
+            api.logger.warn(`Failed to emit Codex activity: ${err}`);
+          });
+        }
+        progress.push(formatActivityLogLine(activity));
       }
     });
 

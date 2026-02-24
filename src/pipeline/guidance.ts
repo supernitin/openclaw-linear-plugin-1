@@ -128,6 +128,44 @@ export function formatGuidanceAppendix(guidance: string | null): string {
 }
 
 // ---------------------------------------------------------------------------
+// Proactive resolution (webhook → cache → null)
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve guidance for a team through all available sources.
+ * Chain: webhook payload → cache → null
+ *
+ * This replaces ad-hoc cache lookups with a single resolution function.
+ * When the cache expires and no webhook guidance is available, returns null.
+ */
+export function resolveGuidance(
+  teamId: string | undefined,
+  payload: Record<string, unknown> | null,
+  pluginConfig?: Record<string, unknown>,
+): string | null {
+  // Check if guidance is enabled for this team
+  if (!isGuidanceEnabled(pluginConfig, teamId)) return null;
+
+  // 1. Try extracting from webhook payload (freshest source)
+  if (payload) {
+    const extracted = extractGuidance(payload);
+    if (extracted.guidance) {
+      // Cache for future Comment webhook paths
+      if (teamId) cacheGuidanceForTeam(teamId, extracted.guidance);
+      return extracted.guidance;
+    }
+  }
+
+  // 2. Try cache
+  if (teamId) {
+    const cached = getCachedGuidanceForTeam(teamId);
+    if (cached) return cached;
+  }
+
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // Config toggle
 // ---------------------------------------------------------------------------
 

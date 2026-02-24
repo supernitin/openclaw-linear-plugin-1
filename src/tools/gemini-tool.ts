@@ -1,17 +1,22 @@
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
+import path from "node:path";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import type { ActivityContent } from "../api/linear-api.js";
 import {
   buildLinearApi,
   resolveSession,
   extractPrompt,
-  DEFAULT_TIMEOUT_MS,
   DEFAULT_BASE_REPO,
+  formatActivityLogLine,
+  createProgressEmitter,
   type CliToolParams,
   type CliResult,
+  type OnProgressUpdate,
 } from "./cli-shared.js";
 import { InactivityWatchdog, resolveWatchdogConfig } from "../agent/watchdog.js";
+import { isTmuxAvailable, buildSessionName, shellEscape } from "../infra/tmux.js";
+import { runInTmux } from "../infra/tmux-runner.js";
 
 const GEMINI_BIN = "gemini";
 
@@ -43,7 +48,7 @@ function mapGeminiEventToActivity(event: any): ActivityContent | null {
     } else if (params.description) {
       paramSummary = String(params.description).slice(0, 200);
     } else {
-      paramSummary = JSON.stringify(params).slice(0, 200);
+      paramSummary = JSON.stringify(params).slice(0, 500);
     }
     return { type: "action", action: `Running ${toolName}`, parameter: paramSummary };
   }
@@ -52,7 +57,7 @@ function mapGeminiEventToActivity(event: any): ActivityContent | null {
   if (type === "tool_result") {
     const status = event.status ?? "unknown";
     const output = event.output ?? "";
-    const truncated = output.length > 300 ? output.slice(0, 300) + "..." : output;
+    const truncated = output.length > 1000 ? output.slice(0, 1000) + "..." : output;
     return {
       type: "action",
       action: `Tool ${status}`,
@@ -82,6 +87,7 @@ export async function runGemini(
   api: OpenClawPluginApi,
   params: CliToolParams,
   pluginConfig?: Record<string, unknown>,
+  onUpdate?: OnProgressUpdate,
 ): Promise<CliResult> {
   api.logger.info(`gemini_run params: ${JSON.stringify(params).slice(0, 500)}`);
 
@@ -95,7 +101,7 @@ export async function runGemini(
   }
 
   const { model, timeoutMs } = params;
-  const { agentSessionId, issueIdentifier } = resolveSession(params);
+  const { agentSessionId, issueId, issueIdentifier } = resolveSession(params);
 
   api.logger.info(`gemini_run: session=${agentSessionId ?? "none"}, issue=${issueIdentifier ?? "none"}`);
 
@@ -123,8 +129,47 @@ export async function runGemini(
     args.push("-m", (model ?? pluginConfig?.geminiModel) as string);
   }
 
-  api.logger.info(`Gemini exec: ${GEMINI_BIN} ${args.join(" ").slice(0, 200)}...`);
+  const fullCommand = `${GEMINI_BIN} ${args.join(" ")}`;
+  api.logger.info(`Gemini exec: ${fullCommand.slice(0, 200)}...`);
 
+  const progressHeader = `[gemini] ${workingDir}\n$ ${fullCommand.slice(0, 500)}\n\nPrompt: ${prompt}`;
+
+  // --- tmux path: run inside a tmux session with pipe-pane streaming ---
+  const tmuxEnabled = pluginConfig?.enableTmux !== false;
+  if (tmuxEnabled && isTmuxAvailable()) {
+    const sessionName = buildSessionName(issueIdentifier ?? "unknown", "gemini", 0);
+    const tmuxIssueId = issueId ?? sessionName;
+    const modelArgs = (model ?? pluginConfig?.geminiModel)
+      ? `-m ${shellEscape((model ?? pluginConfig?.geminiModel) as string)}`
+      : "";
+    const cmdStr = [
+      GEMINI_BIN,
+      "-p", shellEscape(prompt),
+      "-o", "stream-json",
+      "--yolo",
+      modelArgs,
+    ].filter(Boolean).join(" ");
+
+    return runInTmux({
+      issueId: tmuxIssueId,
+      issueIdentifier: issueIdentifier ?? "unknown",
+      sessionName,
+      command: cmdStr,
+      cwd: workingDir,
+      timeoutMs: timeout,
+      watchdogMs: wdConfig.inactivityMs,
+      logPath: path.join(workingDir, ".claw", `tmux-${sessionName}.jsonl`),
+      mapEvent: mapGeminiEventToActivity,
+      linearApi: linearApi ?? undefined,
+      agentSessionId: agentSessionId ?? undefined,
+      steeringMode: "stdin-pipe",
+      logger: api.logger,
+      onUpdate,
+      progressHeader,
+    });
+  }
+
+  // --- fallback: direct spawn ---
   return new Promise<CliResult>((resolve) => {
     const child = spawn(GEMINI_BIN, args, {
       stdio: ["ignore", "pipe", "pipe"],
@@ -158,6 +203,9 @@ export async function runGemini(
     const collectedMessages: string[] = [];
     const collectedCommands: string[] = [];
     let stderrOutput = "";
+
+    const progress = createProgressEmitter({ header: progressHeader, onUpdate });
+    progress.emitHeader();
 
     const rl = createInterface({ input: child.stdout! });
     rl.on("line", (line) => {
@@ -196,12 +244,15 @@ export async function runGemini(
         }
       }
 
-      // Stream activity to Linear
+      // Stream activity to Linear + session progress
       const activity = mapGeminiEventToActivity(event);
-      if (activity && linearApi && agentSessionId) {
-        linearApi.emitActivity(agentSessionId, activity).catch((err) => {
-          api.logger.warn(`Failed to emit Gemini activity: ${err}`);
-        });
+      if (activity) {
+        if (linearApi && agentSessionId) {
+          linearApi.emitActivity(agentSessionId, activity).catch((err) => {
+            api.logger.warn(`Failed to emit Gemini activity: ${err}`);
+          });
+        }
+        progress.push(formatActivityLogLine(activity));
       }
     });
 

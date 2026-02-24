@@ -1,10 +1,11 @@
 /**
  * multi-repo.ts — Multi-repo resolution for dispatches spanning multiple git repos.
  *
- * Three-tier resolution:
+ * Four-tier resolution:
  * 1. Issue body markers: <!-- repos: api, frontend --> or [repos: api, frontend]
  * 2. Linear labels: repo:api, repo:frontend
- * 3. Config default: Falls back to single codexBaseRepo
+ * 3. Team mapping: teamMappings[teamKey].repos from plugin config
+ * 4. Config default: Falls back to single codexBaseRepo
  */
 
 import { existsSync, statSync } from "node:fs";
@@ -18,7 +19,55 @@ export interface RepoConfig {
 
 export interface RepoResolution {
   repos: RepoConfig[];
-  source: "issue_body" | "labels" | "config_default";
+  source: "issue_body" | "labels" | "team_mapping" | "config_default";
+}
+
+/**
+ * Enriched repo entry — filesystem path + optional GitHub identity.
+ * Supports both plain string paths (backward compat) and objects.
+ */
+export interface RepoEntry {
+  path: string;
+  github?: string;      // "owner/repo" format
+  hostname?: string;    // defaults to "github.com"
+}
+
+/**
+ * Parse the repos config, normalizing both string and object formats.
+ * String values become { path: value }, objects pass through.
+ */
+export function getRepoEntries(pluginConfig?: Record<string, unknown>): Record<string, RepoEntry> {
+  const repos = pluginConfig?.repos as Record<string, string | Record<string, unknown>> | undefined;
+  if (!repos) return {};
+  const result: Record<string, RepoEntry> = {};
+  for (const [name, value] of Object.entries(repos)) {
+    if (typeof value === "string") {
+      result[name] = { path: value };
+    } else if (value && typeof value === "object") {
+      result[name] = {
+        path: (value as any).path as string,
+        github: (value as any).github as string | undefined,
+        hostname: (value as any).hostname as string | undefined,
+      };
+    }
+  }
+  return result;
+}
+
+/**
+ * Build candidate repositories for Linear's issueRepositorySuggestions API.
+ * Extracts GitHub identity from enriched repo entries.
+ */
+export function buildCandidateRepositories(
+  pluginConfig?: Record<string, unknown>,
+): Array<{ hostname: string; repositoryFullName: string }> {
+  const entries = getRepoEntries(pluginConfig);
+  return Object.values(entries)
+    .filter(e => e.github)
+    .map(e => ({
+      hostname: e.hostname ?? "github.com",
+      repositoryFullName: e.github!,
+    }));
 }
 
 /**
@@ -28,6 +77,7 @@ export function resolveRepos(
   description: string | null | undefined,
   labels: string[],
   pluginConfig?: Record<string, unknown>,
+  teamKey?: string,
 ): RepoResolution {
   // 1. Check issue body for repo markers
   // Match: <!-- repos: name1, name2 --> or [repos: name1, name2]
@@ -62,7 +112,21 @@ export function resolveRepos(
     return { repos, source: "labels" };
   }
 
-  // 3. Config default: single repo
+  // 3. Team mapping: teamMappings[teamKey].repos
+  if (teamKey) {
+    const teamMappings = pluginConfig?.teamMappings as Record<string, Record<string, unknown>> | undefined;
+    const teamRepoNames = teamMappings?.[teamKey]?.repos as string[] | undefined;
+    if (teamRepoNames && teamRepoNames.length > 0) {
+      const repoMap = getRepoMap(pluginConfig);
+      const repos = teamRepoNames.map(name => ({
+        name,
+        path: repoMap[name] ?? resolveRepoPath(name, pluginConfig),
+      }));
+      return { repos, source: "team_mapping" };
+    }
+  }
+
+  // 4. Config default: single repo
   const baseRepo = (pluginConfig?.codexBaseRepo as string) ?? path.join(homedir(), "ai-workspace");
   return {
     repos: [{ name: "default", path: baseRepo }],
@@ -71,8 +135,12 @@ export function resolveRepos(
 }
 
 function getRepoMap(pluginConfig?: Record<string, unknown>): Record<string, string> {
-  const repos = pluginConfig?.repos as Record<string, string> | undefined;
-  return repos ?? {};
+  const entries = getRepoEntries(pluginConfig);
+  const result: Record<string, string> = {};
+  for (const [name, entry] of Object.entries(entries)) {
+    result[name] = entry.path;
+  }
+  return result;
 }
 
 function resolveRepoPath(name: string, pluginConfig?: Record<string, unknown>): string {

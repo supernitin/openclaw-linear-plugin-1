@@ -30,14 +30,18 @@ Connect Linear to AI agents. Issues get triaged, implemented, and audited — au
 - [x] Worker → Auditor pipeline (hard-enforced, not LLM-mediated)
 - [x] Audit rework loop (gaps fed back, automatic retry)
 - [x] Watchdog timeout + escalation
-- [x] Webhook deduplication (60s sliding window across session/comment/assignment)
-- [ ] Multi-repo worktree support
-- [ ] Project planner (interview → user stories → sub-issues → DAG dispatch)
-- [ ] Cross-model plan review (Claude ↔ Codex ↔ Gemini)
+- [x] Webhook deduplication (60s sliding window + `activeRuns` race guard on all paths)
+- [x] Webhook auto-provisioning (`webhooks setup` CLI, `doctor --fix`)
+- [x] Multi-repo worktree support
+- [x] Project planner (interview → user stories → sub-issues → DAG dispatch)
+- [x] Cross-model plan review (Claude ↔ Codex ↔ Gemini)
 - [x] Issue closure with summary report
-- [ ] Sub-issue decomposition (orchestrator-level only)
+- [x] Sub-issue decomposition (orchestrator-level only)
 - [x] `spawn_agent` / `ask_agent` sub-agent tools
-- [x] CI + coverage badges (1000+ tests, Codecov integration)
+- [x] CI + coverage badges (1170+ tests, Codecov integration)
+- [x] Setup wizard (`openclaw openclaw-linear setup`) + `doctor --fix` auto-repair
+- [x] Project context auto-detection (repo, framework, build/test commands → worker/audit prompts)
+- [x] Per-backend CLI tools (`cli_codex`, `cli_claude`, `cli_gemini`) with Linear session activity streaming
 - [ ] **Worktree → PR merge** — `createPullRequest()` exists but is not wired into the pipeline. After audit pass, commits sit on a `codex/{identifier}` branch. You create the PR manually.
 - [ ] **Sub-agent worktree sharing** — Sub-agents spawned via `spawn_agent`/`ask_agent` do not inherit the parent worktree. They run in their own session without code access.
 - [ ] **Parallel worktree conflict resolution** — DAG dispatch runs up to 3 issues concurrently in separate worktrees, but there's no merge conflict detection across them.
@@ -109,12 +113,12 @@ The end result: you work in Linear. You create issues, assign them, comment in p
 
 - **Named agents** — Define agents with different roles and expertise. Route work by `@mention` or natural language ("hey kaylee look at this").
 - **Intent classification** — An LLM classifier (~300 tokens, ~2s) runs on every user request across all webhook paths — not just comments. Classifies intent and gates work requests on untriaged issues. Regex fallback if the classifier fails.
-- **Scope enforcement** — Three-layer defense prevents agents from building code on issues that haven't been planned. Intent gate blocks `request_work` pre-dispatch; prompt-level constraints limit `code_run` to planning-only; a `before_tool_call` hook prepends hard constraints to worker prompts.
+- **Scope enforcement** — Three-layer defense prevents agents from building code on issues that haven't been planned. Intent gate blocks `request_work` pre-dispatch; prompt-level constraints limit CLI tools to planning-only; a `before_tool_call` hook prepends hard constraints to worker prompts.
 - **One-time detour** — `@mention` a different agent in a session and it handles that single interaction. The session stays with the original agent.
 
 ### Multi-Backend & Multi-Repo
 
-- **Three coding backends** — Codex (OpenAI), Claude (Anthropic), Gemini (Google). Configurable globally or per-agent. The agent writes the prompt; the plugin handles backend selection.
+- **Three coding backends** — Codex (OpenAI), Claude (Anthropic), Gemini (Google). Configurable globally or per-agent. Each backend registers as a dedicated tool (`cli_codex`, `cli_claude`, `cli_gemini`) so agents and Linear session UI show exactly which backend is running. Per-agent overrides let you assign different backends to different team members.
 - **Multi-repo dispatch** — Tag an issue with `<!-- repos: api, frontend -->` and the worker gets isolated worktrees for each repo. One issue, multiple codebases, one agent session.
 
 ### Operations
@@ -723,18 +727,18 @@ To move forward:
 I can help you scope and plan — just ask questions or discuss the approach.
 ```
 
-This prevents the most common failure mode: an agent receiving a casual comment like "build X" on an unscoped issue and immediately spinning up `code_run` to build something that was never planned.
+This prevents the most common failure mode: an agent receiving a casual comment like "build X" on an unscoped issue and immediately spinning up a CLI tool to build something that was never planned.
 
 **What's allowed on untriaged issues:**
 - Questions, discussion, scope refinement
 - Planning (`plan_start`, `plan_continue`, `plan_finalize`)
 - Agent routing (`@mention` or natural language)
 - Issue closure
-- `code_run` in **planning mode only** — workers can explore code and write plan files but cannot create, modify, or delete source code
+- `cli_codex`/`cli_claude`/`cli_gemini` in **planning mode only** — workers can explore code and write plan files but cannot create, modify, or delete source code
 
 **What's blocked on untriaged issues:**
 - `request_work` intent — the gate returns a rejection message before any agent runs
-- Full `code_run` implementation — even if the orchestrator LLM ignores prompt rules, a `before_tool_call` hook prepends hard planning-only constraints to the worker's prompt
+- Full CLI tool implementation — even if the orchestrator LLM ignores prompt rules, a `before_tool_call` hook prepends hard planning-only constraints to the worker's prompt
 
 ### Agent Routing
 
@@ -885,7 +889,7 @@ Add settings under the plugin entry in `openclaw.json`:
 | `notifications` | object | — | Notification targets (see [Notifications](#notifications)) |
 | `inactivitySec` | number | `120` | Kill agent if silent this long |
 | `maxTotalSec` | number | `7200` | Max total agent session time |
-| `toolTimeoutSec` | number | `600` | Max single `code_run` time |
+| `toolTimeoutSec` | number | `600` | Max single CLI tool time |
 | `enableGuidance` | boolean | `true` | Inject Linear workspace/team guidance into agent prompts |
 | `teamGuidanceOverrides` | object | — | Per-team guidance toggle. Key = team ID, value = boolean. Unset teams inherit `enableGuidance`. |
 | `claudeApiKey` | string | — | Anthropic API key for Claude CLI (passed as `ANTHROPIC_API_KEY` env var). Required if using Claude backend. |
@@ -952,7 +956,7 @@ Create `coding-tools.json` in the plugin root to configure which CLI backend age
 }
 ```
 
-The agent calls `code_run` without knowing which backend is active. Resolution order: explicit `backend` parameter > per-agent override > global default > `"codex"`.
+Each backend registers as a dedicated tool — `cli_codex`, `cli_claude`, or `cli_gemini` — so agents and Linear's session UI show exactly which backend is running. The agent's prompt references the correct tool name automatically. Resolution order for which tool is exposed: per-agent override (`agentCodingTools`) > global default (`codingTool`) > `"codex"`.
 
 #### Claude API Key
 
@@ -1126,7 +1130,7 @@ rework:
 | `{{reviewModel}}` | Name of cross-model reviewer (planner review) |
 | `{{crossModelFeedback}}` | Review recommendations (planner review) |
 | `{{guidance}}` | Linear workspace/team guidance (if available, empty string otherwise) |
-| `{{projectContext}}` | Project context from config (project name, repo paths). Framework/build/test info belongs in CLAUDE.md. |
+| `{{projectContext}}` | Auto-detected project context (repo paths, framework, build commands, test commands) injected into worker and audit prompts. |
 
 ### CLI
 
@@ -1287,7 +1291,7 @@ If an agent goes silent (LLM timeout, API hang, CLI lockup), the watchdog handle
 |---|---|---|
 | `inactivitySec` | 120s | Kill if no output for this long |
 | `maxTotalSec` | 7200s (2 hrs) | Hard ceiling on total session time |
-| `toolTimeoutSec` | 600s (10 min) | Max time for a single `code_run` call |
+| `toolTimeoutSec` | 600s (10 min) | Max time for a single CLI tool call |
 
 Configure per-agent in `agent-profiles.json` or globally in plugin config.
 
@@ -1297,9 +1301,9 @@ Configure per-agent in `agent-profiles.json` or globally in plugin config.
 
 Every agent session gets these registered tools. They're available as native tool calls — no CLI parsing, no shell execution, no flag guessing.
 
-### `code_run` — Coding backend dispatch
+### `cli_codex` / `cli_claude` / `cli_gemini` — Coding backend tools
 
-Sends a task to whichever coding CLI is configured (Codex, Claude Code, or Gemini). The agent writes the prompt; the plugin handles backend selection, worktree setup, and output capture.
+Three per-backend tools that send tasks to their respective coding CLIs. Each agent sees only the tool matching its configured backend (e.g., an agent configured for `codex` gets `cli_codex`). The tool name is visible in Linear's agent session UI, so you always know which backend is running. The agent writes the prompt; the plugin handles worktree setup, session activity streaming, and output capture.
 
 ### `linear_issues` — Native Linear API
 
@@ -1320,7 +1324,7 @@ Agents call `linear_issues` with typed JSON parameters. The tool wraps the Linea
 
 Delegate work to other crew agents. `spawn_agent` is fire-and-forget (parallel), `ask_agent` waits for a reply (synchronous). Disabled with `enableOrchestration: false`.
 
-Sub-agents run in their own context — they do **not** share the parent's worktree or get `code_run` access. They're useful for reasoning, research, and coordination (e.g., "ask Inara how to phrase this error message") but cannot directly modify code. To give a sub-agent code context, include the relevant snippets in the task message.
+Sub-agents run in their own context — they do **not** share the parent's worktree or get CLI tool access. They're useful for reasoning, research, and coordination (e.g., "ask Inara how to phrase this error message") but cannot directly modify code. To give a sub-agent code context, include the relevant snippets in the task message.
 
 ### `dispatch_history` — Recent dispatch context
 
@@ -1330,9 +1334,9 @@ Returns recent dispatch activity. Agents use this for situational awareness when
 
 Tool access varies by context. Orchestrators get the full toolset; workers and auditors are restricted:
 
-| Context | `linear_issues` | `code_run` | `spawn_agent` / `ask_agent` | Filesystem |
+| Context | `linear_issues` | `cli_*` | `spawn_agent` / `ask_agent` | Filesystem |
 |---|---|---|---|---|
-| Orchestrator (triaged issue) | Full (read, create, update, comment) | Yes | Yes | Read + write |
+| Orchestrator (triaged issue) | Full (read, create, update, comment) | Yes (backend-specific tool) | Yes | Read + write |
 | Orchestrator (untriaged issue) | Read only | Planning only | Yes | Read + write |
 | Worker | None | None | None | Read + write |
 | Auditor | Prompt-constrained (has tool, instructed to verify only) | None | None | Read only (by prompt) |
@@ -1342,7 +1346,7 @@ Tool access varies by context. Orchestrators get the full toolset; workers and a
 
 **Auditors** have access to `linear_issues` (the tool is registered) but are instructed via prompt to verify only — they return a JSON verdict, not code or issue mutations. Write access is not enforced at the tool level.
 
-**Sub-agents** spawned via `spawn_agent`/`ask_agent` run in their own session with no worktree access and no `code_run`. They're information workers — useful for reasoning and coordination, not code execution.
+**Sub-agents** spawned via `spawn_agent`/`ask_agent` run in their own session with no worktree access and no CLI tools. They're information workers — useful for reasoning and coordination, not code execution.
 
 ---
 
@@ -1457,12 +1461,12 @@ The plugin registers four lifecycle hooks via `api.on()` in `index.ts`:
 - Reads dispatch state and finds up to 3 active dispatches
 - Prepends a `<dispatch-history>` block so the agent has situational awareness of concurrent work
 
-**`before_tool_call`** — Planning-only enforcement for `code_run`. When the active issue is not in "started" state:
+**`before_tool_call`** — Planning-only enforcement for CLI tools (`cli_codex`, `cli_claude`, `cli_gemini`). When the active issue is not in "started" state:
 - Fetches the issue's current workflow state from the Linear API
 - If the issue is in Triage, Todo, Backlog, or any non-started state, prepends hard constraints to the worker's prompt:
   - Workers may read/explore files and write plan files (PLAN.md, design docs)
   - Workers must NOT create/modify/delete source code, run deployments, or make system changes
-- This is the deepest layer of scope enforcement — even if the orchestrator LLM ignores prompt-level scope rules and calls `code_run` anyway, the worker receives constraints that prevent implementation
+- This is the deepest layer of scope enforcement — even if the orchestrator LLM ignores prompt-level scope rules and calls a CLI tool anyway, the worker receives constraints that prevent implementation
 
 **`message_sending`** — Narration guard. Catches short (~250 char) "Let me explore..." responses where the agent narrates intent without actually calling tools:
 - Appends a warning: "Agent acknowledged but may not have completed the task"
@@ -1762,7 +1766,8 @@ openclaw openclaw-linear prompts show       # View the active prompts
 ## CLI Reference
 
 ```bash
-# Auth & status
+# Setup & auth
+openclaw openclaw-linear setup                     # Guided first-time setup (profiles, auth, webhook, doctor)
 openclaw openclaw-linear auth                      # Run OAuth flow
 openclaw openclaw-linear status                    # Check connection
 
@@ -1826,8 +1831,8 @@ journalctl --user -u openclaw-gateway -f         # Watch live logs
 |---|---|
 | Agent goes silent | Watchdog auto-kills after `inactivitySec` and retries. Check logs for `Watchdog KILL`. |
 | Dispatch stuck after watchdog | Both retries failed. Check `.claw/log.jsonl`. Re-assign issue to restart. |
-| `code_run` uses wrong backend | Check `coding-tools.json` — explicit backend > per-agent > global default. Run `code-run doctor` to see routing. |
-| `code_run` fails at runtime | Run `openclaw openclaw-linear code-run doctor` — checks binary, API key, and live callability for each backend. |
+| `cli_*` uses wrong backend | Check `coding-tools.json` — per-agent override > global default. Run `code-run doctor` to see routing. |
+| `cli_*` fails at runtime | Run `openclaw openclaw-linear code-run doctor` — checks binary, API key, and live callability for each backend. |
 | Webhook events not arriving | Run `openclaw openclaw-linear webhooks setup` to auto-provision. Both webhooks must point to `/linear/webhook`. Check tunnel is running. |
 | Tunnel down / webhooks silently failing | `systemctl status cloudflared` (or `systemctl --user status cloudflared`). Restart with `systemctl restart cloudflared`. Test: `curl -s -X POST https://your-domain.com/linear/webhook -H 'Content-Type: application/json' -d '{"type":"test"}'` — should return `"ok"`. |
 | OAuth token expired | Auto-refreshes. If stuck, re-run `openclaw openclaw-linear auth` and restart. |

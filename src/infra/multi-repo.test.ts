@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { homedir } from "node:os";
 import path from "node:path";
-import { resolveRepos, isMultiRepo, validateRepoPath, type RepoResolution } from "./multi-repo.ts";
+import { resolveRepos, isMultiRepo, validateRepoPath, getRepoEntries, buildCandidateRepositories, type RepoResolution } from "./multi-repo.ts";
 
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
@@ -128,6 +128,132 @@ describe("isMultiRepo", () => {
       source: "config_default",
     };
     expect(isMultiRepo(resolution)).toBe(false);
+  });
+});
+
+describe("getRepoEntries", () => {
+  it("normalizes string values to RepoEntry objects", () => {
+    const config = { repos: { api: "/tmp/api", frontend: "/tmp/frontend" } };
+    const entries = getRepoEntries(config);
+    expect(entries.api).toEqual({ path: "/tmp/api" });
+    expect(entries.frontend).toEqual({ path: "/tmp/frontend" });
+  });
+
+  it("passes through object values with github and hostname", () => {
+    const config = {
+      repos: {
+        api: { path: "/tmp/api", github: "org/api", hostname: "github.example.com" },
+        frontend: { path: "/tmp/frontend", github: "org/frontend" },
+      },
+    };
+    const entries = getRepoEntries(config);
+    expect(entries.api).toEqual({ path: "/tmp/api", github: "org/api", hostname: "github.example.com" });
+    expect(entries.frontend).toEqual({ path: "/tmp/frontend", github: "org/frontend", hostname: undefined });
+  });
+
+  it("handles mixed string and object repos", () => {
+    const config = {
+      repos: {
+        api: { path: "/tmp/api", github: "org/api" },
+        legacy: "/tmp/legacy",
+      },
+    };
+    const entries = getRepoEntries(config);
+    expect(entries.api.github).toBe("org/api");
+    expect(entries.legacy).toEqual({ path: "/tmp/legacy" });
+  });
+
+  it("returns empty object when no repos config", () => {
+    expect(getRepoEntries({})).toEqual({});
+    expect(getRepoEntries(undefined)).toEqual({});
+  });
+});
+
+describe("buildCandidateRepositories", () => {
+  it("builds candidates from repos with github field", () => {
+    const config = {
+      repos: {
+        api: { path: "/tmp/api", github: "calltelemetry/cisco-cdr" },
+        frontend: { path: "/tmp/frontend", github: "calltelemetry/ct-quasar" },
+        legacy: "/tmp/legacy",
+      },
+    };
+    const candidates = buildCandidateRepositories(config);
+    expect(candidates).toHaveLength(2);
+    expect(candidates[0]).toEqual({ hostname: "github.com", repositoryFullName: "calltelemetry/cisco-cdr" });
+    expect(candidates[1]).toEqual({ hostname: "github.com", repositoryFullName: "calltelemetry/ct-quasar" });
+  });
+
+  it("uses custom hostname when provided", () => {
+    const config = {
+      repos: {
+        api: { path: "/tmp/api", github: "org/api", hostname: "git.corp.com" },
+      },
+    };
+    const candidates = buildCandidateRepositories(config);
+    expect(candidates[0].hostname).toBe("git.corp.com");
+  });
+
+  it("returns empty array when no repos have github", () => {
+    const config = { repos: { api: "/tmp/api" } };
+    expect(buildCandidateRepositories(config)).toEqual([]);
+  });
+});
+
+describe("resolveRepos with team mapping", () => {
+  const config = {
+    repos: {
+      api: { path: "/tmp/api", github: "org/api" },
+      frontend: { path: "/tmp/frontend", github: "org/frontend" },
+    },
+    teamMappings: {
+      API: { repos: ["api"], defaultAgent: "kaylee" },
+      UAT: { repos: ["api", "frontend"] },
+      MED: { context: "Media team" },
+    },
+  };
+
+  it("uses team mapping when no body markers or labels", () => {
+    const result = resolveRepos("Plain description", [], config, "API");
+    expect(result.source).toBe("team_mapping");
+    expect(result.repos).toHaveLength(1);
+    expect(result.repos[0].name).toBe("api");
+    expect(result.repos[0].path).toBe("/tmp/api");
+  });
+
+  it("team mapping resolves multi-repo teams", () => {
+    const result = resolveRepos("Plain description", [], config, "UAT");
+    expect(result.source).toBe("team_mapping");
+    expect(result.repos).toHaveLength(2);
+    expect(result.repos[0].name).toBe("api");
+    expect(result.repos[1].name).toBe("frontend");
+  });
+
+  it("body markers take priority over team mapping", () => {
+    const result = resolveRepos("<!-- repos: frontend -->", [], config, "API");
+    expect(result.source).toBe("issue_body");
+    expect(result.repos[0].name).toBe("frontend");
+  });
+
+  it("labels take priority over team mapping", () => {
+    const result = resolveRepos("No markers", ["repo:frontend"], config, "API");
+    expect(result.source).toBe("labels");
+    expect(result.repos[0].name).toBe("frontend");
+  });
+
+  it("falls back to config_default when team has no repos", () => {
+    const result = resolveRepos("Plain description", [], config, "MED");
+    expect(result.source).toBe("config_default");
+  });
+
+  it("falls back to config_default when teamKey is unknown", () => {
+    const result = resolveRepos("Plain description", [], config, "UNKNOWN");
+    expect(result.source).toBe("config_default");
+  });
+
+  it("falls back to config_default when no teamKey provided", () => {
+    const result = resolveRepos("Plain description", [], config);
+    expect(result.source).toBe("config_default");
   });
 });
 

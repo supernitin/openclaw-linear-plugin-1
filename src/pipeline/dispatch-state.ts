@@ -69,6 +69,8 @@ export interface CompletedDispatch {
   prUrl?: string;
   project?: string;
   totalAttempts?: number;
+  worktreePath?: string;
+  cleanedUp?: boolean;
 }
 
 /** Maps session keys to dispatch context for agent_end hook lookup */
@@ -370,6 +372,7 @@ export async function completeDispatch(
       prUrl: result.prUrl,
       project: active?.project ?? result.project,
       totalAttempts: active?.attempt ?? 0,
+      worktreePath: active?.worktreePath,
     };
     await writeDispatchState(filePath, data);
   } finally {

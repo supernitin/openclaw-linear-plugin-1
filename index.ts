@@ -18,6 +18,7 @@ import { createPlannerTools } from "./src/tools/planner-tools.js";
 import { registerDispatchCommands } from "./src/infra/commands.js";
 import { createDispatchHistoryTool } from "./src/tools/dispatch-history-tool.js";
 import { readDispatchState as readStateForHook, listActiveDispatches as listActiveForHook } from "./src/pipeline/dispatch-state.js";
+import { startTokenRefreshTimer, stopTokenRefreshTimer } from "./src/infra/token-refresh-timer.js";
 
 export default function register(api: OpenClawPluginApi) {
   const pluginConfig = (api as any).pluginConfig as Record<string, unknown> | undefined;
@@ -337,4 +338,10 @@ export default function register(api: OpenClawPluginApi) {
   api.logger.info(
     `Linear agent extension registered (agent: ${agentId}, token: ${tokenInfo.source !== "none" ? `${tokenInfo.source}` : "missing"}, ${cliSummary}, orchestration: ${orchestration})`,
   );
+
+  // Start proactive token refresh timer (runs immediately, then every 6h)
+  startTokenRefreshTimer(api, pluginConfig);
+
+  // Clean up timer on process exit
+  process.on("beforeExit", () => stopTokenRefreshTimer());
 }

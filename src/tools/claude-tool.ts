@@ -1,17 +1,22 @@
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
+import path from "node:path";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import type { ActivityContent } from "../api/linear-api.js";
 import {
   buildLinearApi,
   resolveSession,
   extractPrompt,
-  DEFAULT_TIMEOUT_MS,
   DEFAULT_BASE_REPO,
+  formatActivityLogLine,
+  createProgressEmitter,
   type CliToolParams,
   type CliResult,
+  type OnProgressUpdate,
 } from "./cli-shared.js";
 import { InactivityWatchdog, resolveWatchdogConfig } from "../agent/watchdog.js";
+import { isTmuxAvailable, buildSessionName, shellEscape } from "../infra/tmux.js";
+import { runInTmux } from "../infra/tmux-runner.js";
 
 const CLAUDE_BIN = "claude";
 
@@ -47,7 +52,7 @@ function mapClaudeEventToActivity(event: any): ActivityContent | null {
         } else if (input.query) {
           paramSummary = String(input.query).slice(0, 200);
         } else {
-          paramSummary = JSON.stringify(input).slice(0, 200);
+          paramSummary = JSON.stringify(input).slice(0, 500);
         }
         return { type: "action", action: `Running ${toolName}`, parameter: paramSummary };
       }
@@ -63,7 +68,7 @@ function mapClaudeEventToActivity(event: any): ActivityContent | null {
     for (const block of content) {
       if (block.type === "tool_result") {
         const output = typeof block.content === "string" ? block.content : "";
-        const truncated = output.length > 300 ? output.slice(0, 300) + "..." : output;
+        const truncated = output.length > 1000 ? output.slice(0, 1000) + "..." : output;
         const isError = block.is_error === true;
         return {
           type: "action",
@@ -100,6 +105,7 @@ export async function runClaude(
   api: OpenClawPluginApi,
   params: CliToolParams,
   pluginConfig?: Record<string, unknown>,
+  onUpdate?: OnProgressUpdate,
 ): Promise<CliResult> {
   api.logger.info(`claude_run params: ${JSON.stringify(params).slice(0, 500)}`);
 
@@ -113,7 +119,7 @@ export async function runClaude(
   }
 
   const { model, timeoutMs } = params;
-  const { agentSessionId, issueIdentifier } = resolveSession(params);
+  const { agentSessionId, issueId, issueIdentifier } = resolveSession(params);
 
   api.logger.info(`claude_run: session=${agentSessionId ?? "none"}, issue=${issueIdentifier ?? "none"}`);
 
@@ -143,8 +149,54 @@ export async function runClaude(
   }
   args.push("-p", prompt);
 
-  api.logger.info(`Claude exec: ${CLAUDE_BIN} ${args.join(" ").slice(0, 200)}...`);
+  const fullCommand = `${CLAUDE_BIN} ${args.join(" ")}`;
+  api.logger.info(`Claude exec: ${fullCommand.slice(0, 200)}...`);
 
+  const progressHeader = `[claude] ${workingDir}\n$ ${fullCommand.slice(0, 500)}\n\nPrompt: ${prompt}`;
+
+  // --- tmux path: run inside a tmux session with pipe-pane streaming ---
+  const tmuxEnabled = pluginConfig?.enableTmux !== false;
+  if (tmuxEnabled && isTmuxAvailable()) {
+    const sessionName = buildSessionName(issueIdentifier ?? "unknown", "claude", 0);
+    const tmuxIssueId = issueId ?? sessionName;
+    const modelArgs = (model ?? pluginConfig?.claudeModel)
+      ? `--model ${shellEscape((model ?? pluginConfig?.claudeModel) as string)}`
+      : "";
+    // Build env prefix: unset CLAUDECODE (avoids "nested session" error)
+    // and inject API key from plugin config if configured
+    const envParts: string[] = ["unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT;"];
+    const claudeApiKey = pluginConfig?.claudeApiKey as string | undefined;
+    if (claudeApiKey) {
+      envParts.push(`export ANTHROPIC_API_KEY=${shellEscape(claudeApiKey)};`);
+    }
+    const cmdStr = [
+      ...envParts,
+      CLAUDE_BIN,
+      "--print", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions",
+      modelArgs,
+      "-p", shellEscape(prompt),
+    ].filter(Boolean).join(" ");
+
+    return runInTmux({
+      issueId: tmuxIssueId,
+      issueIdentifier: issueIdentifier ?? "unknown",
+      sessionName,
+      command: cmdStr,
+      cwd: workingDir,
+      timeoutMs: timeout,
+      watchdogMs: wdConfig.inactivityMs,
+      logPath: path.join(workingDir, ".claw", `tmux-${sessionName}.jsonl`),
+      mapEvent: mapClaudeEventToActivity,
+      linearApi: linearApi ?? undefined,
+      agentSessionId: agentSessionId ?? undefined,
+      steeringMode: "stdin-pipe",
+      logger: api.logger,
+      onUpdate,
+      progressHeader,
+    });
+  }
+
+  // --- fallback: direct spawn ---
   return new Promise<CliResult>((resolve) => {
     // Must unset CLAUDECODE to avoid "nested session" error
     const env = { ...process.env };
@@ -189,6 +241,9 @@ export async function runClaude(
     const collectedCommands: string[] = [];
     let stderrOutput = "";
     let lastToolName = "";
+
+    const progress = createProgressEmitter({ header: progressHeader, onUpdate });
+    progress.emitHeader();
 
     const rl = createInterface({ input: child.stdout! });
     rl.on("line", (line) => {
@@ -244,12 +299,15 @@ export async function runClaude(
         // (it duplicates the last assistant text message)
       }
 
-      // Stream activity to Linear
+      // Stream activity to Linear + session progress
       const activity = mapClaudeEventToActivity(event);
-      if (activity && linearApi && agentSessionId) {
-        linearApi.emitActivity(agentSessionId, activity).catch((err) => {
-          api.logger.warn(`Failed to emit Claude activity: ${err}`);
-        });
+      if (activity) {
+        if (linearApi && agentSessionId) {
+          linearApi.emitActivity(agentSessionId, activity).catch((err) => {
+            api.logger.warn(`Failed to emit Claude activity: ${err}`);
+          });
+        }
+        progress.push(formatActivityLogLine(activity));
       }
     });
 

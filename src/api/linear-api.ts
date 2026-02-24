@@ -41,8 +41,10 @@ export function resolveLinearToken(pluginConfig?: Record<string, unknown>): {
     return { accessToken: fromConfig, source: "config" };
   }
 
-  // 2. Auth profile store (from OAuth flow) — preferred because OAuth tokens
-  //    carry app:assignable/app:mentionable scopes needed for Agent Sessions
+  // 2. Auth profile store (from OAuth flow) — OAuth tokens carry
+  //    app:assignable/app:mentionable scopes needed for Agent Sessions.
+  //    Token refresh is handled by the 6-hour proactive timer; if it's
+  //    expired here, fail loudly so we know the refresh is broken.
   try {
     const raw = readFileSync(AUTH_PROFILES_PATH, "utf8");
     const store = JSON.parse(raw);
@@ -59,7 +61,7 @@ export function resolveLinearToken(pluginConfig?: Record<string, unknown>): {
     // Profile store doesn't exist or is unreadable
   }
 
-  // 3. Env var fallback (personal API key — works for comments but not Agent Sessions)
+  // 3. Env var fallback
   const fromEnv = process.env.LINEAR_ACCESS_TOKEN ?? process.env.LINEAR_API_KEY;
   if (fromEnv) {
     return { accessToken: fromEnv, source: "env" };
@@ -311,7 +313,7 @@ export class LinearAgentApi {
     creator: { name: string; email: string | null } | null;
     assignee: { name: string } | null;
     labels: { nodes: Array<{ id: string; name: string }> };
-    team: { id: string; name: string; issueEstimationType: string };
+    team: { id: string; key: string; name: string; issueEstimationType: string };
     comments: { nodes: Array<{ body: string; user: { name: string } | null; createdAt: string }> };
     project: { id: string; name: string } | null;
     parent: { id: string; identifier: string } | null;
@@ -329,7 +331,7 @@ export class LinearAgentApi {
           creator { name email }
           assignee { name }
           labels { nodes { id name } }
-          team { id name issueEstimationType }
+          team { id key name issueEstimationType }
           comments(last: 10) {
             nodes {
               body
@@ -685,4 +687,111 @@ export class LinearAgentApi {
     );
     return data.webhookDelete.success;
   }
+
+  /**
+   * Get repository suggestions from Linear for an issue.
+   * Uses Linear's ML to rank candidate repos by relevance to the issue.
+   */
+  async getRepositorySuggestions(
+    issueId: string,
+    agentSessionId: string,
+    candidates: Array<{ hostname: string; repositoryFullName: string }>,
+  ): Promise<Array<{ repositoryFullName: string; hostname: string; confidence: number }>> {
+    if (candidates.length === 0) return [];
+    try {
+      const data = await this.gql<{
+        issueRepositorySuggestions: {
+          suggestions: Array<{ repositoryFullName: string; hostname: string; confidence: number }>;
+        };
+      }>(
+        `query RepoSuggestions($issueId: String!, $agentSessionId: String!, $candidateRepositories: [CandidateRepository!]!) {
+          issueRepositorySuggestions(issueId: $issueId, agentSessionId: $agentSessionId, candidateRepositories: $candidateRepositories) {
+            suggestions {
+              repositoryFullName
+              hostname
+              confidence
+            }
+          }
+        }`,
+        { issueId, agentSessionId, candidateRepositories: candidates },
+      );
+      return data.issueRepositorySuggestions?.suggestions ?? [];
+    } catch {
+      // Best-effort — if the API doesn't support this or fails, return empty
+      return [];
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Proactive token refresh (standalone, no API call required)
+// ---------------------------------------------------------------------------
+
+const PROACTIVE_BUFFER_MS = 3_600_000; // 1 hour before expiry
+
+/**
+ * Proactively refresh the Linear OAuth token if it's expired or about to expire.
+ * Returns true if refreshed, false if skipped (not needed or can't refresh).
+ *
+ * This is a standalone function that can be called from a timer without making
+ * a Linear API request. It reads/writes auth-profiles.json directly.
+ */
+export async function refreshTokenProactively(
+  pluginConfig?: Record<string, unknown>,
+): Promise<{ refreshed: boolean; reason: string }> {
+  // 1. Read auth-profiles.json, get linear:default profile
+  let store: any;
+  try {
+    const raw = readFileSync(AUTH_PROFILES_PATH, "utf8");
+    store = JSON.parse(raw);
+  } catch {
+    return { refreshed: false, reason: "auth-profiles.json not readable" };
+  }
+
+  const profile = store?.profiles?.["linear:default"];
+  if (!profile) {
+    return { refreshed: false, reason: "no linear:default profile found" };
+  }
+
+  // 2. Check if token is expired or will expire within 1 hour
+  const expiresAt = profile.expiresAt ?? profile.expires;
+  if (typeof expiresAt === "number" && Date.now() < expiresAt - PROACTIVE_BUFFER_MS) {
+    return { refreshed: false, reason: "token still valid" };
+  }
+
+  // 3. Resolve credentials
+  const clientId = (pluginConfig?.clientId as string) ?? process.env.LINEAR_CLIENT_ID;
+  const clientSecret = (pluginConfig?.clientSecret as string) ?? process.env.LINEAR_CLIENT_SECRET;
+  const refreshToken = profile.refreshToken ?? profile.refresh;
+
+  if (!clientId || !clientSecret || !refreshToken) {
+    return { refreshed: false, reason: "missing credentials (clientId, clientSecret, or refreshToken)" };
+  }
+
+  // 4. Refresh the token
+  const result = await refreshLinearToken(clientId, clientSecret, refreshToken);
+
+  // 5. Persist updated tokens back to auth-profiles.json (same pattern as persistToken())
+  const newAccessToken = result.access_token;
+  const newRefreshToken = result.refresh_token ?? refreshToken;
+  const newExpiresAt = Date.now() + result.expires_in * 1000;
+
+  try {
+    // Re-read to avoid clobbering concurrent writes
+    const freshRaw = readFileSync(AUTH_PROFILES_PATH, "utf8");
+    const freshStore = JSON.parse(freshRaw);
+    if (freshStore.profiles?.["linear:default"]) {
+      freshStore.profiles["linear:default"].accessToken = newAccessToken;
+      freshStore.profiles["linear:default"].access = newAccessToken;
+      freshStore.profiles["linear:default"].refreshToken = newRefreshToken;
+      freshStore.profiles["linear:default"].refresh = newRefreshToken;
+      freshStore.profiles["linear:default"].expiresAt = newExpiresAt;
+      freshStore.profiles["linear:default"].expires = newExpiresAt;
+      writeFileSync(AUTH_PROFILES_PATH, JSON.stringify(freshStore, null, 2), "utf8");
+    }
+  } catch {
+    // Best-effort persistence — token was refreshed even if write fails
+  }
+
+  return { refreshed: true, reason: "token refreshed successfully" };
 }

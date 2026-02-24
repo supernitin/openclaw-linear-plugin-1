@@ -14,6 +14,7 @@ export interface CliToolParams {
   workingDir?: string;
   model?: string;
   timeoutMs?: number;
+  issueId?: string;
   issueIdentifier?: string;
   agentSessionId?: string;
 }
@@ -22,6 +23,51 @@ export interface CliResult {
   success: boolean;
   output: string;
   error?: string;
+}
+
+export type OnProgressUpdate = (update: Record<string, unknown>) => void;
+
+/**
+ * Format a Linear activity as a single streaming log line for session progress.
+ */
+export function formatActivityLogLine(activity: { type: string; body?: string; action?: string; parameter?: string; result?: string }): string {
+  if (activity.type === "thought") {
+    return `▸ ${(activity.body ?? "").slice(0, 300)}`;
+  }
+  if (activity.type === "action") {
+    const result = activity.result ? `\n  → ${activity.result.slice(0, 200)}` : "";
+    return `▸ ${activity.action ?? ""}: ${(activity.parameter ?? "").slice(0, 300)}${result}`;
+  }
+  return `▸ ${JSON.stringify(activity).slice(0, 300)}`;
+}
+
+/**
+ * Create a progress emitter that maintains a rolling log of streaming events.
+ * Calls onUpdate with the full accumulated log on each new event.
+ */
+export function createProgressEmitter(opts: {
+  header: string;
+  onUpdate?: OnProgressUpdate;
+  maxLines?: number;
+}): { push: (line: string) => void; emitHeader: () => void } {
+  const lines: string[] = [];
+  const maxLines = opts.maxLines ?? 40;
+  const { header, onUpdate } = opts;
+
+  function emit() {
+    if (!onUpdate) return;
+    const log = lines.length > 0 ? "\n---\n" + lines.join("\n") : "";
+    try { onUpdate({ status: "running", summary: header + log }); } catch {}
+  }
+
+  return {
+    emitHeader() { emit(); },
+    push(line: string) {
+      lines.push(line);
+      if (lines.length > maxLines) lines.splice(0, lines.length - maxLines);
+      emit();
+    },
+  };
 }
 
 /**
@@ -53,9 +99,10 @@ export function buildLinearApi(
  */
 export function resolveSession(params: CliToolParams): {
   agentSessionId: string | undefined;
+  issueId: string | undefined;
   issueIdentifier: string | undefined;
 } {
-  let { issueIdentifier, agentSessionId } = params;
+  let { issueId, issueIdentifier, agentSessionId } = params;
 
   if (!agentSessionId || !issueIdentifier) {
     const active = issueIdentifier
@@ -63,11 +110,12 @@ export function resolveSession(params: CliToolParams): {
       : getCurrentSession();
     if (active) {
       agentSessionId = agentSessionId ?? active.agentSessionId;
+      issueId = issueId ?? active.issueId;
       issueIdentifier = issueIdentifier ?? active.issueIdentifier;
     }
   }
 
-  return { agentSessionId, issueIdentifier };
+  return { agentSessionId, issueId, issueIdentifier };
 }
 
 /**

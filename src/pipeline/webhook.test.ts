@@ -963,7 +963,7 @@ describe("AgentSessionEvent.prompted full flow", () => {
 
     expect(result.status).toBe(200);
     const infoCalls = (result.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
-    expect(infoCalls.some((msg: string) => msg.includes("agent active, ignoring (feedback)"))).toBe(true);
+    expect(infoCalls.some((msg: string) => msg.includes("agent active, no tmux, ignoring (feedback)"))).toBe(true);
   });
 
   it("deduplicates by webhookId", async () => {

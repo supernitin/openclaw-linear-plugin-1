@@ -49,6 +49,80 @@ import {
 import { resolveWatchdogConfig } from "../agent/watchdog.js";
 import { emitDiagnostic } from "../infra/observability.js";
 import { renderTemplate } from "../infra/template.js";
+import { getWorktreeStatus, createPullRequest } from "../infra/codex-worktree.js";
+
+// ---------------------------------------------------------------------------
+// Linear issue state transitions (best-effort)
+// ---------------------------------------------------------------------------
+
+/**
+ * Transition a Linear issue to a target state by type (e.g., "started", "completed", "triage").
+ * Resolves the team's workflow states and finds a matching state.
+ * All transitions are best-effort — failures are logged as warnings, never thrown.
+ */
+async function transitionLinearIssueState(
+  linearApi: LinearAgentApi,
+  issueId: string,
+  teamId: string | undefined,
+  targetStateType: string,
+  opts?: { preferredStateName?: string },
+  logger?: { warn: (msg: string) => void; info: (msg: string) => void },
+): Promise<void> {
+  if (!teamId) {
+    logger?.warn(`[linear-state] no teamId — skipping state transition to ${targetStateType}`);
+    return;
+  }
+  try {
+    const states = await linearApi.getTeamStates(teamId);
+    // Prefer a specific state name if provided, otherwise match by type
+    let target = opts?.preferredStateName
+      ? states.find(s => s.name === opts.preferredStateName) ?? states.find(s => s.type === targetStateType)
+      : states.find(s => s.type === targetStateType);
+    if (target) {
+      await linearApi.updateIssue(issueId, { stateId: target.id });
+      logger?.info(`[linear-state] ${issueId} → ${target.name} (type=${target.type})`);
+    } else {
+      logger?.warn(`[linear-state] no state with type="${targetStateType}" found for team ${teamId}`);
+    }
+  } catch (err) {
+    logger?.warn(`[linear-state] failed to transition ${issueId} to ${targetStateType}: ${err}`);
+  }
+}
+
+/**
+ * Transition a Linear issue to "In Review" if it exists, otherwise "Done".
+ * Used after audit pass when a PR was created.
+ */
+async function transitionToReviewOrDone(
+  linearApi: LinearAgentApi,
+  issueId: string,
+  teamId: string | undefined,
+  hasPr: boolean,
+  logger?: { warn: (msg: string) => void; info: (msg: string) => void },
+): Promise<void> {
+  if (!teamId) return;
+  try {
+    const states = await linearApi.getTeamStates(teamId);
+    if (hasPr) {
+      // Prefer "In Review" state; fall back to any "started" state named "In Review", then "completed"
+      const inReview = states.find(s => s.name === "In Review")
+        ?? states.find(s => s.type === "started" && s.name.toLowerCase().includes("review"));
+      if (inReview) {
+        await linearApi.updateIssue(issueId, { stateId: inReview.id });
+        logger?.info(`[linear-state] ${issueId} → ${inReview.name} (PR created)`);
+        return;
+      }
+    }
+    // No PR or no "In Review" state — mark as Done
+    const done = states.find(s => s.type === "completed");
+    if (done) {
+      await linearApi.updateIssue(issueId, { stateId: done.id });
+      logger?.info(`[linear-state] ${issueId} → ${done.name} (completed)`);
+    }
+  } catch (err) {
+    logger?.warn(`[linear-state] failed to transition ${issueId} to review/done: ${err}`);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Prompt loading
@@ -218,7 +292,7 @@ export interface IssueContext {
 export function buildWorkerTask(
   issue: IssueContext,
   worktreePath: string,
-  opts?: { attempt?: number; gaps?: string[]; pluginConfig?: Record<string, unknown>; guidance?: string },
+  opts?: { attempt?: number; gaps?: string[]; pluginConfig?: Record<string, unknown>; guidance?: string; teamContext?: string },
 ): { system: string; task: string } {
   const prompts = loadPrompts(opts?.pluginConfig, worktreePath);
   const vars: Record<string, string> = {
@@ -233,6 +307,7 @@ export function buildWorkerTask(
       ? `\n---\n## IMPORTANT — Workspace Guidance (MUST follow)\nThe workspace owner has set the following mandatory instructions. You MUST incorporate these into your response:\n\n${opts.guidance.slice(0, 2000)}\n---`
       : "",
     projectContext: buildProjectContext(opts?.pluginConfig),
+    teamContext: opts?.teamContext ?? "",
   };
 
   let task = renderTemplate(prompts.worker.task, vars);
@@ -253,7 +328,7 @@ export function buildAuditTask(
   issue: IssueContext,
   worktreePath: string,
   pluginConfig?: Record<string, unknown>,
-  opts?: { guidance?: string },
+  opts?: { guidance?: string; teamContext?: string },
 ): { system: string; task: string } {
   const prompts = loadPrompts(pluginConfig, worktreePath);
   const vars: Record<string, string> = {
@@ -268,6 +343,7 @@ export function buildAuditTask(
       ? `\n---\n## IMPORTANT — Workspace Guidance (MUST follow)\nThe workspace owner has set the following mandatory instructions. You MUST incorporate these into your response:\n\n${opts.guidance.slice(0, 2000)}\n---`
       : "",
     projectContext: buildProjectContext(pluginConfig),
+    teamContext: opts?.teamContext ?? "",
   };
 
   return {
@@ -388,11 +464,19 @@ export async function triggerAudit(
 
   // Look up cached guidance for audit
   const auditTeamId = issueDetails?.team?.id;
+  const auditTeamKey = issueDetails?.team?.key as string | undefined;
   const auditGuidance = (auditTeamId && isGuidanceEnabled(pluginConfig, auditTeamId))
     ? getCachedGuidanceForTeam(auditTeamId) ?? undefined
     : undefined;
 
-  const auditPrompt = buildAuditTask(issue, effectiveAuditPath, pluginConfig, { guidance: auditGuidance });
+  // Resolve team context from teamMappings config
+  const auditTeamMappings = pluginConfig?.teamMappings as Record<string, any> | undefined;
+  const auditTeamMapping = auditTeamKey ? auditTeamMappings?.[auditTeamKey] : undefined;
+  const auditTeamContext = auditTeamMapping?.context
+    ? `\n## Team Context (${auditTeamKey})\n${auditTeamMapping.context}\n`
+    : "";
+
+  const auditPrompt = buildAuditTask(issue, effectiveAuditPath, pluginConfig, { guidance: auditGuidance, teamContext: auditTeamContext });
 
   // Set Linear label
   await linearApi.emitActivity(dispatch.agentSessionId ?? "", {
@@ -424,11 +508,22 @@ export async function triggerAudit(
     activeDispatch.auditSessionKey = auditSessionId;
   }
 
+  // Resolve audit agent: team mapping → plugin default
+  const auditDefaultAgentId = (pluginConfig?.defaultAgentId as string) ?? "default";
+  let auditAgentId = auditDefaultAgentId;
+  if (auditTeamKey) {
+    const auditTeamDefault = auditTeamMappings?.[auditTeamKey]?.defaultAgent;
+    if (typeof auditTeamDefault === "string") {
+      auditAgentId = auditTeamDefault;
+      api.logger.info(`${TAG} audit agent routed to ${auditAgentId} via team mapping (${auditTeamKey})`);
+    }
+  }
+
   api.logger.info(`${TAG} spawning audit agent session=${auditSessionId}`);
 
   const result = await runAgent({
     api,
-    agentId: (pluginConfig?.defaultAgentId as string) ?? "default",
+    agentId: auditAgentId,
     sessionId: auditSessionId,
     message: `${auditPrompt.system}\n\n${auditPrompt.task}`,
     streaming: dispatch.agentSessionId
@@ -558,15 +653,7 @@ async function handleAuditPass(
     throw err;
   }
 
-  // Move to completed
-  await completeDispatch(dispatch.issueIdentifier, {
-    tier: dispatch.tier,
-    status: "done",
-    completedAt: new Date().toISOString(),
-    project: dispatch.project,
-  }, configPath);
-
-  // Build summary from .claw/ artifacts and write to memory
+  // Build summary from .claw/ artifacts and write to memory (before PR so body can include it)
   let summary: string | null = null;
   try {
     summary = buildSummaryFromArtifacts(dispatch.worktreePath);
@@ -587,12 +674,58 @@ async function handleAuditPass(
     api.logger.warn(`${TAG} failed to write summary/memory: ${err}`);
   }
 
-  // Post approval comment (with summary excerpt if available)
+  // Auto-PR creation (best-effort, non-fatal)
+  let prUrl: string | null = null;
+  try {
+    const wtStatus = getWorktreeStatus(dispatch.worktreePath);
+    if (wtStatus.lastCommit) {
+      const prBody = [
+        `Fixes ${dispatch.issueIdentifier}`,
+        "",
+        "## What changed",
+        summary?.slice(0, 2000) ?? "(see audit verdict)",
+        "",
+        "## Audit",
+        `- **Criteria:** ${verdict.criteria.join(", ") || "N/A"}`,
+        `- **Tests:** ${verdict.testResults || "N/A"}`,
+        "",
+        `*Auto-generated by OpenClaw dispatch pipeline*`,
+      ].join("\n");
+      const prResult = createPullRequest(
+        dispatch.worktreePath,
+        `${dispatch.issueIdentifier}: ${dispatch.issueTitle ?? "implementation"}`,
+        prBody,
+      );
+      prUrl = prResult.prUrl;
+      api.logger.info(`${TAG} PR created: ${prUrl}`);
+    } else {
+      api.logger.info(`${TAG} no commits in worktree — skipping PR creation`);
+    }
+  } catch (err) {
+    api.logger.warn(`${TAG} PR creation failed (non-fatal): ${err}`);
+  }
+
+  // Move to completed (include prUrl if PR was created)
+  await completeDispatch(dispatch.issueIdentifier, {
+    tier: dispatch.tier,
+    status: "done",
+    completedAt: new Date().toISOString(),
+    project: dispatch.project,
+    prUrl: prUrl ?? undefined,
+  }, configPath);
+
+  // Linear state transition: "In Review" if PR was created, otherwise "Done"
+  const issueDetails = await linearApi.getIssueDetails(dispatch.issueId).catch(() => null);
+  const teamId = issueDetails?.team?.id;
+  await transitionToReviewOrDone(linearApi, dispatch.issueId, teamId, !!prUrl, api.logger);
+
+  // Post approval comment (with summary excerpt and PR link if available)
   const criteriaList = verdict.criteria.map((c) => `- ${c}`).join("\n");
   const summaryExcerpt = summary ? `\n\n**Summary:**\n${summary.slice(0, 2000)}` : "";
+  const prLine = prUrl ? `\n- **Pull request:** ${prUrl}` : "";
   await linearApi.createComment(
     dispatch.issueId,
-    `## Done\n\nThis issue has been implemented and verified.\n\n**What was checked:**\n${criteriaList}\n\n**Test results:** ${verdict.testResults || "N/A"}${summaryExcerpt}\n\n---\n*Completed on attempt ${dispatch.attempt + 1}.*\n\n**Next steps:**\n- Review the code: \`cd ${dispatch.worktreePath}\`\n- View artifacts: \`ls ${dispatch.worktreePath}/.claw/\`\n- Create a PR from the worktree branch if one wasn't opened automatically`,
+    `## Done\n\nThis issue has been implemented and verified.\n\n**What was checked:**\n${criteriaList}\n\n**Test results:** ${verdict.testResults || "N/A"}${summaryExcerpt}${prLine}\n\n---\n*Completed on attempt ${dispatch.attempt + 1}.*\n\n**Next steps:**\n- Review the code: \`cd ${dispatch.worktreePath}\`\n- View artifacts: \`ls ${dispatch.worktreePath}/.claw/\`${prUrl ? "" : "\n- Create a PR from the worktree branch if one wasn't opened automatically"}`,
   ).catch((err) => api.logger.error(`${TAG} failed to post audit pass comment: ${err}`));
 
   api.logger.info(`${TAG} audit PASSED — dispatch completed (attempt ${dispatch.attempt})`);
@@ -672,6 +805,13 @@ async function handleAuditFail(
         });
       }
     } catch {}
+
+    // Linear state transition: move to "Triage" so it shows up for human review
+    const stuckIssueDetails = await linearApi.getIssueDetails(dispatch.issueId).catch(() => null);
+    await transitionLinearIssueState(
+      linearApi, dispatch.issueId, stuckIssueDetails?.team?.id,
+      "triage", undefined, api.logger,
+    );
 
     const gapsList = verdict.gaps.map((g) => `- ${g}`).join("\n");
     await linearApi.createComment(
@@ -804,15 +944,24 @@ export async function spawnWorker(
 
   // Look up cached guidance for the issue's team
   const workerTeamId = issueDetails?.team?.id;
+  const workerTeamKey = issueDetails?.team?.key as string | undefined;
   const workerGuidance = (workerTeamId && isGuidanceEnabled(pluginConfig, workerTeamId))
     ? getCachedGuidanceForTeam(workerTeamId) ?? undefined
     : undefined;
+
+  // Resolve team context from teamMappings config
+  const workerTeamMappings = pluginConfig?.teamMappings as Record<string, any> | undefined;
+  const workerTeamMapping = workerTeamKey ? workerTeamMappings?.[workerTeamKey] : undefined;
+  const workerTeamContext = workerTeamMapping?.context
+    ? `\n## Team Context (${workerTeamKey})\n${workerTeamMapping.context}\n`
+    : "";
 
   const workerPrompt = buildWorkerTask(issue, effectiveWorkerPath, {
     attempt: dispatch.attempt,
     gaps: opts?.gaps,
     pluginConfig,
     guidance: workerGuidance,
+    teamContext: workerTeamContext,
   });
 
   const workerSessionId = `linear-worker-${dispatch.issueIdentifier}-${dispatch.attempt}`;
@@ -833,10 +982,21 @@ export async function spawnWorker(
 
   api.logger.info(`${TAG} spawning worker agent session=${workerSessionId} (attempt ${dispatch.attempt})`);
 
+  // Resolve agent: team mapping → plugin default
+  const defaultAgentId = (pluginConfig?.defaultAgentId as string) ?? "default";
+  let workerAgentId = defaultAgentId;
+  if (workerTeamKey) {
+    const teamDefault = workerTeamMappings?.[workerTeamKey]?.defaultAgent;
+    if (typeof teamDefault === "string") {
+      workerAgentId = teamDefault;
+      api.logger.info(`${TAG} worker agent routed to ${workerAgentId} via team mapping (${workerTeamKey})`);
+    }
+  }
+
   const workerStartTime = Date.now();
   const result = await runAgent({
     api,
-    agentId: (pluginConfig?.defaultAgentId as string) ?? "default",
+    agentId: workerAgentId,
     sessionId: workerSessionId,
     message: `${workerPrompt.system}\n\n${workerPrompt.task}`,
     streaming: dispatch.agentSessionId
@@ -846,7 +1006,7 @@ export async function spawnWorker(
 
   // Save worker output to .claw/
   const workerElapsed = Date.now() - workerStartTime;
-  const agentId = (pluginConfig?.defaultAgentId as string) ?? "default";
+  const agentId = workerAgentId;
   try { saveWorkerOutput(dispatch.worktreePath, dispatch.attempt, result.output); } catch {}
   try {
     appendLog(dispatch.worktreePath, {
@@ -896,6 +1056,13 @@ export async function spawnWorker(
         api.logger.warn(`${TAG} CAS failed for watchdog stuck transition: ${err.message}`);
       }
     }
+
+    // Linear state transition: move to "Triage" so it shows up for human review
+    const wdIssueDetails = await linearApi.getIssueDetails(dispatch.issueId).catch(() => null);
+    await transitionLinearIssueState(
+      linearApi, dispatch.issueId, wdIssueDetails?.team?.id,
+      "triage", undefined, api.logger,
+    );
 
     await linearApi.createComment(
       dispatch.issueId,

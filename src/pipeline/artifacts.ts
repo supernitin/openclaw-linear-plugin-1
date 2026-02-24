@@ -307,3 +307,45 @@ export function resolveOrchestratorWorkspace(
     return join(home, ".openclaw", "workspace");
   }
 }
+
+/**
+ * Read worker output artifacts for all attempts.
+ */
+export function readWorkerOutputs(worktreePath: string, maxAttempt: number): string[] {
+  const outputs: string[] = [];
+  for (let i = 0; i <= maxAttempt; i++) {
+    try {
+      outputs.push(readFileSync(join(clawDir(worktreePath), `worker-${i}.md`), "utf-8"));
+    } catch {
+      outputs.push("(not found)");
+    }
+  }
+  return outputs;
+}
+
+/**
+ * Read audit verdict artifacts for all attempts.
+ */
+export function readAuditVerdicts(worktreePath: string, maxAttempt: number): string[] {
+  const verdicts: string[] = [];
+  for (let i = 0; i <= maxAttempt; i++) {
+    try {
+      verdicts.push(readFileSync(join(clawDir(worktreePath), `audit-${i}.json`), "utf-8"));
+    } catch {
+      verdicts.push("(not found)");
+    }
+  }
+  return verdicts;
+}
+
+/**
+ * Read the interaction log entries.
+ */
+export function readLog(worktreePath: string): string[] {
+  try {
+    const raw = readFileSync(join(clawDir(worktreePath), "log.jsonl"), "utf-8");
+    return raw.trim().split("\n").filter(Boolean);
+  } catch {
+    return [];
+  }
+}

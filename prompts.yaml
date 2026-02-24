@@ -2,7 +2,7 @@
 #
 # Template variables: {{identifier}}, {{title}}, {{description}},
 #   {{worktreePath}}, {{gaps}}, {{tier}}, {{attempt}}, {{guidance}},
-#   {{projectContext}}
+#   {{projectContext}}, {{teamContext}}
 #
 # Edit these to customize worker/audit behavior without rebuilding the plugin.
 # Override path via `promptsPath` in plugin config.
@@ -27,6 +27,7 @@ worker:
 
     Worktree: {{worktreePath}}
     {{projectContext}}
+    {{teamContext}}
 
     Before writing any code, read these files in the worktree root (if they exist):
     - CLAUDE.md — project conventions, tech stack, build/test commands, architecture
@@ -70,6 +71,7 @@ audit:
 
     Worktree: {{worktreePath}}
     {{projectContext}}
+    {{teamContext}}
 
     Before auditing, read these files in the worktree root (if they exist):
     - CLAUDE.md — project conventions, tech stack, build/test commands
