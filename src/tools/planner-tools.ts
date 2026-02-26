@@ -408,6 +408,7 @@ export function createPlannerTools(): AnyAgentTool[] {
           priority: { type: "number", description: "New priority: 1=Urgent, 2=High, 3=Medium, 4=Low" },
           labelIds: {
             type: "array",
+            items: { type: "string" },
             description: "Label IDs to set",
           },
         },
