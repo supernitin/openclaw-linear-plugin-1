@@ -303,6 +303,73 @@ export class LinearAgentApi {
     return data.commentCreate.comment.id;
   }
 
+  async createInitiativeUpdate(
+    initiativeId: string,
+    body: string,
+  ): Promise<string> {
+    const data = await this.gql<{
+      initiativeUpdateCreate: { success: boolean; initiativeUpdate: { id: string } };
+    }>(
+      `mutation InitiativeUpdateCreate($input: InitiativeUpdateCreateInput!) {
+        initiativeUpdateCreate(input: $input) {
+          success
+          initiativeUpdate { id }
+        }
+      }`,
+      { input: { initiativeId, body } },
+    );
+    return data.initiativeUpdateCreate.initiativeUpdate.id;
+  }
+
+  async getInitiative(initiativeId: string): Promise<{
+    id: string;
+    name: string;
+    description: string | null;
+    status: string;
+  } | null> {
+    try {
+      const data = await this.gql<{
+        initiative: { id: string; name: string; description: string | null; status: string };
+      }>(
+        `query Initiative($id: String!) {
+          initiative(id: $id) {
+            id
+            name
+            description
+            status
+          }
+        }`,
+        { id: initiativeId },
+      );
+      return data.initiative;
+    } catch {
+      return null;
+    }
+  }
+
+  async getInitiativeFromUpdate(updateId: string): Promise<{
+    id: string;
+    name: string;
+  } | null> {
+    try {
+      const data = await this.gql<{
+        node: { initiative?: { id: string; name: string } } | null;
+      }>(
+        `query GetInitiativeFromUpdate($id: ID!) {
+          node(id: $id) {
+            ... on InitiativeUpdate {
+              initiative { id name }
+            }
+          }
+        }`,
+        { id: updateId },
+      );
+      return data.node?.initiative ?? null;
+    } catch {
+      return null;
+    }
+  }
+
   async getIssueDetails(issueId: string): Promise<{
     id: string;
     identifier: string;

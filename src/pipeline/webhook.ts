@@ -973,7 +973,15 @@ export async function handleLinearWebhook(
     const issue = comment?.issue ?? payload.issue;
 
     if (!issue?.id) {
-      api.logger.error("Comment webhook: missing issue data");
+      // Project update comments have data.projectUpdate instead of data.issue.
+      // Log clearly and skip — project update mentions are handled by the
+      // InitiativeUpdate.create handler instead.
+      const projectUpdate = comment?.projectUpdate ?? comment?.projectUpdateId;
+      if (projectUpdate) {
+        api.logger.info(`Comment on project update (not issue) — skipping comment handler`);
+      } else {
+        api.logger.warn("Comment webhook: missing both issue and projectUpdate data");
+      }
       return true;
     }
 
@@ -1597,6 +1605,115 @@ export async function handleLinearWebhook(
       } finally {
         clearActiveSession(issue.id);
         activeRuns.delete(issue.id);
+      }
+    })();
+
+    return true;
+  }
+
+  // ── InitiativeUpdate.create — @mention routing ──────────────────
+  if (payload.type === "InitiativeUpdate" && payload.action === "create") {
+    res.statusCode = 200;
+    res.end("ok");
+
+    const updateData = payload.data;
+    const updateBody = updateData?.body ?? "";
+    const author = payload.actor?.name ?? "Unknown";
+
+    // Only process if there's an @mention
+    const profiles = loadAgentProfiles();
+    const mentionPattern = buildMentionPattern(profiles);
+    const mentionMatches = mentionPattern ? updateBody.match(mentionPattern) : null;
+
+    if (!mentionMatches || mentionMatches.length === 0) {
+      api.logger.info(`InitiativeUpdate: no @mention detected — ignoring`);
+      return true;
+    }
+
+    const alias = mentionMatches[0].replace("@", "");
+    const resolved = resolveAgentFromAlias(alias, profiles);
+    if (!resolved) {
+      api.logger.warn(`InitiativeUpdate: unrecognized alias @${alias}`);
+      return true;
+    }
+
+    // Dedup
+    if (updateData?.id && wasRecentlyProcessed(`initiative-update:${updateData.id}`)) {
+      api.logger.info(`InitiativeUpdate ${updateData.id} already processed — skipping`);
+      return true;
+    }
+
+    const linearApi = createLinearApi(api);
+    if (!linearApi) {
+      api.logger.error("No Linear access token — cannot process initiative update");
+      return true;
+    }
+
+    // Resolve initiative ID: try data.initiative.id, data.initiativeId, or query API
+    let initiativeId: string | null =
+      updateData?.initiative?.id ?? updateData?.initiativeId ?? null;
+    let initiativeName: string = updateData?.initiative?.name ?? "Unknown Initiative";
+
+    if (!initiativeId && updateData?.id) {
+      // Query the API to find the parent initiative
+      try {
+        const initiative = await linearApi.getInitiativeFromUpdate(updateData.id);
+        if (initiative) {
+          initiativeId = initiative.id;
+          initiativeName = initiative.name;
+        }
+      } catch (err) {
+        api.logger.warn(`Could not resolve initiative from update: ${err}`);
+      }
+    }
+
+    if (!initiativeId) {
+      api.logger.error(`InitiativeUpdate @mention: could not resolve initiative ID — cannot reply`);
+      return true;
+    }
+
+    api.logger.info(`InitiativeUpdate @mention: @${resolved.agentId} on initiative "${initiativeName}" (${initiativeId})`);
+
+    // Dispatch async
+    void (async () => {
+      try {
+        const profile = profiles[resolved.agentId];
+        const label = profile?.label ?? resolved.agentId;
+
+        // Fetch initiative details for context
+        const initiative = await linearApi.getInitiative(initiativeId!);
+
+        const message = [
+          `You are responding to an @mention on a Linear Initiative Update. Your text output will be posted as a new update on the initiative.`,
+          ``,
+          `## Initiative: ${initiative?.name ?? initiativeName}`,
+          `**Status:** ${initiative?.status ?? "Unknown"}`,
+          initiative?.description ? `**Description:** ${initiative.description}` : "",
+          ``,
+          `**${author} says:**`,
+          `> ${sanitizePromptInput(updateBody, 2000)}`,
+          ``,
+          `Respond conversationally and concisely. This is an initiative update, not a code issue.`,
+        ].filter(Boolean).join("\n");
+
+        const sessionId = `linear-initiative-${resolved.agentId}-${Date.now()}`;
+        const { runAgent } = await import("../agent/agent.js");
+        const result = await runAgent({
+          api,
+          agentId: resolved.agentId,
+          sessionId,
+          message,
+          timeoutMs: 2 * 60_000,
+        });
+
+        const responseBody = result.success
+          ? result.output
+          : `I received your mention but encountered an issue processing it. Please try again.`;
+
+        await linearApi.createInitiativeUpdate(initiativeId!, `**[${label}]** ${responseBody}`);
+        api.logger.info(`Posted ${resolved.agentId} initiative update response on "${initiativeName}"`);
+      } catch (err) {
+        api.logger.error(`InitiativeUpdate dispatch error: ${err}`);
       }
     })();
 

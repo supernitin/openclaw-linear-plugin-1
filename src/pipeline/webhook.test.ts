@@ -80,6 +80,9 @@ const {
       { id: "st-2", name: "In Progress", type: "started" },
       { id: "st-3", name: "Done", type: "completed" },
     ]),
+    createInitiativeUpdate: vi.fn().mockResolvedValue("initiative-update-id"),
+    getInitiative: vi.fn().mockResolvedValue({ id: "init-1", name: "Q1 Roadmap", description: "Planning", status: "In Progress" }),
+    getInitiativeFromUpdate: vi.fn().mockResolvedValue({ id: "init-1", name: "Q1 Roadmap" }),
   },
   loadAgentProfilesMock: vi.fn().mockReturnValue({
     mal: { label: "Mal", mission: "captain", mentionAliases: ["mal", "mason"], isDefault: true, avatarUrl: "https://example.com/mal.png" },
@@ -344,6 +347,9 @@ afterEach(() => {
     { id: "st-2", name: "In Progress", type: "started" },
     { id: "st-3", name: "Done", type: "completed" },
   ]);
+  mockLinearApiInstance.createInitiativeUpdate.mockReset().mockResolvedValue("initiative-update-id");
+  mockLinearApiInstance.getInitiative.mockReset().mockResolvedValue({ id: "init-1", name: "Q1 Roadmap", description: "Planning", status: "In Progress" });
+  mockLinearApiInstance.getInitiativeFromUpdate.mockReset().mockResolvedValue({ id: "init-1", name: "Q1 Roadmap" });
   resolveLinearTokenMock.mockReset().mockReturnValue({
     accessToken: "test-token",
     refreshToken: "test-refresh",
@@ -1092,7 +1098,7 @@ describe("AgentSessionEvent.prompted full flow", () => {
 // ---------------------------------------------------------------------------
 
 describe("Comment.create intent routing", () => {
-  it("responds 200 and logs missing issue data", async () => {
+  it("responds 200 and logs warning when comment has no issue or projectUpdate", async () => {
     const result = await postWebhook({
       type: "Comment",
       action: "create",
@@ -1100,8 +1106,27 @@ describe("Comment.create intent routing", () => {
     });
 
     expect(result.status).toBe(200);
-    const errorCalls = (result.api.logger.error as any).mock.calls.map((c: any[]) => c[0]);
-    expect(errorCalls.some((msg: string) => msg.includes("missing issue data"))).toBe(true);
+    const warnCalls = (result.api.logger.warn as any).mock.calls.map((c: any[]) => c[0]);
+    expect(warnCalls.some((msg: string) => msg.includes("missing both issue and projectUpdate"))).toBe(true);
+  });
+
+  it("responds 200 and logs info when comment is on a project update", async () => {
+    const result = await postWebhook({
+      type: "Comment",
+      action: "create",
+      data: {
+        id: "comment-proj-update",
+        body: "Great progress!",
+        user: { id: "u1", name: "User" },
+        projectUpdate: { id: "pu-1" },
+      },
+    });
+
+    expect(result.status).toBe(200);
+    const infoCalls = (result.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
+    expect(infoCalls.some((msg: string) => msg.includes("Comment on project update"))).toBe(true);
+    // Should NOT dispatch to agent
+    expect(runAgentMock).not.toHaveBeenCalled();
   });
 
   it("deduplicates by comment ID", async () => {
@@ -5036,5 +5061,191 @@ describe("session affinity routing", () => {
     const infoCalls = (result.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
     // ask_agent uses intentResult.agentId directly, not affinity
     expect(infoCalls.some((msg: string) => msg.includes("ask_agent") && msg.includes("mal"))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// InitiativeUpdate.create — @mention routing
+// ---------------------------------------------------------------------------
+
+describe("InitiativeUpdate.create @mention routing", () => {
+  it("dispatches agent and posts initiative update when @mention is present", async () => {
+    resolveAgentFromAliasMock.mockReturnValue({ agentId: "mal" });
+
+    const result = await postWebhook({
+      type: "InitiativeUpdate",
+      action: "create",
+      data: {
+        id: "iu-1",
+        body: "Hey @mal what do you think about this initiative?",
+        initiative: { id: "init-1", name: "Q1 Roadmap" },
+      },
+      actor: { name: "Nitin" },
+    });
+
+    expect(result.status).toBe(200);
+    // Wait for async dispatch
+    await new Promise((r) => setTimeout(r, 300));
+
+    const infoCalls = (result.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
+    expect(infoCalls.some((msg: string) => msg.includes("InitiativeUpdate @mention") && msg.includes("mal"))).toBe(true);
+    expect(runAgentMock).toHaveBeenCalled();
+    expect(mockLinearApiInstance.createInitiativeUpdate).toHaveBeenCalledWith(
+      "init-1",
+      expect.stringContaining("[Mal]"),
+    );
+  });
+
+  it("ignores InitiativeUpdate with no @mention", async () => {
+    const result = await postWebhook({
+      type: "InitiativeUpdate",
+      action: "create",
+      data: {
+        id: "iu-2",
+        body: "Just a regular update with no mentions",
+        initiative: { id: "init-1", name: "Q1 Roadmap" },
+      },
+      actor: { name: "Nitin" },
+    });
+
+    expect(result.status).toBe(200);
+    const infoCalls = (result.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
+    expect(infoCalls.some((msg: string) => msg.includes("no @mention detected"))).toBe(true);
+    expect(runAgentMock).not.toHaveBeenCalled();
+  });
+
+  it("logs warning for unrecognized @mention alias", async () => {
+    buildMentionPatternMock.mockReturnValue(/@(mal|mason|kaylee|eureka|unknown)/i);
+    resolveAgentFromAliasMock.mockReturnValue(null);
+
+    const result = await postWebhook({
+      type: "InitiativeUpdate",
+      action: "create",
+      data: {
+        id: "iu-3",
+        body: "Hey @unknown check this out",
+        initiative: { id: "init-1", name: "Q1 Roadmap" },
+      },
+      actor: { name: "Nitin" },
+    });
+
+    expect(result.status).toBe(200);
+    const warnCalls = (result.api.logger.warn as any).mock.calls.map((c: any[]) => c[0]);
+    expect(warnCalls.some((msg: string) => msg.includes("unrecognized alias"))).toBe(true);
+    expect(runAgentMock).not.toHaveBeenCalled();
+  });
+
+  it("deduplicates already-processed InitiativeUpdate", async () => {
+    resolveAgentFromAliasMock.mockReturnValue({ agentId: "mal" });
+    _markAsProcessedForTesting("initiative-update:iu-dup");
+
+    const result = await postWebhook({
+      type: "InitiativeUpdate",
+      action: "create",
+      data: {
+        id: "iu-dup",
+        body: "Hey @mal test dedup",
+        initiative: { id: "init-1", name: "Q1 Roadmap" },
+      },
+      actor: { name: "Nitin" },
+    });
+
+    expect(result.status).toBe(200);
+    const infoCalls = (result.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
+    expect(infoCalls.some((msg: string) => msg.includes("already processed"))).toBe(true);
+    expect(runAgentMock).not.toHaveBeenCalled();
+  });
+
+  it("resolves initiative ID from API when not in payload", async () => {
+    resolveAgentFromAliasMock.mockReturnValue({ agentId: "mal" });
+    mockLinearApiInstance.getInitiativeFromUpdate.mockResolvedValue({ id: "init-resolved", name: "Resolved Initiative" });
+    mockLinearApiInstance.getInitiative.mockResolvedValue({ id: "init-resolved", name: "Resolved Initiative", description: null, status: "Active" });
+
+    const result = await postWebhook({
+      type: "InitiativeUpdate",
+      action: "create",
+      data: {
+        id: "iu-no-init",
+        body: "Hey @mal what's the status?",
+        // No initiative field — must resolve via API
+      },
+      actor: { name: "Nitin" },
+    });
+
+    expect(result.status).toBe(200);
+    await new Promise((r) => setTimeout(r, 300));
+
+    expect(mockLinearApiInstance.getInitiativeFromUpdate).toHaveBeenCalledWith("iu-no-init");
+    expect(runAgentMock).toHaveBeenCalled();
+    expect(mockLinearApiInstance.createInitiativeUpdate).toHaveBeenCalledWith(
+      "init-resolved",
+      expect.any(String),
+    );
+  });
+
+  it("logs error when initiative ID cannot be resolved", async () => {
+    resolveAgentFromAliasMock.mockReturnValue({ agentId: "mal" });
+    mockLinearApiInstance.getInitiativeFromUpdate.mockResolvedValue(null);
+
+    const result = await postWebhook({
+      type: "InitiativeUpdate",
+      action: "create",
+      data: {
+        id: "iu-no-init-fail",
+        body: "Hey @mal help",
+        // No initiative field and API returns null
+      },
+      actor: { name: "Nitin" },
+    });
+
+    expect(result.status).toBe(200);
+    const errorCalls = (result.api.logger.error as any).mock.calls.map((c: any[]) => c[0]);
+    expect(errorCalls.some((msg: string) => msg.includes("could not resolve initiative ID"))).toBe(true);
+    expect(runAgentMock).not.toHaveBeenCalled();
+  });
+
+  it("skips when no Linear access token", async () => {
+    resolveAgentFromAliasMock.mockReturnValue({ agentId: "mal" });
+    resolveLinearTokenMock.mockReturnValue({ accessToken: null, source: "none" });
+
+    const result = await postWebhook({
+      type: "InitiativeUpdate",
+      action: "create",
+      data: {
+        id: "iu-no-token",
+        body: "Hey @mal help",
+        initiative: { id: "init-1", name: "Q1 Roadmap" },
+      },
+      actor: { name: "Nitin" },
+    });
+
+    expect(result.status).toBe(200);
+    const errorCalls = (result.api.logger.error as any).mock.calls.map((c: any[]) => c[0]);
+    expect(errorCalls.some((msg: string) => msg.includes("No Linear access token"))).toBe(true);
+    expect(runAgentMock).not.toHaveBeenCalled();
+  });
+
+  it("handles agent failure gracefully and posts fallback message", async () => {
+    resolveAgentFromAliasMock.mockReturnValue({ agentId: "mal" });
+    runAgentMock.mockResolvedValue({ success: false, output: "" });
+
+    const result = await postWebhook({
+      type: "InitiativeUpdate",
+      action: "create",
+      data: {
+        id: "iu-agent-fail",
+        body: "Hey @mal please respond",
+        initiative: { id: "init-1", name: "Q1 Roadmap" },
+      },
+      actor: { name: "Nitin" },
+    });
+
+    expect(result.status).toBe(200);
+    await new Promise((r) => setTimeout(r, 300));
+
+    expect(mockLinearApiInstance.createInitiativeUpdate).toHaveBeenCalledWith(
+      "init-1",
+      expect.stringContaining("encountered an issue"),
+    );
   });
 });
