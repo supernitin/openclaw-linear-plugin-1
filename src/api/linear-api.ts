@@ -303,6 +303,41 @@ export class LinearAgentApi {
     return data.commentCreate.comment.id;
   }
 
+  /**
+   * Create a comment on a non-issue entity (initiative update, project update,
+   * document content, etc.) or as a threaded reply to an existing comment.
+   *
+   * Exactly one of the target fields should be provided. If `parentId` is set,
+   * the comment becomes a threaded reply.
+   */
+  async createCommentOnEntity(
+    target: {
+      initiativeUpdateId?: string;
+      projectUpdateId?: string;
+      documentContentId?: string;
+      parentId?: string;
+    },
+    body: string,
+    opts?: { createAsUser?: string; displayIconUrl?: string },
+  ): Promise<string> {
+    const input: Record<string, unknown> = { ...target, body };
+    if (opts?.createAsUser) input.createAsUser = opts.createAsUser;
+    if (opts?.displayIconUrl) input.displayIconUrl = opts.displayIconUrl;
+
+    const data = await this.gql<{
+      commentCreate: { success: boolean; comment: { id: string } };
+    }>(
+      `mutation CommentOnEntity($input: CommentCreateInput!) {
+        commentCreate(input: $input) {
+          success
+          comment { id }
+        }
+      }`,
+      { input },
+    );
+    return data.commentCreate.comment.id;
+  }
+
   async createInitiativeUpdate(
     initiativeId: string,
     body: string,
@@ -382,7 +417,7 @@ export class LinearAgentApi {
     labels: { nodes: Array<{ id: string; name: string }> };
     team: { id: string; key: string; name: string; issueEstimationType: string };
     comments: { nodes: Array<{ body: string; user: { name: string } | null; createdAt: string }> };
-    project: { id: string; name: string } | null;
+    project: { id: string; name: string; description: string | null } | null;
     parent: { id: string; identifier: string } | null;
     relations: { nodes: Array<{ type: string; relatedIssue: { id: string; identifier: string; title: string } }> };
   }> {
@@ -406,7 +441,7 @@ export class LinearAgentApi {
               createdAt
             }
           }
-          project { id name }
+          project { id name description }
           parent { id identifier }
           relations { nodes { type relatedIssue { id identifier title } } }
         }

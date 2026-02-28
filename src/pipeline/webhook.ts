@@ -109,6 +109,17 @@ export function _resetForTesting(): void {
   _resetAffinityForTesting();
 }
 
+// ── Per-handler config toggles ─────────────────────────────────────────
+// Allows disabling individual webhook handlers via pluginConfig.webhookHandlers.
+// When a handler key is explicitly set to false, that handler returns early.
+// Missing keys or missing webhookHandlers object → handler enabled (backwards compatible).
+
+export function isHandlerEnabled(pluginConfig: Record<string, unknown> | undefined, handler: string): boolean {
+  const handlers = pluginConfig?.webhookHandlers as Record<string, boolean> | undefined;
+  if (!handlers) return true;
+  return handlers[handler] !== false;
+}
+
 // ── Feedback loop prevention for steering ─────────────────────────────
 // Track recently emitted activity body hashes to prevent our own emissions
 // from triggering the steering handler.
@@ -347,6 +358,11 @@ export async function handleLinearWebhook(
     // Respond within 5 seconds (Linear requirement)
     res.statusCode = 200;
     res.end("ok");
+
+    if (!isHandlerEnabled((api as any).pluginConfig, "agentSession")) {
+      api.logger.info("AgentSession.created: handler disabled via config — skipping");
+      return true;
+    }
 
     const session = payload.agentSession ?? payload.data;
     const issue = session?.issue ?? payload.issue;
@@ -668,6 +684,11 @@ export async function handleLinearWebhook(
     res.statusCode = 200;
     res.end("ok");
 
+    if (!isHandlerEnabled((api as any).pluginConfig, "sessionPrompted")) {
+      api.logger.info("AgentSession.prompted: handler disabled via config — skipping");
+      return true;
+    }
+
     const session = payload.agentSession ?? payload.data;
     const issue = session?.issue ?? payload.issue;
     const activity = payload.agentActivity;
@@ -967,21 +988,78 @@ export async function handleLinearWebhook(
     res.statusCode = 200;
     res.end("ok");
 
+    if (!isHandlerEnabled((api as any).pluginConfig, "commentMention")) {
+      api.logger.info("Comment.create: handler disabled via config — skipping");
+      return true;
+    }
+
     const comment = payload.data;
     const commentBody = comment?.body ?? "";
     const commentor = comment?.user?.name ?? "Unknown";
     const issue = comment?.issue ?? payload.issue;
 
     if (!issue?.id) {
-      // Project update comments have data.projectUpdate instead of data.issue.
-      // Log clearly and skip — project update mentions are handled by the
-      // InitiativeUpdate.create handler instead.
-      const projectUpdate = comment?.projectUpdate ?? comment?.projectUpdateId;
-      if (projectUpdate) {
-        api.logger.info(`Comment on project update (not issue) — skipping comment handler`);
-      } else {
-        api.logger.warn("Comment webhook: missing both issue and projectUpdate data");
+      // ── Non-issue comment routing ──────────────────────────────────
+      // Comments on initiative updates, project updates, documents, etc.
+      // have no issue field. Route @mentions to a lightweight dispatch.
+      const initiativeUpdateId = comment?.initiativeUpdateId as string | undefined;
+      const projectUpdateId = comment?.projectUpdateId as string | undefined;
+      const documentContentId = comment?.documentContentId as string | undefined;
+
+      if (initiativeUpdateId || projectUpdateId || documentContentId) {
+        const parentType = initiativeUpdateId ? "initiative-update"
+          : projectUpdateId ? "project-update" : "document";
+        const parentId = initiativeUpdateId ?? projectUpdateId ?? documentContentId!;
+        api.logger.info(`Comment on ${parentType} ${parentId} — checking for @mention`);
+
+        // Dedup
+        if (comment?.id && wasRecentlyProcessed(`comment:${comment.id}`)) {
+          api.logger.info(`Non-issue comment ${comment.id} already processed — skipping`);
+          return true;
+        }
+
+        const linearApi = createLinearApi(api);
+        if (!linearApi) {
+          api.logger.error("No Linear access token — cannot process non-issue comment");
+          return true;
+        }
+
+        // Skip bot's own comments
+        try {
+          const viewerId = await linearApi.getViewerId();
+          if (viewerId && comment?.user?.id === viewerId) {
+            api.logger.info(`Non-issue comment: skipping our own comment on ${parentType}`);
+            return true;
+          }
+        } catch { /* proceed */ }
+
+        // Check for @mention
+        const profiles = loadAgentProfiles();
+        const mentionPattern = buildMentionPattern(profiles);
+        const mentionMatches = mentionPattern ? commentBody.match(mentionPattern) : null;
+
+        if (mentionMatches && mentionMatches.length > 0) {
+          const alias = mentionMatches[0].replace("@", "");
+          const resolved = resolveAgentFromAlias(alias, profiles);
+          if (resolved) {
+            api.logger.info(`Non-issue @mention: @${resolved.agentId} on ${parentType} ${parentId}`);
+
+            void dispatchNonIssueCommentToAgent(
+              api, linearApi, profiles, resolved.agentId,
+              { parentType, parentId: parentId, initiativeUpdateId, projectUpdateId, documentContentId },
+              comment, commentBody, commentor, pluginConfig,
+            ).catch((err) => api.logger.error(`Non-issue comment dispatch error: ${err}`));
+            return true;
+          }
+        }
+
+        // No @mention — log and skip (no intent classification for non-issue comments)
+        api.logger.info(`Comment on ${parentType} ${parentId}: no agent @mention — skipping`);
+        return true;
       }
+
+      // Truly unknown comment parent — no issue, no known entity
+      api.logger.warn(`Comment webhook: missing issue and no known parent entity — data keys: [${comment ? Object.keys(comment).join(", ") : "(none)"}]`);
       return true;
     }
 
@@ -1268,6 +1346,11 @@ export async function handleLinearWebhook(
     res.statusCode = 200;
     res.end("ok");
 
+    if (!isHandlerEnabled((api as any).pluginConfig, "issueAssignment")) {
+      api.logger.info("Issue.update: handler disabled via config — skipping");
+      return true;
+    }
+
     const issue = payload.data;
 
     // Guard: check activeRuns FIRST (synchronous, O(1)) before any async work.
@@ -1337,6 +1420,11 @@ export async function handleLinearWebhook(
   if (payload.type === "Issue" && payload.action === "create") {
     res.statusCode = 200;
     res.end("ok");
+
+    if (!isHandlerEnabled((api as any).pluginConfig, "issueAutoTriage")) {
+      api.logger.info("Issue.create: handler disabled via config — skipping");
+      return true;
+    }
 
     const issue = payload.data;
     if (!issue?.id) {
@@ -1469,7 +1557,23 @@ export async function handleLinearWebhook(
           ? formatGuidanceAppendix(triageGuidance)
           : "";
 
-        const projectCtx = buildProjectContext(pluginConfig);
+        // Build rich context from enriched issue data
+        const teamName = enrichedIssue?.team?.name ?? "Unknown";
+        const teamKey = enrichedIssue?.team?.key ?? "??";
+        const projectName = enrichedIssue?.project?.name ?? null;
+        const projectDescription = enrichedIssue?.project?.description ?? null;
+
+        const contextLines: string[] = [
+          `## Context`,
+          `**Team:** ${teamName} (${teamKey})`,
+        ];
+        if (projectName) {
+          contextLines.push(`**Project:** ${projectName}`);
+          if (projectDescription) {
+            contextLines.push(projectDescription);
+          }
+        }
+
         const message = [
           `IMPORTANT: You are triaging a new Linear issue. You MUST respond with a JSON block containing your triage decisions, followed by your assessment as plain text.`,
           ``,
@@ -1480,13 +1584,21 @@ export async function handleLinearWebhook(
           `**Description:**`,
           description,
           ``,
-          ...(projectCtx ? [projectCtx, ``] : []),
+          ...contextLines,
+          ``,
+          `## Domain Awareness`,
+          `Adapt your assessment to the team and project's domain. Not all issues are software development tasks.`,
+          `- If this is a personal, life, or non-technical project, frame your assessment accordingly`,
+          `  (no references to codebase, implementation, acceptance criteria, UAT, etc.)`,
+          `- If this is a development project, include technical analysis as appropriate`,
+          `- Match your tone and vocabulary to the issue's domain`,
+          ``,
           `## Your Triage Tasks`,
           ``,
-          `1. **Story Points** — Estimate complexity using ${estimationType} scale (1=trivial, 2=small, 3=medium, 5=large, 8=very large, 13=epic)`,
+          `1. **Complexity** — Estimate using ${estimationType} scale (1=trivial, 2=small, 3=medium, 5=large, 8=very large, 13=epic)`,
           `2. **Labels** — Select appropriate labels from the team's available labels`,
           `3. **Priority** — Set priority (1=Urgent, 2=High, 3=Medium, 4=Low) if not already set`,
-          `4. **Assessment** — Brief analysis of what this issue needs`,
+          `4. **Assessment** — Brief analysis of what this issue involves and what it needs`,
           ``,
           `## Available Labels`,
           availableLabelList || "  (no labels configured)",
@@ -1615,6 +1727,11 @@ export async function handleLinearWebhook(
   if (payload.type === "InitiativeUpdate" && payload.action === "create") {
     res.statusCode = 200;
     res.end("ok");
+
+    if (!isHandlerEnabled((api as any).pluginConfig, "initiativeUpdate")) {
+      api.logger.info("InitiativeUpdate.create: handler disabled via config — skipping");
+      return true;
+    }
 
     const updateData = payload.data;
     const updateBody = updateData?.body ?? "";
@@ -1907,6 +2024,105 @@ async function dispatchCommentToAgent(
   } finally {
     clearActiveSession(issue.id);
     activeRuns.delete(issue.id);
+  }
+}
+
+// ── Non-issue comment dispatch ────────────────────────────────────
+//
+// Handles @mention dispatch for comments on initiative updates, project
+// updates, and documents. Lighter than dispatchCommentToAgent — no issue
+// enrichment, no agent sessions, no active run tracking by issue ID.
+// Posts the response as a reply on the same entity thread.
+
+interface NonIssueTarget {
+  parentType: "initiative-update" | "project-update" | "document";
+  parentId: string;
+  initiativeUpdateId?: string;
+  projectUpdateId?: string;
+  documentContentId?: string;
+}
+
+async function dispatchNonIssueCommentToAgent(
+  api: OpenClawPluginApi,
+  linearApi: LinearAgentApi,
+  profiles: Record<string, AgentProfile>,
+  agentId: string,
+  target: NonIssueTarget,
+  comment: any,
+  commentBody: string,
+  commentor: string,
+  pluginConfig?: Record<string, unknown>,
+): Promise<void> {
+  const profile = profiles[agentId];
+  const label = profile?.label ?? agentId;
+  const avatarUrl = profile?.avatarUrl;
+
+  // Guard: prevent concurrent runs on same parent entity
+  const runKey = `entity:${target.parentId}`;
+  if (activeRuns.has(runKey)) {
+    api.logger.info(`dispatchNonIssueComment: ${target.parentType} ${target.parentId} has active run — skipping`);
+    return;
+  }
+
+  // Fetch context about the parent entity
+  let entityContext = "";
+  if (target.initiativeUpdateId) {
+    try {
+      const initiative = await linearApi.getInitiativeFromUpdate(target.initiativeUpdateId);
+      if (initiative) {
+        entityContext = `\n## Initiative: ${initiative.name}\n`;
+      }
+    } catch { /* proceed without context */ }
+  }
+
+  const message = [
+    `You are responding to an @mention on a ${target.parentType} comment in Linear.`,
+    `Your text output will be posted as a reply on the same thread (do NOT post comments yourself — the handler does it).`,
+    ``,
+    `**Your role:** Conversational assistant. Answer questions, provide analysis, or offer suggestions.`,
+    `You do NOT have access to Linear issue tools in this context — this is a ${target.parentType}, not an issue.`,
+    `Use standard tools (web_search, exec, read, etc.) if needed.`,
+    entityContext,
+    `**${commentor} says:**`,
+    `> ${commentBody}`,
+    ``,
+    `Respond concisely and helpfully.`,
+  ].filter(Boolean).join("\n");
+
+  activeRuns.add(runKey);
+
+  try {
+    const sessionId = `linear-entity-comment-${agentId}-${Date.now()}`;
+    const { runAgent } = await import("../agent/agent.js");
+    const result = await runAgent({
+      api,
+      agentId,
+      sessionId,
+      message,
+      timeoutMs: 2 * 60_000,
+    });
+
+    const responseBody = result.success
+      ? result.output
+      : `Something went wrong while processing this comment.`;
+
+    // Post response as a comment on the same entity
+    const replyTarget = target.initiativeUpdateId
+      ? { initiativeUpdateId: target.initiativeUpdateId }
+      : target.projectUpdateId
+        ? { projectUpdateId: target.projectUpdateId }
+        : { documentContentId: target.documentContentId! };
+
+    const labeledBody = `**[${label}]** ${responseBody}`;
+    const opts = avatarUrl ? { createAsUser: label, displayIconUrl: avatarUrl } : undefined;
+    const replyId = await linearApi.createCommentOnEntity(replyTarget, labeledBody, opts);
+    wasRecentlyProcessed(`comment:${replyId}`);
+
+    api.logger.info(`Posted ${agentId} response on ${target.parentType} ${target.parentId}`);
+  } catch (err) {
+    api.logger.error(`dispatchNonIssueCommentToAgent error: ${err}`);
+  } finally {
+    activeRuns.delete(runKey);
   }
 }
 

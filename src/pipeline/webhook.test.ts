@@ -83,6 +83,7 @@ const {
     createInitiativeUpdate: vi.fn().mockResolvedValue("initiative-update-id"),
     getInitiative: vi.fn().mockResolvedValue({ id: "init-1", name: "Q1 Roadmap", description: "Planning", status: "In Progress" }),
     getInitiativeFromUpdate: vi.fn().mockResolvedValue({ id: "init-1", name: "Q1 Roadmap" }),
+    createCommentOnEntity: vi.fn().mockResolvedValue("entity-comment-id"),
   },
   loadAgentProfilesMock: vi.fn().mockReturnValue({
     mal: { label: "Mal", mission: "captain", mentionAliases: ["mal", "mason"], isDefault: true, avatarUrl: "https://example.com/mal.png" },
@@ -350,6 +351,7 @@ afterEach(() => {
   mockLinearApiInstance.createInitiativeUpdate.mockReset().mockResolvedValue("initiative-update-id");
   mockLinearApiInstance.getInitiative.mockReset().mockResolvedValue({ id: "init-1", name: "Q1 Roadmap", description: "Planning", status: "In Progress" });
   mockLinearApiInstance.getInitiativeFromUpdate.mockReset().mockResolvedValue({ id: "init-1", name: "Q1 Roadmap" });
+  mockLinearApiInstance.createCommentOnEntity.mockReset().mockResolvedValue("entity-comment-id");
   resolveLinearTokenMock.mockReset().mockReturnValue({
     accessToken: "test-token",
     refreshToken: "test-refresh",
@@ -1098,7 +1100,7 @@ describe("AgentSessionEvent.prompted full flow", () => {
 // ---------------------------------------------------------------------------
 
 describe("Comment.create intent routing", () => {
-  it("responds 200 and logs warning when comment has no issue or projectUpdate", async () => {
+  it("responds 200 and logs warning when comment has no issue or known parent entity", async () => {
     const result = await postWebhook({
       type: "Comment",
       action: "create",
@@ -1107,10 +1109,10 @@ describe("Comment.create intent routing", () => {
 
     expect(result.status).toBe(200);
     const warnCalls = (result.api.logger.warn as any).mock.calls.map((c: any[]) => c[0]);
-    expect(warnCalls.some((msg: string) => msg.includes("missing both issue and projectUpdate"))).toBe(true);
+    expect(warnCalls.some((msg: string) => msg.includes("missing issue and no known parent entity"))).toBe(true);
   });
 
-  it("responds 200 and logs info when comment is on a project update", async () => {
+  it("responds 200 and logs routing when comment is on a project update without mention", async () => {
     const result = await postWebhook({
       type: "Comment",
       action: "create",
@@ -1118,14 +1120,60 @@ describe("Comment.create intent routing", () => {
         id: "comment-proj-update",
         body: "Great progress!",
         user: { id: "u1", name: "User" },
+        projectUpdateId: "pu-1",
         projectUpdate: { id: "pu-1" },
       },
     });
 
     expect(result.status).toBe(200);
     const infoCalls = (result.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
-    expect(infoCalls.some((msg: string) => msg.includes("Comment on project update"))).toBe(true);
-    // Should NOT dispatch to agent
+    expect(infoCalls.some((msg: string) => msg.includes("Comment on project-update"))).toBe(true);
+    // No @mention → should NOT dispatch to agent
+    expect(runAgentMock).not.toHaveBeenCalled();
+  });
+
+  it("responds 200 and routes initiative update @mention to agent dispatch", async () => {
+    resolveAgentFromAliasMock.mockReturnValue({ agentId: "mal", profile: { label: "Mal" } });
+
+    const result = await postWebhook({
+      type: "Comment",
+      action: "create",
+      data: {
+        id: "comment-init-mention",
+        body: "@mal what do you think?",
+        user: { id: "u1", name: "Nitin" },
+        initiativeUpdateId: "init-update-1",
+        initiativeUpdate: { id: "init-update-1", health: "onTrack", bodyData: {} },
+      },
+    });
+
+    expect(result.status).toBe(200);
+    const infoCalls = (result.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
+    expect(infoCalls.some((msg: string) => msg.includes("Non-issue @mention"))).toBe(true);
+
+    // Wait for fire-and-forget dispatch to settle
+    await new Promise((r) => setTimeout(r, 100));
+    expect(runAgentMock).toHaveBeenCalled();
+  });
+
+  it("skips non-issue comment when no @mention is present", async () => {
+    runAgentMock.mockClear();
+
+    const result = await postWebhook({
+      type: "Comment",
+      action: "create",
+      data: {
+        id: "comment-init-no-mention",
+        body: "Just a regular comment",
+        user: { id: "u1", name: "User" },
+        initiativeUpdateId: "init-update-2",
+        initiativeUpdate: { id: "init-update-2", health: "atRisk", bodyData: {} },
+      },
+    });
+
+    expect(result.status).toBe(200);
+    const infoCalls = (result.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
+    expect(infoCalls.some((msg: string) => msg.includes("no agent @mention — skipping"))).toBe(true);
     expect(runAgentMock).not.toHaveBeenCalled();
   });
 

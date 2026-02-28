@@ -103,7 +103,20 @@
       "teamGuidanceOverrides": { "type": "object", "description": "Per-team guidance toggle. Key = Linear team ID, value = boolean. Unset teams inherit enableGuidance.", "additionalProperties": { "type": "boolean" } },
       "enableTmux": { "type": "boolean", "default": true, "description": "Enable tmux wrapping for code_run CLI backends (enables steering)" },
       "enableRetro": { "type": "boolean", "default": true, "description": "Enable post-task retrospective analysis" },
-      "retroDir": { "type": "string", "description": "Override path for coding retrospective files (default: {stateDir}/shared/coding)" }
+      "retroDir": { "type": "string", "description": "Override path for coding retrospective files (default: {stateDir}/shared/coding)" },
+      "webhookHandlers": {
+        "type": "object",
+        "description": "Per-handler toggle — set a handler key to false to disable it. Missing keys default to enabled.",
+        "properties": {
+          "agentSession": { "type": "boolean", "default": true },
+          "sessionPrompted": { "type": "boolean", "default": true },
+          "commentMention": { "type": "boolean", "default": true },
+          "issueAssignment": { "type": "boolean", "default": true },
+          "issueAutoTriage": { "type": "boolean", "default": true },
+          "initiativeUpdate": { "type": "boolean", "default": true }
+        },
+        "additionalProperties": false
+      }
     }
   }
 }
