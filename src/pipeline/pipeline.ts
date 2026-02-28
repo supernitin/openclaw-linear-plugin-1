@@ -136,15 +136,15 @@ interface PromptTemplates {
 
 const DEFAULT_PROMPTS: PromptTemplates = {
   worker: {
-    system: "You are a coding worker implementing a Linear issue. Your ONLY job is to write code and return a text summary. Do NOT attempt to update, close, comment on, or modify the Linear issue. Do NOT mark the issue as Done.",
-    task: "Implement issue {{identifier}}: {{title}}\n\nIssue body:\n{{description}}\n\nWorktree: {{worktreePath}}\n{{projectContext}}\n\nBefore coding, read CLAUDE.md and AGENTS.md in the worktree root for project conventions and guidelines. If they don't exist, explore the codebase first.\n\nImplement the solution, run tests, commit your work, and return a text summary.",
+    system: "You are a task worker completing a Linear issue. Your ONLY job is to complete the assigned work and return a text summary. Do NOT attempt to update, close, comment on, or modify the Linear issue. Do NOT mark the issue as Done.",
+    task: "Complete issue {{identifier}}: {{title}}\n\nIssue body:\n{{description}}\n\nWorkspace: {{worktreePath}}\n{{projectContext}}\n\nBefore beginning work, read CLAUDE.md and AGENTS.md in the workspace root for project conventions and guidelines. If they don't exist, explore the workspace first.\n\nComplete the work, verify your changes, commit your work, and return a text summary.",
   },
   audit: {
     system: "You are an independent auditor. The Linear issue body is the SOURCE OF TRUTH. Worker comments are secondary evidence.",
-    task: 'Audit issue {{identifier}}: {{title}}\n\nIssue body:\n{{description}}\n\nWorktree: {{worktreePath}}\n{{projectContext}}\n\nRead CLAUDE.md and AGENTS.md in the worktree root for project standards.\n\nReturn JSON verdict: {"pass": true/false, "criteria": [...], "gaps": [...], "testResults": "..."}',
+    task: 'Audit issue {{identifier}}: {{title}}\n\nIssue body:\n{{description}}\n\nWorkspace: {{worktreePath}}\n{{projectContext}}\n\nRead CLAUDE.md and AGENTS.md in the workspace root for project standards.\n\nReturn JSON verdict: {"pass": true/false, "criteria": [...], "gaps": [...], "verificationResults": "..."}',
   },
   rework: {
-    addendum: "PREVIOUS AUDIT FAILED (attempt {{attempt}}). Gaps:\n{{gaps}}\n\nAddress these specific issues. Preserve correct code from prior attempts.",
+    addendum: "PREVIOUS AUDIT FAILED (attempt {{attempt}}). Gaps:\n{{gaps}}\n\nAddress these specific issues. Preserve correct work from prior attempts.",
   },
 };
 

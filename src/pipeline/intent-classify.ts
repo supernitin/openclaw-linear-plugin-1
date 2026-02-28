@@ -63,7 +63,7 @@ const VALID_INTENTS: Set<string> = new Set([
 // Classifier prompt
 // ---------------------------------------------------------------------------
 
-const CLASSIFY_PROMPT = `You are an intent classifier for a developer tool. Respond ONLY with JSON.
+const CLASSIFY_PROMPT = `You are an intent classifier for a work management tool. Respond ONLY with JSON.
 
 Intents:
 - plan_start: user wants to begin project planning
@@ -71,7 +71,7 @@ Intents:
 - plan_abandon: user wants to cancel/stop planning (e.g. "nevermind", "cancel this", "stop planning")
 - plan_continue: regular message during planning (default when planning is active)
 - ask_agent: user is addressing a specific agent by name
-- request_work: user wants something built, fixed, or implemented
+- request_work: user wants something done, fixed, or completed
 - question: user asking for information or help
 - close_issue: user wants to close/complete/resolve the issue (e.g. "close this", "mark as done", "resolved")
 - general: none of the above, automated messages, or noise

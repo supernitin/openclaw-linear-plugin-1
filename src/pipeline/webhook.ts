@@ -523,23 +523,23 @@ export async function handleLinearWebhook(
       ? [
         `**Tool access:**`,
         `- \`linear_issues\` tool: Full access. Use action="read" with issueId="${issueRef}" to get details, action="create" to create issues (with parentIssueId to create sub-issues for granular work breakdown), action="update" with status/priority/labels/estimate to modify issues, action="comment" to post comments, action="list_states" to see available workflow states.`,
-        `- \`${cliTool}\`: Dispatch coding work to a worker. Workers return text — they cannot access linear_issues.`,
+        `- \`${cliTool}\`: Dispatch work to a worker. Workers return text — they cannot access linear_issues.`,
         `- \`spawn_agent\`/\`ask_agent\`: Delegate to other crew agents.`,
         `- Standard tools: exec, read, edit, write, web_search, etc.`,
         ``,
-        `**Sub-issue guidance:** When a task is too large or has multiple distinct parts, break it into sub-issues using action="create" with parentIssueId="${issueRef}". Each sub-issue should be an atomic, independently testable unit of work with its own acceptance criteria. This enables parallel dispatch and clearer progress tracking.`,
+        `**Sub-issue guidance:** When a task is too large or has multiple distinct parts, break it into sub-issues using action="create" with parentIssueId="${issueRef}". Each sub-issue should be an atomic, independently verifiable unit of work with its own acceptance criteria. This enables parallel dispatch and clearer progress tracking.`,
       ]
       : [
         `**Tool access:**`,
         `- \`linear_issues\` tool: READ ONLY. Use action="read" with issueId="${issueRef}" to get details, action="list_states"/"list_labels" for metadata. Do NOT use action="update", action="create", or action="comment".`,
-        `- \`${cliTool}\`: **Planning mode only.** Workers may explore code and write plan files (PLAN.md, design docs). Workers MUST NOT create, modify, or delete source code, run deployments, or make system changes. Use for codebase exploration and planning only.`,
+        `- \`${cliTool}\`: **Planning mode only.** Workers may explore the workspace and write plan files (PLAN.md, design docs). Workers MUST NOT create, modify, or delete workspace artifacts, run deployments, or make system changes. Use for workspace exploration and planning only.`,
         `- \`spawn_agent\`/\`ask_agent\`: Delegate to other crew agents.`,
         `- Standard tools: exec, read, edit, write, web_search, etc.`,
       ];
 
     const roleLines = isTriaged
       ? [`**Your role:** Orchestrator with full Linear access. You can update issue fields, change status, and dispatch work via \`${cliTool}\`. Do NOT post comments yourself — the handler posts your text output.`]
-      : [`**Your role:** You are the dispatcher. For any coding or implementation work, use \`${cliTool}\` to dispatch it. Workers return text output. You summarize results. You do NOT update issue status or post comments via linear_issues — the audit system handles lifecycle transitions.`];
+      : [`**Your role:** You are the dispatcher. For work requests, use \`${cliTool}\` to dispatch it. Workers return text output. You summarize results. You do NOT update issue status or post comments via linear_issues — the audit system handles lifecycle transitions.`];
 
     if (guidanceAppendix) {
       api.logger.info(`Guidance injected (${guidanceCtx.source}): ${guidanceCtx.guidance?.slice(0, 120)}...`);
@@ -592,10 +592,10 @@ export async function handleLinearWebhook(
       ``,
       `## Scope Rules`,
       `1. **Read the issue first.** The issue title + description define your scope. Everything you do must serve the issue as written.`,
-      `2. **\`${cliTool}\` is ONLY for issue-body work.** Only dispatch \`${cliTool}\` when the issue description contains implementation requirements. A greeting, question, or conversational issue gets a conversational response — NOT ${cliTool}.`,
-      `3. **Comments explore, issue body builds.** User comments may explore scope or ask questions but NEVER trigger \`${cliTool}\` alone. If a comment requests new implementation, update the issue description first, then build from the issue text.`,
+      `2. **\`${cliTool}\` is ONLY for issue-body work.** Only dispatch \`${cliTool}\` when the issue description contains work requirements. A greeting, question, or conversational issue gets a conversational response — NOT ${cliTool}.`,
+      `3. **Comments explore, issue body builds.** User comments may explore scope or ask questions but NEVER trigger \`${cliTool}\` alone. If a comment requests new work, update the issue description first, then build from the issue text.`,
       `4. **Plan before building.** For non-trivial work, respond with a plan first. Only dispatch \`${cliTool}\` after the plan is clear and grounded in the issue body.`,
-      `5. **Match response to request.** Greeting → greet. Question → answer. No implementation requirements → no ${cliTool}.`,
+      `5. **Match response to request.** Greeting → greet. Question → answer. No work requirements → no ${cliTool}.`,
       ``,
       `Respond within the scope defined above. Be concise and action-oriented.`,
     ].filter(Boolean).join("\n");
@@ -843,7 +843,7 @@ export async function handleLinearWebhook(
         ? [
           `**Tool access:**`,
           `- \`linear_issues\` tool: Full access. Use action="read" with issueId="${followUpIssueRef}" to get details, action="create" to create issues (with parentIssueId to create sub-issues for granular work breakdown), action="update" with status/priority/labels/estimate to modify issues, action="comment" to post comments, action="list_states" to see available workflow states.`,
-          `- \`${followUpCliTool}\`: Dispatch coding work to a worker. Workers return text — they cannot access linear_issues.`,
+          `- \`${followUpCliTool}\`: Dispatch work to a worker. Workers return text — they cannot access linear_issues.`,
           `- \`spawn_agent\`/\`ask_agent\`: Delegate to other crew agents.`,
           `- Standard tools: exec, read, edit, write, web_search, etc.`,
           ``,
@@ -852,7 +852,7 @@ export async function handleLinearWebhook(
         : [
           `**Tool access:**`,
           `- \`linear_issues\` tool: READ ONLY. Use action="read" with issueId="${followUpIssueRef}" to get details, action="list_states"/"list_labels" for metadata. Do NOT use action="update", action="create", or action="comment".`,
-          `- \`${followUpCliTool}\`: **Planning mode only.** Workers may explore code and write plan files (PLAN.md, design docs). Workers MUST NOT create, modify, or delete source code, run deployments, or make system changes. Use for codebase exploration and planning only.`,
+          `- \`${followUpCliTool}\`: **Planning mode only.** Workers may explore the workspace and write plan files (PLAN.md, design docs). Workers MUST NOT create, modify, or delete workspace artifacts, run deployments, or make system changes. Use for workspace exploration and planning only.`,
           `- \`spawn_agent\`/\`ask_agent\`: Delegate to other crew agents.`,
           `- Standard tools: exec, read, edit, write, web_search, etc.`,
         ];
@@ -1416,6 +1416,39 @@ export async function handleLinearWebhook(
     return true;
   }
 
+  // ── Estimation helpers for auto-triage ──────────────────────────
+
+  function getEstimationPromptParts(estimationType: string): {
+    instruction: string;
+    jsonField: string;
+  } {
+    switch (estimationType) {
+      case "notUsed":
+        return { instruction: "", jsonField: "" };
+      case "tShirt":
+        return {
+          instruction: `- Estimate size: 1=XS, 2=S, 3=M, 4=L, 5=XL`,
+          jsonField: `  "estimate": <number>,\n`,
+        };
+      case "linear":
+        return {
+          instruction: `- Estimate effort: 1=trivial, 2=small, 3=medium, 4=large, 5=very large`,
+          jsonField: `  "estimate": <number>,\n`,
+        };
+      case "exponential":
+        return {
+          instruction: `- Estimate effort: 1=trivial, 2=small, 4=moderate, 8=large, 16=extensive`,
+          jsonField: `  "estimate": <number>,\n`,
+        };
+      case "fibonacci":
+      default:
+        return {
+          instruction: `- Estimate effort: 1=trivial, 2=small, 3=moderate, 5=significant, 8=large, 13=extensive`,
+          jsonField: `  "estimate": <number>,\n`,
+        };
+    }
+  }
+
   // ── Issue.create — auto-triage new issues ───────────────────────
   if (payload.type === "Issue" && payload.action === "create") {
     res.statusCode = 200;
@@ -1539,8 +1572,8 @@ export async function handleLinearWebhook(
         if (agentSessionId) {
           await linearApi.emitActivity(agentSessionId, {
             type: "action",
-            action: "Triaging",
-            parameter: `${enrichedIssue?.identifier ?? issue.id} — estimating, labeling`,
+            action: "Assessing",
+            parameter: `${enrichedIssue?.identifier ?? issue.id} — reviewing context, analyzing`,
           }).catch(() => {});
         }
 
@@ -1574,8 +1607,82 @@ export async function handleLinearWebhook(
           }
         }
 
+        // Fetch project issues for duplicate detection and context
+        let projectIssuesList = "";
+        if (enrichedIssue?.project?.id) {
+          try {
+            const projectIssues = await linearApi.getProjectIssues(enrichedIssue.project.id);
+            const otherIssues = projectIssues.filter((i: any) => i.id !== issue.id);
+            if (otherIssues.length > 0) {
+              projectIssuesList = otherIssues
+                .map((i: any) => `  - ${i.identifier}: ${i.title} [${i.state.name}]`)
+                .join("\n");
+            }
+          } catch { /* non-fatal */ }
+        }
+
+        // Fetch initiative context if the project belongs to one
+        let initiativeContext = "";
+        if (enrichedIssue?.project?.id) {
+          try {
+            const initiatives = await linearApi.getInitiativesForProject(enrichedIssue.project.id);
+            if (initiatives.length > 0) {
+              const parts = initiatives.map((init) => {
+                let line = `**Initiative:** ${init.name} (${init.status})`;
+                if (init.description) line += `\n${init.description}`;
+                return line;
+              });
+              initiativeContext = parts.join("\n");
+            }
+          } catch { /* non-fatal */ }
+        }
+        if (initiativeContext) {
+          contextLines.push(initiativeContext);
+        }
+
+        // Build estimation-aware prompt parts
+        const estParts = getEstimationPromptParts(estimationType);
+
+        // Assessment tasks — Goal Alignment only when project context exists
+        const assessmentTasks: string[] = [
+          `1. **Clarify & Make Actionable** — Restate what this issue is really asking for. If vague, identify what information is missing and what a concrete next step would be`,
+          `2. **Duplicate/Overlap Check** — Does this duplicate or significantly overlap with any existing issues listed above? If so, note which ones`,
+        ];
+        if (projectName) {
+          assessmentTasks.push(
+            `3. **Goal Alignment** — Does this align with the project's stated goals and any linked initiatives? Flag if it seems out of scope or if it could unblock/block other issues`,
+          );
+        }
+        assessmentTasks.push(
+          `${projectName ? "4" : "3"}. **Impact & Dependencies** — What existing issues, projects, or initiatives does this affect? Note any that would be blocked or accelerated by completing this`,
+          `${projectName ? "5" : "4"}. **Suggested Approach** — Briefly suggest how to approach this, including any prerequisites or decisions needed before starting`,
+          `${projectName ? "6" : "5"}. **Subtask Breakdown** — If the issue is complex enough to benefit from subtask breakdown, create subtasks using \`linear_issues\` with action="create" and parentIssueId="${issue.id}"`,
+        );
+
+        // Build JSON schema — omit estimate when not used
+        const jsonSchema = [
+          `{`,
+          estParts.jsonField ? estParts.jsonField : null,
+          `  "labelIds": ["<id1>", "<id2>"],`,
+          `  "priority": <number or null>,`,
+          `  "assessment": "<one-line summary>",`,
+          `  "duplicateOf": "<identifier or null>",`,
+          `  "subtasksCreated": <number or 0>`,
+          `}`,
+        ].filter((line) => line !== null).join("\n");
+
+        // Labels & effort section
+        const labelsAndEffort: string[] = [
+          `## Labels & Effort`,
+          `- Select appropriate labels from the available labels below`,
+        ];
+        if (estParts.instruction) {
+          labelsAndEffort.push(estParts.instruction);
+        }
+        labelsAndEffort.push(`- Set priority (1=Urgent, 2=High, 3=Medium, 4=Low) if not already set`);
+
         const message = [
-          `IMPORTANT: You are triaging a new Linear issue. You MUST respond with a JSON block containing your triage decisions, followed by your assessment as plain text.`,
+          `IMPORTANT: You are assessing a new Linear issue. Review it in context and provide your analysis. You MUST respond with a JSON block containing your decisions, followed by your assessment as plain text.`,
           ``,
           `## Issue: ${enrichedIssue?.identifier ?? issue.identifier ?? issue.id} — ${enrichedIssue?.title ?? issue.title ?? "(untitled)"}`,
           `**Status:** ${enrichedIssue?.state?.name ?? "Unknown"} | **Current Estimate:** ${enrichedIssue?.estimate ?? "None"} | **Current Labels:** ${currentLabelNames}`,
@@ -1586,19 +1693,13 @@ export async function handleLinearWebhook(
           ``,
           ...contextLines,
           ``,
-          `## Domain Awareness`,
-          `Adapt your assessment to the team and project's domain. Not all issues are software development tasks.`,
-          `- If this is a personal, life, or non-technical project, frame your assessment accordingly`,
-          `  (no references to codebase, implementation, acceptance criteria, UAT, etc.)`,
-          `- If this is a development project, include technical analysis as appropriate`,
-          `- Match your tone and vocabulary to the issue's domain`,
+          projectIssuesList ? `## Existing Issues in This Project\n${projectIssuesList}` : "",
           ``,
-          `## Your Triage Tasks`,
+          `## Your Assessment Tasks`,
           ``,
-          `1. **Complexity** — Estimate using ${estimationType} scale (1=trivial, 2=small, 3=medium, 5=large, 8=very large, 13=epic)`,
-          `2. **Labels** — Select appropriate labels from the team's available labels`,
-          `3. **Priority** — Set priority (1=Urgent, 2=High, 3=Medium, 4=Low) if not already set`,
-          `4. **Assessment** — Brief analysis of what this issue involves and what it needs`,
+          ...assessmentTasks,
+          ``,
+          ...labelsAndEffort,
           ``,
           `## Available Labels`,
           availableLabelList || "  (no labels configured)",
@@ -1608,12 +1709,7 @@ export async function handleLinearWebhook(
           `You MUST start your response with a JSON block, then follow with your assessment:`,
           ``,
           '```json',
-          `{`,
-          `  "estimate": <number>,`,
-          `  "labelIds": ["<id1>", "<id2>"],`,
-          `  "priority": <number or null>,`,
-          `  "assessment": "<one-line summary of your sizing rationale>"`,
-          `}`,
+          jsonSchema,
           '```',
           ``,
           `IMPORTANT: Only reference real users from the issue data above. Do NOT fabricate or guess user names, emails, or identities. The issue creator is shown in the "Created by" field.`,
@@ -1631,10 +1727,6 @@ export async function handleLinearWebhook(
           message,
           timeoutMs: 3 * 60_000,
           streaming: agentSessionId ? { linearApi, agentSessionId } : undefined,
-          // Triage is strictly read-only: the agent can read/search the
-          // codebase but all write-capable tools are denied via config
-          // policy.  The only artifacts are a Linear comment + issue updates.
-          readOnly: true,
         });
 
         const responseBody = result.success
@@ -1666,11 +1758,25 @@ export async function handleLinearWebhook(
                 await linearApi.updateIssue(issue.id, updateInput);
                 api.logger.info(`Applied triage to ${enrichedIssue?.identifier ?? issue.id}: ${JSON.stringify(updateInput)}`);
 
+                const resultParts = [
+                  `estimate=${triage.estimate ?? "unchanged"}`,
+                  `labels=${triage.labelIds?.length ?? 0}`,
+                  `priority=${triage.priority ?? "unchanged"}`,
+                ];
+                if (triage.duplicateOf) {
+                  resultParts.push(`possible duplicate of ${triage.duplicateOf}`);
+                  api.logger.info(`Triage flagged ${enrichedIssue?.identifier ?? issue.id} as possible duplicate of ${triage.duplicateOf}`);
+                }
+                if (typeof triage.subtasksCreated === "number" && triage.subtasksCreated > 0) {
+                  resultParts.push(`${triage.subtasksCreated} subtask(s) created`);
+                  api.logger.info(`Triage created ${triage.subtasksCreated} subtask(s) for ${enrichedIssue?.identifier ?? issue.id}`);
+                }
+
                 if (agentSessionId) {
                   await linearApi.emitActivity(agentSessionId, {
                     type: "action",
                     action: "Applied triage",
-                    result: `estimate=${triage.estimate ?? "unchanged"}, labels=${triage.labelIds?.length ?? 0}, priority=${triage.priority ?? "unchanged"}`,
+                    result: resultParts.join(", "),
                   }).catch(() => {});
                 }
               }
@@ -1901,7 +2007,7 @@ async function dispatchCommentToAgent(
     ? [
       `**Tool access:**`,
       `- \`linear_issues\` tool: Full access. Use action="read" with issueId="${issueRef}" to get details, action="create" to create issues (with parentIssueId to create sub-issues for granular work breakdown), action="update" with status/priority/labels/estimate to modify issues, action="comment" to post comments, action="list_states" to see available workflow states.`,
-      `- \`${cliTool}\`: Dispatch coding work to a worker. Workers return text — they cannot access linear_issues.`,
+      `- \`${cliTool}\`: Dispatch work to a worker. Workers return text — they cannot access linear_issues.`,
       `- Standard tools: exec, read, edit, write, web_search, etc.`,
       ``,
       `**Sub-issue guidance:** When a task is too large or has multiple distinct parts, break it into sub-issues using action="create" with parentIssueId="${issueRef}". Each sub-issue should be an atomic, independently testable unit of work with its own acceptance criteria. This enables parallel dispatch and clearer progress tracking.`,
@@ -1909,7 +2015,7 @@ async function dispatchCommentToAgent(
     : [
       `**Tool access:**`,
       `- \`linear_issues\` tool: READ ONLY. Use action="read" with issueId="${issueRef}" to get details, action="list_states"/"list_labels" for metadata. Do NOT use action="update", action="create", or action="comment".`,
-      `- \`${cliTool}\`: **Planning mode only.** Workers may explore code and write plan files (PLAN.md, design docs). Workers MUST NOT create, modify, or delete source code, run deployments, or make system changes. Use for codebase exploration and planning only.`,
+      `- \`${cliTool}\`: **Planning mode only.** Workers may explore the workspace and write plan files (PLAN.md, design docs). Workers MUST NOT create, modify, or delete workspace artifacts, run deployments, or make system changes. Use for workspace exploration and planning only.`,
       `- Standard tools: exec, read, edit, write, web_search, etc.`,
     ];
 
@@ -1937,10 +2043,10 @@ async function dispatchCommentToAgent(
     ``,
     `## Scope Rules`,
     `1. **Read the issue first.** The issue title + description define your scope. Everything you do must serve the issue as written.`,
-    `2. **\`${cliTool}\` is ONLY for issue-body work.** Only dispatch \`${cliTool}\` when the issue description contains implementation requirements. A greeting, question, or conversational issue gets a conversational response — NOT ${cliTool}.`,
-    `3. **Comments explore, issue body builds.** The comment above may explore scope or ask questions but NEVER trigger \`${cliTool}\` from a comment alone. If the comment requests new implementation, suggest updating the issue description or creating a new issue.`,
+    `2. **\`${cliTool}\` is ONLY for issue-body work.** Only dispatch \`${cliTool}\` when the issue description contains work requirements. A greeting, question, or conversational issue gets a conversational response — NOT ${cliTool}.`,
+    `3. **Comments explore, issue body builds.** The comment above may explore scope or ask questions but NEVER trigger \`${cliTool}\` from a comment alone. If the comment requests new work, suggest updating the issue description or creating a new issue.`,
     `4. **Plan before building.** For non-trivial work, respond with a plan first. Only dispatch \`${cliTool}\` after the plan is clear and grounded in the issue body.`,
-    `5. **Match response to request.** Greeting → greet. Question → answer. No implementation requirements in the issue body → no ${cliTool}.`,
+    `5. **Match response to request.** Greeting → greet. Question → answer. No work requirements in the issue body → no ${cliTool}.`,
     ``,
     `Respond within the scope defined above. Be concise and action-oriented.`,
     commentGuidanceAppendix,
@@ -2651,7 +2757,7 @@ async function handleSteeringInput(
     return;
   }
 
-  // 1. Capture recent coding agent output for context
+  // 1. Capture recent work agent output for context
   let agentOutput = "";
   try {
     agentOutput = capturePane(tmuxSession.sessionName, 50);
@@ -2675,7 +2781,7 @@ async function handleSteeringInput(
 
   // 3. Build steering prompt
   const prompt = [
-    `You are a steering orchestrator. A ${tmuxSession.backend} coding agent is currently ` +
+    `You are a steering orchestrator. A ${tmuxSession.backend} work agent is currently ` +
     `working on issue ${tmuxSession.issueIdentifier}. The user just sent a message in the Linear session.`,
     ``,
     `## Issue Context`,
@@ -2692,7 +2798,7 @@ async function handleSteeringInput(
     `> ${sanitizePromptInput(userMessage, 2000)}`,
     ``,
     `## Your Decision`,
-    `Analyze the user's message in the context of what the coding agent is doing.`,
+    `Analyze the user's message in the context of what the work agent is doing.`,
     ``,
     `**Use \`steer_agent\`** (issueId="${issue.id}") if the user is:`,
     `- Providing information the agent needs (docs location, tool name, API details)`,
@@ -2710,7 +2816,7 @@ async function handleSteeringInput(
     ``,
     `**Respond directly (just output text)** if the user is:`,
     `- Asking a status question ("what's it doing?", "how far along?")`,
-    `- Making a request for you, not the coding agent`,
+    `- Making a request for you, not the work agent`,
     ``,
     `Be fast and decisive. This is a mid-task steering call, not a conversation.`,
   ].filter(Boolean).join("\n");

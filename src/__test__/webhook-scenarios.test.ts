@@ -602,10 +602,10 @@ describe("webhook scenario tests — full handler flows", () => {
       // Session created for triage
       expect(mockCreateSessionOnIssue).toHaveBeenCalledWith("issue-new");
 
-      // Agent invoked in read-only mode
+      // Agent invoked with write access (can create subtasks)
       expect(mockRunAgent).toHaveBeenCalledOnce();
       const runArgs = mockRunAgent.mock.calls[0][0];
-      expect(runArgs.readOnly).toBe(true);
+      expect(runArgs.readOnly).toBeUndefined();
       expect(runArgs.message).toContain("ENG-200");
 
       // Triage JSON applied to issue

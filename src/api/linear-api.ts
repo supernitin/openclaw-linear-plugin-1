@@ -592,6 +592,29 @@ export class LinearAgentApi {
     return data.project as any;
   }
 
+  async getInitiativesForProject(projectId: string): Promise<Array<{
+    id: string;
+    name: string;
+    description: string | null;
+    status: string;
+  }>> {
+    try {
+      const data = await this.gql<{
+        project: { initiatives: { nodes: Array<{ id: string; name: string; description: string | null; status: string }> } };
+      }>(
+        `query ProjectInitiatives($id: String!) {
+          project(id: $id) {
+            initiatives { nodes { id name description status } }
+          }
+        }`,
+        { id: projectId },
+      );
+      return data.project.initiatives.nodes;
+    } catch {
+      return [];
+    }
+  }
+
   async getProjectIssues(projectId: string): Promise<Array<{
     id: string;
     identifier: string;
