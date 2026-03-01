@@ -2010,10 +2010,11 @@ export async function handleLinearWebhook(
           ? result.output
           : `I received your mention but encountered an issue processing it. Please try again.`;
 
+        api.logger.info(`Agent ${resolved.agentId} returned for initiative "${initiativeName}": success=${result.success} outputLen=${responseBody?.length ?? 0}`);
         await linearApi.createInitiativeUpdate(initiativeId!, `**[${label}]** ${responseBody}`);
         api.logger.info(`Posted ${resolved.agentId} initiative update response on "${initiativeName}"`);
       } catch (err) {
-        api.logger.error(`InitiativeUpdate dispatch error: ${err}`);
+        api.logger.warn(`InitiativeUpdate dispatch FAILED for "${initiativeName}": ${err}`);
       }
     })();
 
@@ -2329,6 +2330,13 @@ async function dispatchNonIssueCommentToAgent(
       ? result.output
       : `Something went wrong while processing this comment.`;
 
+    api.logger.info(`Agent ${agentId} returned for ${target.parentType} ${target.parentId}: success=${result.success} outputLen=${responseBody?.length ?? 0}`);
+
+    if (!responseBody?.trim()) {
+      api.logger.warn(`dispatchNonIssueCommentToAgent: agent returned empty output for ${target.parentType} ${target.parentId} — skipping comment post`);
+      return;
+    }
+
     // Post response as a comment on the same entity
     const replyTarget = target.initiativeUpdateId
       ? { initiativeUpdateId: target.initiativeUpdateId }
@@ -2338,12 +2346,15 @@ async function dispatchNonIssueCommentToAgent(
 
     const labeledBody = `**[${label}]** ${responseBody}`;
     const opts = avatarUrl ? { createAsUser: label, displayIconUrl: avatarUrl } : undefined;
+
+    api.logger.info(`Posting ${agentId} reply on ${target.parentType} ${target.parentId} (${Object.keys(replyTarget).join(",")}=${Object.values(replyTarget).join(",")})`);
     const replyId = await linearApi.createCommentOnEntity(replyTarget, labeledBody, opts);
     wasRecentlyProcessed(`comment:${replyId}`);
 
-    api.logger.info(`Posted ${agentId} response on ${target.parentType} ${target.parentId}`);
+    api.logger.info(`Posted ${agentId} response on ${target.parentType} ${target.parentId} (comment ${replyId})`);
   } catch (err) {
-    api.logger.error(`dispatchNonIssueCommentToAgent error: ${err}`);
+    // Use warn — api.logger.error() is invisible in gateway.log (only info+warn show)
+    api.logger.warn(`dispatchNonIssueCommentToAgent FAILED: ${target.parentType} ${target.parentId} — ${err}`);
   } finally {
     activeRuns.delete(runKey);
   }
