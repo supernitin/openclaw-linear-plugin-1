@@ -1689,7 +1689,7 @@ export async function handleLinearWebhook(
         // Assessment tasks — Goal Alignment only when project context exists
         const hasDescription = description && description !== "(no description)" && description.trim().length > 10;
         const assessmentTasks: string[] = [
-          `1. **Clarify & Make Actionable** — Restate what this issue is really asking for in concrete, specific terms.${hasDescription ? "" : " The issue has only a title and no description — you MUST flesh it out: infer the likely intent, identify the concrete steps involved, and write a clear description of what needs to happen."} If anything is ambiguous, state your assumptions explicitly`,
+          `1. **Research & Enrich** — Think about what would make this issue genuinely actionable. ${hasDescription ? "Build on the existing description." : "The issue has only a title — think like a proactive assistant: what details, links, dates, or context would the creator need to actually act on this?"} Use your tools (web_search, memory) to find concrete information: relevant URLs, deadlines, account details, reference material, how-to steps. Add everything useful to your assessment. Don't just restate the issue — make it better than when you found it`,
           `2. **Duplicate/Overlap Check** — Does this duplicate or significantly overlap with any existing issues listed above? If so, note which ones`,
         ];
         if (projectName) {
@@ -1700,8 +1700,8 @@ export async function handleLinearWebhook(
         let taskNum = projectName ? 4 : 3;
         assessmentTasks.push(
           `${taskNum++}. **Impact & Dependencies** — What existing issues, projects, or initiatives does this affect? Note any that would be blocked or accelerated by completing this`,
-          `${taskNum++}. **Suggested Approach** — Briefly suggest how to approach this, including any prerequisites or decisions needed before starting`,
-          `${taskNum++}. **Subtask Breakdown** — If this issue involves multiple distinct steps, create subtasks using \`linear_issues\` with action="create" and parentIssueId="${issue.id}".${hasDescription ? "" : " Title-only issues often benefit from subtasks once you've inferred the concrete steps."} Each subtask title should be a specific, actionable item (not vague). Set the "subtasksCreated" field in your JSON to the number of subtasks you created (0 if none needed)`,
+          `${taskNum++}. **Suggested Approach** — Recommend a concrete approach: what to do first, what tools or accounts are needed, whether this should be recurring, and any prerequisites. Be specific and practical, not generic`,
+          `${taskNum++}. **Subtask Breakdown** — If this issue involves multiple distinct steps, create subtasks using \`linear_issues\` with action="create" and parentIssueId="${issue.id}". Each subtask title should be a specific, actionable item. Set the "subtasksCreated" field in your JSON to the number of subtasks you created (0 if none needed)`,
         );
 
         // Build JSON schema — omit estimate when not used
@@ -1729,7 +1729,7 @@ export async function handleLinearWebhook(
         const message = [
           `IMPORTANT: You are assessing a new Linear issue. Review it in context and provide your analysis. You MUST respond with a JSON block containing your decisions, followed by your assessment as plain text.`,
           ``,
-          `**Tool access:** You have the \`linear_issues\` tool available. Use action="create" with parentIssueId to create subtasks. Use action="read", action="list_states", action="list_labels" for lookups. You also have web_search and standard tools for research.`,
+          `**Tool access:** You have web_search for looking up relevant information (due dates, links, how-to guides, pricing). You have \`linear_issues\` for creating subtasks (action="create" with parentIssueId) and lookups. Use memory search to recall user context. Be proactive — research what would make this issue actionable before responding.`,
           ``,
           `## Issue: ${enrichedIssue?.identifier ?? issue.identifier ?? issue.id} — ${enrichedIssue?.title ?? issue.title ?? "(untitled)"}`,
           `**Status:** ${enrichedIssue?.state?.name ?? "Unknown"} | **Current Estimate:** ${enrichedIssue?.estimate ?? "None"} | **Current Labels:** ${currentLabelNames}`,
