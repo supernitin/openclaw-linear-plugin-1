@@ -1689,7 +1689,7 @@ export async function handleLinearWebhook(
         // Assessment tasks — Goal Alignment only when project context exists
         const hasDescription = description && description !== "(no description)" && description.trim().length > 10;
         const assessmentTasks: string[] = [
-          `1. **Research & Enrich** — Think about what would make this issue genuinely actionable. ${hasDescription ? "Build on the existing description." : "The issue has only a title — think like a proactive assistant: what details, links, dates, or context would the creator need to actually act on this?"} Use your tools (web_search, memory) to find concrete information: relevant URLs, deadlines, account details, reference material, how-to steps. Add everything useful to your assessment. Don't just restate the issue — make it better than when you found it`,
+          `1. **Research & Enrich** — Think about what would make this issue genuinely actionable. ${hasDescription ? "Build on the existing description." : "The issue has only a title — think like a proactive assistant: what details, links, dates, or context would the creator need to actually act on this?"} Think about where the relevant information lives — email, calendar, files, the web, memory — and go get it. Add concrete details: dates, links, amounts, account info, steps. Don't just restate the issue — make it better than when you found it`,
           `2. **Duplicate/Overlap Check** — Does this duplicate or significantly overlap with any existing issues listed above? If so, note which ones`,
         ];
         if (projectName) {
@@ -1729,7 +1729,7 @@ export async function handleLinearWebhook(
         const message = [
           `IMPORTANT: You are assessing a new Linear issue. Review it in context and provide your analysis. You MUST respond with a JSON block containing your decisions, followed by your assessment as plain text.`,
           ``,
-          `**Tool access:** You have web_search for looking up relevant information (due dates, links, how-to guides, pricing). You have \`linear_issues\` for creating subtasks (action="create" with parentIssueId) and lookups. Use memory search to recall user context. Be proactive — research what would make this issue actionable before responding.`,
+          `**Tool access:** You have access to the user's full environment — use whatever is relevant to enrich this issue. Examples: email (search for statements, confirmations, due dates), calendar (check for existing events, deadlines), reminders, contacts, files on disk, web search, memory (past context about the user). You also have \`linear_issues\` for creating subtasks and lookups. Think about where the information needed for this issue would naturally live and go find it.`,
           ``,
           `## Issue: ${enrichedIssue?.identifier ?? issue.identifier ?? issue.id} — ${enrichedIssue?.title ?? issue.title ?? "(untitled)"}`,
           `**Status:** ${enrichedIssue?.state?.name ?? "Unknown"} | **Current Estimate:** ${enrichedIssue?.estimate ?? "None"} | **Current Labels:** ${currentLabelNames}`,
