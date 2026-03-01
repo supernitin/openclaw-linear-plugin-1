@@ -134,6 +134,14 @@ The end result: you work in Linear. You create issues, assign them, comment in p
 
 ## Quick Start
 
+> **Tip:** Claude Code is very good at setting this up for you. Install the plugin, install the [Cloudflare CLI](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/get-started/create-local-tunnel/#1-download-and-install-cloudflared) and authenticate (`cloudflared tunnel login`), then just ask Claude to configure the rest. Or run the guided setup wizard:
+>
+> ```bash
+> openclaw openclaw-linear setup
+> ```
+>
+> It walks through agent profiles, auth, webhook provisioning, and verification in one interactive flow.
+
 ### 1. Install the plugin
 
 ```bash
