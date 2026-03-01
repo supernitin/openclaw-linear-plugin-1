@@ -1687,8 +1687,9 @@ export async function handleLinearWebhook(
         const estParts = getEstimationPromptParts(estimationType);
 
         // Assessment tasks — Goal Alignment only when project context exists
+        const hasDescription = description && description !== "(no description)" && description.trim().length > 10;
         const assessmentTasks: string[] = [
-          `1. **Clarify & Make Actionable** — Restate what this issue is really asking for. If vague, identify what information is missing and what a concrete next step would be`,
+          `1. **Clarify & Make Actionable** — Restate what this issue is really asking for in concrete, specific terms.${hasDescription ? "" : " The issue has only a title and no description — you MUST flesh it out: infer the likely intent, identify the concrete steps involved, and write a clear description of what needs to happen."} If anything is ambiguous, state your assumptions explicitly`,
           `2. **Duplicate/Overlap Check** — Does this duplicate or significantly overlap with any existing issues listed above? If so, note which ones`,
         ];
         if (projectName) {
@@ -1696,10 +1697,11 @@ export async function handleLinearWebhook(
             `3. **Goal Alignment** — Does this align with the project's stated goals and any linked initiatives? Flag if it seems out of scope or if it could unblock/block other issues`,
           );
         }
+        let taskNum = projectName ? 4 : 3;
         assessmentTasks.push(
-          `${projectName ? "4" : "3"}. **Impact & Dependencies** — What existing issues, projects, or initiatives does this affect? Note any that would be blocked or accelerated by completing this`,
-          `${projectName ? "5" : "4"}. **Suggested Approach** — Briefly suggest how to approach this, including any prerequisites or decisions needed before starting`,
-          `${projectName ? "6" : "5"}. **Subtask Breakdown** — If the issue is complex enough to benefit from subtask breakdown, create subtasks using \`linear_issues\` with action="create" and parentIssueId="${issue.id}"`,
+          `${taskNum++}. **Impact & Dependencies** — What existing issues, projects, or initiatives does this affect? Note any that would be blocked or accelerated by completing this`,
+          `${taskNum++}. **Suggested Approach** — Briefly suggest how to approach this, including any prerequisites or decisions needed before starting`,
+          `${taskNum++}. **Subtask Breakdown** — Break this issue into concrete subtasks using \`linear_issues\` with action="create" and parentIssueId="${issue.id}". ${hasDescription ? "Do this if the issue has multiple distinct steps or would benefit from structured tracking." : "Since this issue lacks a description, subtasks are essential — create one for each concrete action needed."} Each subtask title should be a specific, actionable item (not vague). Set the "subtasksCreated" field in your JSON to the number of subtasks you created`,
         );
 
         // Build JSON schema — omit estimate when not used
@@ -1726,6 +1728,8 @@ export async function handleLinearWebhook(
 
         const message = [
           `IMPORTANT: You are assessing a new Linear issue. Review it in context and provide your analysis. You MUST respond with a JSON block containing your decisions, followed by your assessment as plain text.`,
+          ``,
+          `**Tool access:** You have the \`linear_issues\` tool available. Use action="create" with parentIssueId to create subtasks. Use action="read", action="list_states", action="list_labels" for lookups. You also have web_search and standard tools for research.`,
           ``,
           `## Issue: ${enrichedIssue?.identifier ?? issue.identifier ?? issue.id} — ${enrichedIssue?.title ?? issue.title ?? "(untitled)"}`,
           `**Status:** ${enrichedIssue?.state?.name ?? "Unknown"} | **Current Estimate:** ${enrichedIssue?.estimate ?? "None"} | **Current Labels:** ${currentLabelNames}`,
