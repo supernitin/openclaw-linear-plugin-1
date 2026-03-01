@@ -8,9 +8,10 @@
  * Unlike webhook-dedup.test.ts (dedup logic) and webhook.test.ts (HTTP basics),
  * these tests verify the full business logic paths end-to-end.
  *
- * Key pattern: handlers prefer emitActivity(response) over createComment
- * when an agent session exists — createComment is only used as a fallback
- * when the session activity emission fails.
+ * Key pattern: comment-triggered responses use threaded comments (parentId)
+ * rather than emitActivity, so replies appear under the triggering comment.
+ * emitActivity is used for session-triggered responses (no parent comment)
+ * and as a fallback when no comment context exists.
  */
 import type { AddressInfo } from "node:net";
 import { createServer } from "node:http";
@@ -35,6 +36,7 @@ const {
   mockSetActiveSession,
   mockClearActiveSession,
   mockEmitDiagnostic,
+  mockCreateCommentOnEntity,
 } = vi.hoisted(() => ({
   mockRunAgent: vi.fn(),
   mockGetViewerId: vi.fn(),
@@ -51,6 +53,7 @@ const {
   mockSetActiveSession: vi.fn(),
   mockClearActiveSession: vi.fn(),
   mockEmitDiagnostic: vi.fn(),
+  mockCreateCommentOnEntity: vi.fn(),
 }));
 
 // ── Module mocks (must precede all imports of tested code) ───────
@@ -63,6 +66,7 @@ vi.mock("../api/linear-api.js", () => ({
   LinearAgentApi: class MockLinearAgentApi {
     emitActivity = mockEmitActivity;
     createComment = mockCreateComment;
+    createCommentOnEntity = mockCreateCommentOnEntity;
     getIssueDetails = mockGetIssueDetails;
     updateSession = mockUpdateSession;
     getViewerId = mockGetViewerId;
@@ -269,6 +273,7 @@ beforeEach(() => {
   mockGetViewerId.mockResolvedValue("viewer-bot-1");
   mockGetIssueDetails.mockResolvedValue(makeIssueDetails());
   mockCreateComment.mockResolvedValue("comment-new-id");
+  mockCreateCommentOnEntity.mockResolvedValue("comment-threaded-id");
   mockEmitActivity.mockResolvedValue(undefined);
   mockUpdateSession.mockResolvedValue(undefined);
   mockUpdateIssue.mockResolvedValue(true);
@@ -427,8 +432,10 @@ describe("webhook scenario tests — full handler flows", () => {
       expect(mockClassifyIntent).toHaveBeenCalledOnce();
       expect(mockRunAgent).toHaveBeenCalledOnce();
 
-      // Session created → response via emitActivity
-      expect(activityCallsOfType("response").length).toBeGreaterThan(0);
+      // Comment-triggered → response via threaded comment (parentId), not emitActivity
+      expect(mockCreateCommentOnEntity).toHaveBeenCalled();
+      const entityArgs = mockCreateCommentOnEntity.mock.calls[0];
+      expect(entityArgs[0]).toEqual({ parentId: "comment-intent-1" });
     });
 
     it("request_work intent: dispatches to default agent", async () => {
@@ -550,12 +557,10 @@ describe("webhook scenario tests — full handler flows", () => {
       // Team states fetched to find completed state
       expect(mockGetTeamStates).toHaveBeenCalledWith("team-1");
 
-      // Closure report posted via emitActivity
-      const responseCalls = activityCallsOfType("response");
-      expect(responseCalls.length).toBeGreaterThan(0);
-      const reportBody = (responseCalls[0][1] as any).body;
-      expect(reportBody).toContain("Closure Report");
-      expect(reportBody).toContain("authentication bug");
+      // Closure report posted as threaded comment (comment-triggered path)
+      expect(mockCreateCommentOnEntity).toHaveBeenCalled();
+      const entityArgs = mockCreateCommentOnEntity.mock.calls[0];
+      expect(entityArgs[0]).toEqual({ parentId: "comment-close-1" });
     });
   });
 

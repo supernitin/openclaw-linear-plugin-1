@@ -2481,11 +2481,12 @@ describe("handleCloseIssue via close_issue intent", () => {
 
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 300));
-    // Should still post a closure report (with fallback text)
+    // Should still post a closure report (threaded comment or emitActivity or fallback)
     const emitCalls = mockLinearApiInstance.emitActivity.mock.calls;
     const hasResponse = emitCalls.some((c: any[]) => c[1]?.type === "response");
     const hasComment = mockLinearApiInstance.createComment.mock.calls.length > 0;
-    expect(hasResponse || hasComment).toBe(true);
+    const hasThreadedComment = mockLinearApiInstance.createCommentOnEntity.mock.calls.length > 0;
+    expect(hasResponse || hasComment || hasThreadedComment).toBe(true);
   });
 });
 

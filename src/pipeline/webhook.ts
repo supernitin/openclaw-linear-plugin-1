@@ -65,6 +65,14 @@ const activeRuns = new Set<string>();
 // `finishActiveRun()`, the queued comment is replayed automatically.
 const pendingComments = new Map<string, () => void>();
 
+// Track issues recently handled by the AgentSessionEvent.prompted path.
+// When a user @mentions the app, Linear fires BOTH Comment.create AND
+// AgentSessionEvent.prompted webhooks. This map prevents processComment
+// from dispatching a duplicate agent run when the session handler already
+// picked up the message. Entries expire after 30 seconds (covers the race
+// window without blocking legitimate follow-up comments).
+const sessionHandledIssues = new Map<string, number>();
+
 /**
  * Finish an active run for an issue and replay any queued comment.
  * Call this instead of raw `activeRuns.delete(id)` in every `finally` block.
@@ -115,6 +123,7 @@ function wasRecentlyProcessed(key: string): boolean {
 export function _resetForTesting(): void {
   activeRuns.clear();
   pendingComments.clear();
+  sessionHandledIssues.clear();
   recentlyProcessed.clear();
   recentlyEmittedActivities.clear();
   _resetProfilesCacheForTesting();
@@ -325,6 +334,15 @@ async function processComment(
   commentor: string,
   pluginConfig?: Record<string, unknown>,
 ): Promise<void> {
+  // Skip if the AgentSessionEvent.prompted handler already handled this issue
+  // recently. Both webhooks fire for the same user @mention — without this
+  // check, the agent runs twice and posts duplicate responses.
+  const sessionHandledTs = sessionHandledIssues.get(issue.id);
+  if (sessionHandledTs && Date.now() - sessionHandledTs < 30_000) {
+    api.logger.info(`processComment: skipping ${issue.identifier ?? issue.id} — already handled by session prompted handler`);
+    return;
+  }
+
   const linearApi = createLinearApi(api);
   if (!linearApi) {
     api.logger.error("processComment: no Linear access token");
@@ -1092,8 +1110,12 @@ export async function handleLinearWebhook(
 
     api.logger.info(`AgentSession prompted (follow-up): ${session.id} issue=${issue?.identifier ?? issue?.id} agent=${agentId} message="${userMessage.slice(0, 80)}..."`);
 
-    // Run agent for follow-up (non-blocking)
+    // Run agent for follow-up (non-blocking).
+    // Mark that a session handler is handling this issue — prevents the
+    // Comment.create handler from also dispatching (dual-path duplicate).
     activeRuns.add(issue.id);
+    pendingComments.delete(issue.id);
+    sessionHandledIssues.set(issue.id, Date.now());
     void (async () => {
       const profiles = loadAgentProfiles();
       const label = profiles[agentId]?.label ?? agentId;
@@ -2005,6 +2027,41 @@ export async function handleLinearWebhook(
   return true;
 }
 
+// ── Issue context builder ─────────────────────────────────────────
+//
+// Builds concise context lines from enriched issue data (project, parent,
+// relations, labels) for injection into agent prompts. Uses data already
+// returned by getIssueDetails — no extra API calls.
+
+function buildIssueContextLines(issue: any): string[] {
+  const lines: string[] = [];
+  const labels = issue?.labels?.nodes;
+  if (labels?.length) {
+    lines.push(`**Labels:** ${labels.map((l: any) => l.name).join(", ")}`);
+  }
+  const project = issue?.project;
+  if (project) {
+    lines.push(`**Project:** ${project.name}${project.description ? ` — ${project.description}` : ""}`);
+  }
+  const parent = issue?.parent;
+  if (parent) {
+    lines.push(`**Parent issue:** ${parent.identifier}${parent.title ? ` — ${parent.title}` : ""}`);
+  }
+  const relations = issue?.relations?.nodes;
+  if (relations?.length) {
+    const grouped: Record<string, string[]> = {};
+    for (const r of relations) {
+      const type = r.type ?? "related";
+      const ref = `${r.relatedIssue?.identifier}: ${r.relatedIssue?.title ?? ""}`;
+      (grouped[type] ??= []).push(ref);
+    }
+    for (const [type, refs] of Object.entries(grouped)) {
+      lines.push(`**${type}:** ${refs.join("; ")}`);
+    }
+  }
+  return lines;
+}
+
 // ── Comment dispatch helper ───────────────────────────────────────
 //
 // Dispatches a comment to a specific agent. Used by intent-based routing
@@ -2088,6 +2145,7 @@ async function dispatchCommentToAgent(
     `## Issue: ${issueRef} — ${enrichedIssue?.title ?? issue.title ?? "(untitled)"}`,
     `**Status:** ${enrichedIssue?.state?.name ?? "Unknown"} | **Assignee:** ${enrichedIssue?.assignee?.name ?? "Unassigned"}`,
     enrichedIssue?.creator ? `**Created by:** ${enrichedIssue.creator.name}${enrichedIssue.creator.email ? ` (${enrichedIssue.creator.email})` : ""}` : "",
+    ...buildIssueContextLines(enrichedIssue),
     ``,
     `**Description:**`,
     description,
@@ -2154,9 +2212,16 @@ async function dispatchCommentToAgent(
     // Thread reply under the triggering comment when we have a comment ID.
     const parentCommentId = comment?.id as string | undefined;
 
-    // When a session exists, prefer emitActivity (avoids duplicate comment).
-    // Otherwise, post as a regular comment threaded under the triggering comment.
-    if (agentSessionId) {
+    // Always post as a threaded comment when responding to a comment.
+    // emitActivity creates a top-level agent activity (no parentId threading),
+    // so we only use it for the response when there's no comment to thread under.
+    const agentOpts = avatarUrl
+      ? { createAsUser: label, displayIconUrl: avatarUrl }
+      : undefined;
+
+    if (parentCommentId) {
+      await postAgentComment(api, linearApi, issue.id, responseBody, label, agentOpts, parentCommentId);
+    } else if (agentSessionId) {
       const labeledResponse = `**[${label}]** ${responseBody}`;
       const emitted = await linearApi.emitActivity(agentSessionId, {
         type: "response",
@@ -2164,16 +2229,10 @@ async function dispatchCommentToAgent(
       }).then(() => true).catch(() => false);
 
       if (!emitted) {
-        const agentOpts = avatarUrl
-          ? { createAsUser: label, displayIconUrl: avatarUrl }
-          : undefined;
-        await postAgentComment(api, linearApi, issue.id, responseBody, label, agentOpts, parentCommentId);
+        await postAgentComment(api, linearApi, issue.id, responseBody, label, agentOpts);
       }
     } else {
-      const agentOpts = avatarUrl
-        ? { createAsUser: label, displayIconUrl: avatarUrl }
-        : undefined;
-      await postAgentComment(api, linearApi, issue.id, responseBody, label, agentOpts, parentCommentId);
+      await postAgentComment(api, linearApi, issue.id, responseBody, label, agentOpts);
     }
 
     api.logger.info(`Posted ${agentId} response to ${issueRef}${parentCommentId ? ` (threaded under ${parentCommentId})` : ""}`);
@@ -2434,9 +2493,15 @@ async function handleCloseIssue(
       api.logger.warn(`No completed state found for ${issueRef} — posting report without state change`);
     }
 
-    // Post closure report via emitActivity-first pattern
+    // Post closure report — thread under triggering comment when available.
     const parentCommentId = comment?.id as string | undefined;
-    if (agentSessionId) {
+    const agentOpts = avatarUrl
+      ? { createAsUser: label, displayIconUrl: avatarUrl }
+      : undefined;
+
+    if (parentCommentId) {
+      await postAgentComment(api, linearApi, issue.id, fullReport, label, agentOpts, parentCommentId);
+    } else if (agentSessionId) {
       const labeledReport = `**[${label}]** ${fullReport}`;
       const emitted = await linearApi.emitActivity(agentSessionId, {
         type: "response",
@@ -2444,16 +2509,10 @@ async function handleCloseIssue(
       }).then(() => true).catch(() => false);
 
       if (!emitted) {
-        const agentOpts = avatarUrl
-          ? { createAsUser: label, displayIconUrl: avatarUrl }
-          : undefined;
-        await postAgentComment(api, linearApi, issue.id, fullReport, label, agentOpts, parentCommentId);
+        await postAgentComment(api, linearApi, issue.id, fullReport, label, agentOpts);
       }
     } else {
-      const agentOpts = avatarUrl
-        ? { createAsUser: label, displayIconUrl: avatarUrl }
-        : undefined;
-      await postAgentComment(api, linearApi, issue.id, fullReport, label, agentOpts, parentCommentId);
+      await postAgentComment(api, linearApi, issue.id, fullReport, label, agentOpts);
     }
 
     api.logger.info(`Posted closure report for ${issueRef}${parentCommentId ? ` (threaded under ${parentCommentId})` : ""}`);
