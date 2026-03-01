@@ -260,8 +260,15 @@ async function createCommentWithDedup(
   issueId: string,
   body: string,
   opts?: { createAsUser?: string; displayIconUrl?: string },
+  parentCommentId?: string,
 ): Promise<string> {
-  const commentId = await linearApi.createComment(issueId, body, opts);
+  let commentId: string;
+  if (parentCommentId) {
+    // Thread reply under the parent comment
+    commentId = await linearApi.createCommentOnEntity({ parentId: parentCommentId }, body, opts);
+  } else {
+    commentId = await linearApi.createComment(issueId, body, opts);
+  }
   wasRecentlyProcessed(`comment:${commentId}`);
   return commentId;
 }
@@ -277,16 +284,17 @@ async function postAgentComment(
   body: string,
   label: string,
   agentOpts?: { createAsUser: string; displayIconUrl: string },
+  parentCommentId?: string,
 ): Promise<void> {
   if (!agentOpts) {
-    await createCommentWithDedup(linearApi, issueId, `**[${label}]** ${body}`);
+    await createCommentWithDedup(linearApi, issueId, `**[${label}]** ${body}`, undefined, parentCommentId);
     return;
   }
   try {
-    await createCommentWithDedup(linearApi, issueId, body, agentOpts);
+    await createCommentWithDedup(linearApi, issueId, body, agentOpts, parentCommentId);
   } catch (identityErr) {
     api.logger.warn(`Agent identity comment failed: ${identityErr}`);
-    await createCommentWithDedup(linearApi, issueId, `**[${label}]** ${body}`);
+    await createCommentWithDedup(linearApi, issueId, `**[${label}]** ${body}`, undefined, parentCommentId);
   }
 }
 
@@ -2143,8 +2151,11 @@ async function dispatchCommentToAgent(
       ? result.output
       : `Something went wrong while processing this. The system will retry automatically if possible.`;
 
+    // Thread reply under the triggering comment when we have a comment ID.
+    const parentCommentId = comment?.id as string | undefined;
+
     // When a session exists, prefer emitActivity (avoids duplicate comment).
-    // Otherwise, post as a regular comment.
+    // Otherwise, post as a regular comment threaded under the triggering comment.
     if (agentSessionId) {
       const labeledResponse = `**[${label}]** ${responseBody}`;
       const emitted = await linearApi.emitActivity(agentSessionId, {
@@ -2156,16 +2167,16 @@ async function dispatchCommentToAgent(
         const agentOpts = avatarUrl
           ? { createAsUser: label, displayIconUrl: avatarUrl }
           : undefined;
-        await postAgentComment(api, linearApi, issue.id, responseBody, label, agentOpts);
+        await postAgentComment(api, linearApi, issue.id, responseBody, label, agentOpts, parentCommentId);
       }
     } else {
       const agentOpts = avatarUrl
         ? { createAsUser: label, displayIconUrl: avatarUrl }
         : undefined;
-      await postAgentComment(api, linearApi, issue.id, responseBody, label, agentOpts);
+      await postAgentComment(api, linearApi, issue.id, responseBody, label, agentOpts, parentCommentId);
     }
 
-    api.logger.info(`Posted ${agentId} response to ${issueRef}`);
+    api.logger.info(`Posted ${agentId} response to ${issueRef}${parentCommentId ? ` (threaded under ${parentCommentId})` : ""}`);
   } catch (err) {
     api.logger.error(`dispatchCommentToAgent error: ${err}`);
     if (agentSessionId) {

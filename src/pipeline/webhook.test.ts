@@ -2243,8 +2243,8 @@ describe("dispatchCommentToAgent via Comment.create intents", () => {
 
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 300));
-    // Should have fallen back to createComment
-    expect(mockLinearApiInstance.createComment).toHaveBeenCalled();
+    // Should have fallen back to createCommentOnEntity (threaded reply via parentId)
+    expect(mockLinearApiInstance.createCommentOnEntity).toHaveBeenCalled();
   });
 
   it("dispatches with no agent session when createSessionOnIssue returns null", async () => {
@@ -2277,8 +2277,8 @@ describe("dispatchCommentToAgent via Comment.create intents", () => {
 
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 300));
-    // Without session, posts via comment
-    expect(mockLinearApiInstance.createComment).toHaveBeenCalled();
+    // Without session, posts via threaded reply (createCommentOnEntity with parentId)
+    expect(mockLinearApiInstance.createCommentOnEntity).toHaveBeenCalled();
   });
 
   it("handles error in dispatchCommentToAgent gracefully", async () => {
@@ -2759,16 +2759,16 @@ describe("resolveAgentId edge cases", () => {
 
 describe("postAgentComment edge cases", () => {
   it("falls back to prefix when agent identity comment fails", async () => {
-    // This is tested indirectly when createComment with agentOpts throws
-    // Make createComment fail only when called with opts (identity mode)
+    // Comment responses now use createCommentOnEntity (threaded reply via parentId).
+    // Make createCommentOnEntity fail only when called with identity opts.
     let callCount = 0;
-    mockLinearApiInstance.createComment.mockImplementation(
-      (_issueId: string, _body: string, opts?: any) => {
+    mockLinearApiInstance.createCommentOnEntity.mockImplementation(
+      (_target: any, _body: string, opts?: any) => {
         callCount++;
         if (opts?.createAsUser) {
           return Promise.reject(new Error("actor_id scope required"));
         }
-        return Promise.resolve(`comment-${callCount}`);
+        return Promise.resolve(`entity-comment-${callCount}`);
       }
     );
 
@@ -2802,9 +2802,9 @@ describe("postAgentComment edge cases", () => {
 
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 300));
-    // createComment should have been called at least twice:
-    // once with identity (fails), once without (fallback)
-    expect(mockLinearApiInstance.createComment.mock.calls.length).toBeGreaterThanOrEqual(2);
+    // createCommentOnEntity should have been called at least twice:
+    // once with identity (fails), once without (fallback) — both threaded via parentId
+    expect(mockLinearApiInstance.createCommentOnEntity.mock.calls.length).toBeGreaterThanOrEqual(2);
   });
 });
 
