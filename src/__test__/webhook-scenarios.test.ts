@@ -807,8 +807,8 @@ describe("webhook scenario tests — full handler flows", () => {
 
       // Verify sub-issue guidance text includes the correct parentIssueId
       expect(msg).toContain("Sub-issue guidance");
-      expect(msg).toContain("break it into sub-issues");
-      expect(msg).toContain('parentIssueId="ENG-123"');
+      expect(msg).toContain("Only create sub-issues when work genuinely needs separate tracking");
+      expect(msg).toContain("just do the work directly");
     });
 
     it("created: backlog issue does NOT include sub-issue guidance", async () => {

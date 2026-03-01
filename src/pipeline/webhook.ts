@@ -810,12 +810,12 @@ export async function handleLinearWebhook(
     const toolAccessLines = isTriaged
       ? [
         `**Tool access:**`,
-        `- \`linear_issues\` tool: Full access. Use action="read" with issueId="${issueRef}" to get details, action="create" to create issues (with parentIssueId to create sub-issues for granular work breakdown), action="update" with status/priority/labels/estimate to modify issues, action="comment" to post comments, action="list_states" to see available workflow states.`,
+        `- \`linear_issues\` tool: Full access. Use action="read" with issueId="${issueRef}" to get details, action="create" to create issues (with parentIssueId for sub-issues when separate tracking is needed), action="update" with status/priority/labels/estimate to modify issues, action="comment" to post comments, action="list_states" to see available workflow states.`,
         `- \`${cliTool}\`: Dispatch work to a worker. Workers return text — they cannot access linear_issues.`,
         `- \`spawn_agent\`/\`ask_agent\`: Delegate to other crew agents.`,
         `- Standard tools: exec, read, edit, write, web_search, etc.`,
         ``,
-        `**Sub-issue guidance:** When a task is too large or has multiple distinct parts, break it into sub-issues using action="create" with parentIssueId="${issueRef}". Each sub-issue should be an atomic, independently verifiable unit of work with its own acceptance criteria. This enables parallel dispatch and clearer progress tracking.`,
+        `**Sub-issue guidance:** Only create sub-issues when work genuinely needs separate tracking — e.g., it requires the user to take action first, depends on an external event, or is a long-running task. For research, lookups, and tasks you can complete with your tools, just do the work directly and report findings. Most requests need 0 sub-issues.`,
       ]
       : [
         `**Tool access:**`,
@@ -1130,12 +1130,12 @@ export async function handleLinearWebhook(
       const followUpToolAccessLines = followUpIsTriaged
         ? [
           `**Tool access:**`,
-          `- \`linear_issues\` tool: Full access. Use action="read" with issueId="${followUpIssueRef}" to get details, action="create" to create issues (with parentIssueId to create sub-issues for granular work breakdown), action="update" with status/priority/labels/estimate to modify issues, action="comment" to post comments, action="list_states" to see available workflow states.`,
+          `- \`linear_issues\` tool: Full access. Use action="read" with issueId="${followUpIssueRef}" to get details, action="create" to create issues (with parentIssueId for sub-issues when separate tracking is needed), action="update" with status/priority/labels/estimate to modify issues, action="comment" to post comments, action="list_states" to see available workflow states.`,
           `- \`${followUpCliTool}\`: Dispatch work to a worker. Workers return text — they cannot access linear_issues.`,
           `- \`spawn_agent\`/\`ask_agent\`: Delegate to other crew agents.`,
           `- Standard tools: exec, read, edit, write, web_search, etc.`,
           ``,
-          `**Sub-issue guidance:** When a task is too large or has multiple distinct parts, break it into sub-issues using action="create" with parentIssueId="${followUpIssueRef}". Each sub-issue should be an atomic, independently testable unit of work with its own acceptance criteria. This enables parallel dispatch and clearer progress tracking.`,
+          `**Sub-issue guidance:** Only create sub-issues when work genuinely needs separate tracking — e.g., it requires the user to take action first, depends on an external event, or is a long-running task. For research, lookups, and tasks you can complete with your tools, just do the work directly and report findings. Most requests need 0 sub-issues.`,
         ]
         : [
           `**Tool access:**`,
@@ -1709,7 +1709,7 @@ export async function handleLinearWebhook(
         assessmentTasks.push(
           `${taskNum++}. **Impact & Dependencies** — What existing issues, projects, or initiatives does this affect? Note any that would be blocked or accelerated by completing this`,
           `${taskNum++}. **Suggested Approach** — Recommend a concrete approach: what to do first, what tools or accounts are needed, whether this should be recurring, and any prerequisites. Be specific and practical, not generic`,
-          `${taskNum++}. **Subtask Breakdown** — If this issue involves multiple distinct steps, create subtasks using \`linear_issues\` with action="create" and parentIssueId="${issue.id}". Each subtask title should be a specific, actionable item. Set the "subtasksCreated" field in your JSON to the number of subtasks you created (0 if none needed)`,
+          `${taskNum++}. **Do What You Can** — If you can research, look up, or resolve parts of this issue using your tools, DO IT NOW and include the findings in your assessment. Search email for relevant info, check the calendar, search the web, create reminders — whatever is useful. Only create subtasks (via \`linear_issues\` with action="create" and parentIssueId="${issue.id}") for work that genuinely cannot be done right now: things that require the user to take a physical action, things that require waiting for an external event, or long-running tasks that need separate tracking. Most issues need 0 subtasks. Set "subtasksCreated" in your JSON to the count (usually 0)`,
         );
 
         // Build JSON schema — omit estimate when not used
@@ -1737,7 +1737,7 @@ export async function handleLinearWebhook(
         const message = [
           `IMPORTANT: You are assessing a new Linear issue. Review it in context and provide your analysis. You MUST respond with a JSON block containing your decisions, followed by your assessment as plain text.`,
           ``,
-          `**Tool access:** You have access to the user's full environment — use whatever is relevant to enrich this issue. Examples: email (search for statements, confirmations, due dates), calendar (check for existing events, deadlines), reminders, contacts, files on disk, web search, memory (past context about the user). You also have \`linear_issues\` for creating subtasks and lookups. Think about where the information needed for this issue would naturally live and go find it.`,
+          `**Tool access:** You have access to the user's full environment — use whatever is relevant to enrich this issue. Examples: email (search for statements, confirmations, due dates), calendar (check for existing events, deadlines), reminders, contacts, files on disk, web search, memory (past context about the user). You also have \`linear_issues\` for lookups and updates. Think about where the information needed for this issue would naturally live and go find it.`,
           ``,
           `## Issue: ${enrichedIssue?.identifier ?? issue.identifier ?? issue.id} — ${enrichedIssue?.title ?? issue.title ?? "(untitled)"}`,
           `**Status:** ${enrichedIssue?.state?.name ?? "Unknown"} | **Current Estimate:** ${enrichedIssue?.estimate ?? "None"} | **Current Labels:** ${currentLabelNames}`,
@@ -2061,11 +2061,11 @@ async function dispatchCommentToAgent(
   const toolAccessLines = isTriaged
     ? [
       `**Tool access:**`,
-      `- \`linear_issues\` tool: Full access. Use action="read" with issueId="${issueRef}" to get details, action="create" to create issues (with parentIssueId to create sub-issues for granular work breakdown), action="update" with status/priority/labels/estimate to modify issues, action="comment" to post comments, action="list_states" to see available workflow states.`,
+      `- \`linear_issues\` tool: Full access. Use action="read" with issueId="${issueRef}" to get details, action="create" to create issues (with parentIssueId for sub-issues when separate tracking is needed), action="update" with status/priority/labels/estimate to modify issues, action="comment" to post comments, action="list_states" to see available workflow states.`,
       `- \`${cliTool}\`: Dispatch work to a worker. Workers return text — they cannot access linear_issues.`,
       `- Standard tools: exec, read, edit, write, web_search, etc.`,
       ``,
-      `**Sub-issue guidance:** When a task is too large or has multiple distinct parts, break it into sub-issues using action="create" with parentIssueId="${issueRef}". Each sub-issue should be an atomic, independently testable unit of work with its own acceptance criteria. This enables parallel dispatch and clearer progress tracking.`,
+      `**Sub-issue guidance:** Only create sub-issues when work genuinely needs separate tracking — e.g., it requires the user to take action first, depends on an external event, or is a long-running task. For research, lookups, and tasks you can complete with your tools, just do the work directly and report findings. Most requests need 0 sub-issues.`,
     ]
     : [
       `**Tool access:**`,
