@@ -3771,8 +3771,8 @@ describe("handleCloseIssue .catch callbacks", () => {
 
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 300));
-    // Should fall back to comment
-    expect(mockLinearApiInstance.createComment).toHaveBeenCalled();
+    // Should fall back to threaded comment (createCommentOnEntity with parentId)
+    expect(mockLinearApiInstance.createCommentOnEntity).toHaveBeenCalled();
   });
 
   it("covers error emitActivity .catch in handleCloseIssue", async () => {
@@ -3843,7 +3843,7 @@ describe("handleCloseIssue .catch callbacks", () => {
 
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 300));
-    expect(mockLinearApiInstance.createComment).toHaveBeenCalled();
+    expect(mockLinearApiInstance.createCommentOnEntity).toHaveBeenCalled();
   });
 
   it("covers handleCloseIssue with no team (no completed state lookup)", async () => {
@@ -3982,7 +3982,7 @@ describe("handleCloseIssue .catch callbacks", () => {
 
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 300));
-    expect(mockLinearApiInstance.createComment).toHaveBeenCalled();
+    expect(mockLinearApiInstance.createCommentOnEntity).toHaveBeenCalled();
   });
 
   it("covers handleCloseIssue getIssueDetails failure", async () => {

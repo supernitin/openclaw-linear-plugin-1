@@ -336,7 +336,7 @@ async function processComment(
   if (profilesError) {
     api.logger.error("Agent profiles validation failed — posting setup error to Linear");
     try {
-      await createCommentWithDedup(linearApi, issue.id, profilesError);
+      await createCommentWithDedup(linearApi, issue.id, profilesError, undefined, comment?.id);
     } catch {}
     return;
   }
@@ -385,7 +385,7 @@ async function processComment(
       );
       if (mentionBlockMsg) {
         api.logger.info(`Comment @mention: blocking work request on untriaged issue ${enrichedForGate?.identifier ?? issue.identifier ?? issue.id}`);
-        try { await createCommentWithDedup(linearApi, issue.id, mentionBlockMsg); } catch {}
+        try { await createCommentWithDedup(linearApi, issue.id, mentionBlockMsg, undefined, comment?.id); } catch {}
         return;
       }
 
@@ -440,7 +440,7 @@ async function processComment(
   );
   if (commentBlockMsg) {
     api.logger.info(`Comment: blocking work request on untriaged issue ${enrichedIssue?.identifier ?? issue.identifier ?? issue.id}`);
-    try { await createCommentWithDedup(linearApi, issue.id, commentBlockMsg); } catch {}
+    try { await createCommentWithDedup(linearApi, issue.id, commentBlockMsg, undefined, comment?.id); } catch {}
     return;
   }
 
@@ -2435,6 +2435,7 @@ async function handleCloseIssue(
     }
 
     // Post closure report via emitActivity-first pattern
+    const parentCommentId = comment?.id as string | undefined;
     if (agentSessionId) {
       const labeledReport = `**[${label}]** ${fullReport}`;
       const emitted = await linearApi.emitActivity(agentSessionId, {
@@ -2446,16 +2447,16 @@ async function handleCloseIssue(
         const agentOpts = avatarUrl
           ? { createAsUser: label, displayIconUrl: avatarUrl }
           : undefined;
-        await postAgentComment(api, linearApi, issue.id, fullReport, label, agentOpts);
+        await postAgentComment(api, linearApi, issue.id, fullReport, label, agentOpts, parentCommentId);
       }
     } else {
       const agentOpts = avatarUrl
         ? { createAsUser: label, displayIconUrl: avatarUrl }
         : undefined;
-      await postAgentComment(api, linearApi, issue.id, fullReport, label, agentOpts);
+      await postAgentComment(api, linearApi, issue.id, fullReport, label, agentOpts, parentCommentId);
     }
 
-    api.logger.info(`Posted closure report for ${issueRef}`);
+    api.logger.info(`Posted closure report for ${issueRef}${parentCommentId ? ` (threaded under ${parentCommentId})` : ""}`);
   } catch (err) {
     api.logger.error(`handleCloseIssue error: ${err}`);
     if (agentSessionId) {
