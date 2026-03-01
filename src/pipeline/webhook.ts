@@ -43,21 +43,17 @@ export function sanitizePromptInput(text: string, maxLength = 4000): string {
  * Returns a rejection message if blocked, null if allowed.
  */
 function shouldBlockWorkRequest(
-  intent: Intent,
-  stateType: string,
-  stateName: string,
-  issueRef: string,
+  _intent: Intent,
+  _stateType: string,
+  _stateName: string,
+  _issueRef: string,
 ): string | null {
-  if (intent !== "request_work") return null;
-  if (stateType === "started") return null; // In Progress — allow
-  return (
-    `This issue (${issueRef}) is in **${stateName}** — it needs planning and scoping before implementation.\n\n` +
-    `**To move forward:**\n` +
-    `1. Update the issue description with requirements and acceptance criteria\n` +
-    `2. Move the issue to **In Progress**\n` +
-    `3. Then ask me to implement it\n\n` +
-    `I can help you scope and plan — just ask questions or discuss the approach.`
-  );
+  // State-based gating removed — work requests are allowed regardless of
+  // issue state.  The original gate assumed a dev workflow (Todo → In Progress
+  // → Done) where "Todo" means "not yet scoped".  In a general-purpose
+  // workspace the user may create an issue in Todo and immediately ask the
+  // agent to research, review, or act on it.
+  return null;
 }
 
 // Track issues with active agent runs to prevent concurrent duplicate runs.
