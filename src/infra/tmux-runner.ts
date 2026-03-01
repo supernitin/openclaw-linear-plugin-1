@@ -1,6 +1,6 @@
 import { execSync, spawn } from "node:child_process";
 import { createInterface } from "node:readline";
-import { mkdirSync, createWriteStream } from "node:fs";
+import { mkdirSync, writeFileSync, unlinkSync } from "node:fs";
 import { dirname } from "node:path";
 import type { ActivityContent, LinearAgentApi } from "../api/linear-api.js";
 import type { CliResult, OnProgressUpdate } from "../tools/cli-shared.js";
@@ -45,8 +45,12 @@ export function getActiveTmuxSession(issueId: string): TmuxSession | null {
 }
 
 /**
- * Run a command inside a tmux session with pipe-pane streaming to a JSONL log.
+ * Run a command inside a tmux session with output piped to a JSONL log.
  * Monitors the log file for events and streams them to Linear.
+ *
+ * The command + tee are wrapped in a shell script so that tee runs INSIDE
+ * the tmux session (not in the outer shell). This ensures JSONL output
+ * from the CLI subprocess is captured to the log file.
  */
 export async function runInTmux(opts: RunInTmuxOptions): Promise<CliResult> {
   const {
@@ -70,6 +74,9 @@ export async function runInTmux(opts: RunInTmuxOptions): Promise<CliResult> {
   // Ensure log directory exists
   mkdirSync(dirname(logPath), { recursive: true });
 
+  // Touch the log file so tail -f can start immediately
+  writeFileSync(logPath, "", { flag: "a" });
+
   // Register active session
   const session: TmuxSession = {
     sessionName,
@@ -83,14 +90,25 @@ export async function runInTmux(opts: RunInTmuxOptions): Promise<CliResult> {
   const progress = createProgressEmitter({ header: progressHeader, onUpdate });
   progress.emitHeader();
 
-  try {
-    // Create tmux session running the command, piping output to logPath
-    const tmuxCmd = [
-      `tmux new-session -d -s ${shellEscape(sessionName)} -c ${shellEscape(cwd)}`,
-      `${shellEscape(command)} 2>&1 | tee ${shellEscape(logPath)}`,
-    ].join(" ");
+  // Write a shell wrapper script so the entire pipeline (command | tee)
+  // runs inside the tmux session. This avoids quoting hell and ensures
+  // tee captures the subprocess output, not tmux's own stdout.
+  const scriptPath = `${logPath}.run.sh`;
 
-    execSync(tmuxCmd, { stdio: "ignore", timeout: 10_000 });
+  try {
+    writeFileSync(scriptPath, [
+      "#!/bin/sh",
+      `exec ${command} 2>&1 | tee -a ${shellEscape(logPath)}`,
+      "",
+    ].join("\n"), { mode: 0o755 });
+
+    // Start tmux session running the wrapper script
+    execSync(
+      `tmux new-session -d -s ${shellEscape(sessionName)} -c ${shellEscape(cwd)} ${shellEscape(scriptPath)}`,
+      { stdio: "ignore", timeout: 10_000 },
+    );
+
+    logger.info(`tmux session started: ${sessionName} (log: ${logPath})`);
 
     // Tail the log file and process JSONL events
     return await new Promise<CliResult>((resolve) => {
@@ -100,6 +118,7 @@ export async function runInTmux(opts: RunInTmuxOptions): Promise<CliResult> {
 
       let killed = false;
       let killedByWatchdog = false;
+      let resolved = false;
       const collectedMessages: string[] = [];
 
       const timer = setTimeout(() => {
@@ -120,6 +139,9 @@ export async function runInTmux(opts: RunInTmuxOptions): Promise<CliResult> {
       watchdog.start();
 
       function cleanup(reason: string) {
+        if (resolved) return;
+        resolved = true;
+
         clearTimeout(timer);
         watchdog.stop();
         tail.kill();
@@ -131,6 +153,9 @@ export async function runInTmux(opts: RunInTmuxOptions): Promise<CliResult> {
             timeout: 5_000,
           });
         } catch { /* session may already be gone */ }
+
+        // Clean up wrapper script
+        try { unlinkSync(scriptPath); } catch { /* best effort */ }
 
         activeSessions.delete(issueId);
 
@@ -169,8 +194,9 @@ export async function runInTmux(opts: RunInTmuxOptions): Promise<CliResult> {
           return;
         }
 
-        // Collect text for output
+        // Collect text for output — handle both Claude and Codex event shapes
         if (event.type === "assistant") {
+          // Claude stream-json shape
           const content = event.message?.content;
           if (Array.isArray(content)) {
             for (const block of content) {
@@ -179,6 +205,11 @@ export async function runInTmux(opts: RunInTmuxOptions): Promise<CliResult> {
               }
             }
           }
+        }
+        if (event.item?.type === "agent_message" || event.item?.type === "message") {
+          // Codex --json shape
+          const text = event.item.text ?? event.item.content ?? "";
+          if (text) collectedMessages.push(text);
         }
 
         // Stream to Linear
@@ -192,16 +223,16 @@ export async function runInTmux(opts: RunInTmuxOptions): Promise<CliResult> {
           progress.push(formatActivityLogLine(activity));
         }
 
-        // Detect completion
-        if (event.type === "result") {
+        // Detect completion — Claude uses "result", Codex uses "session.completed"
+        if (event.type === "result" || event.type === "session.completed") {
           cleanup("done");
           rl.close();
         }
       });
 
-      // Handle tail process ending (tmux session completed)
+      // Handle tail process ending (tmux session exited)
       tail.on("close", () => {
-        if (!killed) {
+        if (!resolved) {
           cleanup("done");
         }
         rl.close();
@@ -209,11 +240,16 @@ export async function runInTmux(opts: RunInTmuxOptions): Promise<CliResult> {
 
       tail.on("error", (err) => {
         logger.error(`tmux tail error: ${err}`);
-        cleanup("error");
+        if (!resolved) {
+          cleanup("error");
+        }
         rl.close();
       });
     });
   } catch (err) {
+    // Clean up wrapper script on failure
+    try { unlinkSync(scriptPath); } catch { /* best effort */ }
+
     activeSessions.delete(issueId);
     logger.error(`runInTmux failed: ${err}`);
     return {
