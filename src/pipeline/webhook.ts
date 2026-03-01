@@ -1701,7 +1701,7 @@ export async function handleLinearWebhook(
         assessmentTasks.push(
           `${taskNum++}. **Impact & Dependencies** — What existing issues, projects, or initiatives does this affect? Note any that would be blocked or accelerated by completing this`,
           `${taskNum++}. **Suggested Approach** — Briefly suggest how to approach this, including any prerequisites or decisions needed before starting`,
-          `${taskNum++}. **Subtask Breakdown** — Break this issue into concrete subtasks using \`linear_issues\` with action="create" and parentIssueId="${issue.id}". ${hasDescription ? "Do this if the issue has multiple distinct steps or would benefit from structured tracking." : "Since this issue lacks a description, subtasks are essential — create one for each concrete action needed."} Each subtask title should be a specific, actionable item (not vague). Set the "subtasksCreated" field in your JSON to the number of subtasks you created`,
+          `${taskNum++}. **Subtask Breakdown** — If this issue involves multiple distinct steps, create subtasks using \`linear_issues\` with action="create" and parentIssueId="${issue.id}".${hasDescription ? "" : " Title-only issues often benefit from subtasks once you've inferred the concrete steps."} Each subtask title should be a specific, actionable item (not vague). Set the "subtasksCreated" field in your JSON to the number of subtasks you created (0 if none needed)`,
         );
 
         // Build JSON schema — omit estimate when not used
