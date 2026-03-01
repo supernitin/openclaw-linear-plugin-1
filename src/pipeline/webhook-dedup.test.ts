@@ -223,9 +223,9 @@ describe("webhook deduplication", () => {
     await postWebhook(api, payload);
 
     const logs = infoLogs(api);
-    expect(logs.some((l) => l.includes("active run — skipping"))).toBe(true);
+    expect(logs.some((l) => l.includes("active run — queued for replay"))).toBe(true);
 
-    // Intent classifier should NOT have been called (saved LLM cost)
+    // Intent classifier should NOT have been called (saved LLM cost — queued, not executed)
     expect(classifyIntent).not.toHaveBeenCalled();
   });
 
