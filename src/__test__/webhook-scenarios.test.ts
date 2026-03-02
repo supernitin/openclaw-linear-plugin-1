@@ -159,7 +159,17 @@ vi.mock("../pipeline/dag-dispatch.js", () => ({
 
 vi.mock("../infra/shared-profiles.js", async (importOriginal) => {
   const actual = await importOriginal() as Record<string, unknown>;
-  return { ...actual, validateProfiles: vi.fn().mockReturnValue(null) };
+  return {
+    ...actual,
+    validateProfiles: vi.fn().mockReturnValue(null),
+    loadAgentProfiles: vi.fn().mockReturnValue({
+      main: {
+        label: "frAInk",
+        mentionAliases: ["main", "fraink"],
+        avatarUrl: null,
+      },
+    }),
+  };
 });
 
 // ── Imports (after mocks) ────────────────────────────────────────
@@ -435,7 +445,7 @@ describe("webhook scenario tests — full handler flows", () => {
       // Comment-triggered → response via threaded comment (parentId), not emitActivity
       expect(mockCreateCommentOnEntity).toHaveBeenCalled();
       const entityArgs = mockCreateCommentOnEntity.mock.calls[0];
-      expect(entityArgs[0]).toEqual({ parentId: "comment-intent-1" });
+      expect(entityArgs[0]).toEqual({ issueId: "issue-intent-1", parentId: "comment-intent-1" });
     });
 
     it("request_work intent: dispatches to default agent", async () => {
@@ -560,7 +570,7 @@ describe("webhook scenario tests — full handler flows", () => {
       // Closure report posted as threaded comment (comment-triggered path)
       expect(mockCreateCommentOnEntity).toHaveBeenCalled();
       const entityArgs = mockCreateCommentOnEntity.mock.calls[0];
-      expect(entityArgs[0]).toEqual({ parentId: "comment-close-1" });
+      expect(entityArgs[0]).toEqual({ issueId: "issue-close-1", parentId: "comment-close-1" });
     });
   });
 
@@ -767,6 +777,13 @@ describe("webhook scenario tests — full handler flows", () => {
         fromFallback: false,
       });
 
+      // Advance Date.now() past the 30s sessionHandledIssues TTL so
+      // processComment doesn't skip this as a duplicate of the session handler.
+      // This simulates a real follow-up comment arriving after the dedup window.
+      const realNow = Date.now;
+      const baseTime = Date.now();
+      vi.spyOn(Date, "now").mockReturnValue(baseTime + 31_000);
+
       // Step 2: Now send a comment — it should pick up cached guidance
       const commentPayload = makeCommentCreate({
         data: {
@@ -834,6 +851,342 @@ describe("webhook scenario tests — full handler flows", () => {
       // Backlog issues get READ ONLY access — no sub-issue guidance
       expect(msg).not.toContain("Sub-issue guidance");
       expect(msg).toContain("READ ONLY");
+    });
+  });
+
+  describe("Dual-webhook dedup", () => {
+    it("session handler first: Comment.create is dropped, only one agent run", async () => {
+      // Simulate: AgentSessionEvent.created arrives first, Comment.create arrives while agent is running.
+      // The comment should be DROPPED (not queued), producing exactly one response.
+      const api = createApi();
+      const sessionPayload = makeAgentSessionEventCreated();
+
+      // Make agent run take a bit of time so Comment.create arrives during the run
+      let resolveAgent!: (v: any) => void;
+      mockRunAgent.mockReturnValueOnce(
+        new Promise((resolve) => { resolveAgent = resolve; }),
+      );
+
+      // 1. Fire session event (starts agent run)
+      await postWebhook(api, sessionPayload);
+
+      // Wait for the session handler to enter the async IIFE and set activeRuns
+      await vi.waitFor(
+        () => { expect(mockGetIssueDetails).toHaveBeenCalled(); },
+        { timeout: 2000, interval: 20 },
+      );
+
+      // 2. Fire Comment.create for the same issue while agent is running
+      const commentPayload = makeCommentCreate();
+      await postWebhook(api, commentPayload);
+
+      // 3. Let the agent finish
+      resolveAgent({ success: true, output: "Session response" });
+
+      await waitForMock(mockClearActiveSession);
+
+      // Exactly ONE agent run — the comment was dropped, not queued for replay
+      expect(mockRunAgent).toHaveBeenCalledOnce();
+
+      // Session handler posts via emitActivity — no duplicate comment
+      const responseCalls = activityCallsOfType("response");
+      expect(responseCalls.length).toBe(1);
+
+      // No comment was created (session handler uses emitActivity, comment was dropped)
+      expect(mockCreateComment).not.toHaveBeenCalled();
+      expect(mockCreateCommentOnEntity).not.toHaveBeenCalled();
+
+      // Logs show the comment was dropped
+      const logs = infoLogs(api);
+      expect(logs.some((l) => l.includes("session handler active") && l.includes("dropping"))).toBe(true);
+    });
+
+    it("comment handler first: session event is skipped via activeRuns, only one agent run", async () => {
+      // Simulate: Comment.create arrives first, AgentSessionEvent.created arrives while agent is running.
+      // The session event should be skipped by activeRuns, producing exactly one threaded reply.
+      mockClassifyIntent.mockResolvedValue({
+        intent: "ask_agent",
+        agentId: "mal",
+        reasoning: "user asking question",
+        fromFallback: false,
+      });
+      mockCreateCommentOnEntity.mockResolvedValue("comment-threaded-id");
+
+      const api = createApi();
+
+      // Make agent run take a bit of time
+      let resolveAgent!: (v: any) => void;
+      mockRunAgent.mockReturnValueOnce(
+        new Promise((resolve) => { resolveAgent = resolve; }),
+      );
+
+      // 1. Fire Comment.create (starts intent classification → agent dispatch)
+      const commentPayload = makeCommentCreate({
+        data: {
+          id: "comment-dual-1",
+          body: "@main can you check this?",
+          user: { id: "user-1", name: "Human" },
+          issue: {
+            id: "issue-dual-1",
+            identifier: "ENG-500",
+            title: "Dual test",
+            team: { id: "team-1" },
+            project: null,
+          },
+          createdAt: new Date().toISOString(),
+        },
+      });
+      await postWebhook(api, commentPayload);
+
+      // Wait for dispatchCommentToAgent to start (agent run begins)
+      await vi.waitFor(
+        () => { expect(mockRunAgent).toHaveBeenCalled(); },
+        { timeout: 2000, interval: 20 },
+      );
+
+      // 2. Fire AgentSessionEvent.created for the same issue — should be skipped
+      const sessionPayload = makeAgentSessionEventCreated({
+        agentSession: {
+          id: "sess-dual-1",
+          issue: {
+            id: "issue-dual-1",
+            identifier: "ENG-500",
+            title: "Dual test",
+          },
+        },
+      });
+      await postWebhook(api, sessionPayload);
+
+      // 3. Let the agent finish
+      resolveAgent({ success: true, output: "Comment response" });
+
+      await waitForMock(mockClearActiveSession);
+
+      // Exactly ONE agent run
+      expect(mockRunAgent).toHaveBeenCalledOnce();
+
+      // Response posted as threaded comment (comment handler's path)
+      expect(mockCreateCommentOnEntity).toHaveBeenCalled();
+      const entityArgs = mockCreateCommentOnEntity.mock.calls[0];
+      expect(entityArgs[0]).toHaveProperty("parentId", "comment-dual-1");
+      expect(entityArgs[0]).toHaveProperty("issueId", "issue-dual-1");
+
+      // Session event was skipped (logged)
+      const logs = infoLogs(api);
+      expect(logs.some((l) => l.includes("active run") || l.includes("skipping session"))).toBe(true);
+    });
+
+    it("non-session active run: comments are still queued for replay", async () => {
+      // When a triage or dispatch run is active (NOT from session handler),
+      // Comment.create should be queued for replay, not dropped.
+      const api = createApi();
+
+      // Trigger Issue.create which starts auto-triage (sets activeRuns without sessionHandledIssues)
+      mockGetIssueDetails.mockResolvedValue(makeIssueDetails({
+        id: "issue-triage-1",
+        identifier: "ENG-600",
+        title: "Triage test",
+      }));
+
+      let resolveTriageAgent!: (v: any) => void;
+      mockRunAgent.mockReturnValueOnce(
+        new Promise((resolve) => { resolveTriageAgent = resolve; }),
+      );
+
+      const issuePayload = makeIssueCreate({
+        data: {
+          id: "issue-triage-1",
+          identifier: "ENG-600",
+          title: "Triage test",
+          state: { name: "Backlog", type: "backlog" },
+          assignee: null,
+          team: { id: "team-1" },
+          project: null,
+        },
+      });
+      await postWebhook(api, issuePayload);
+
+      // Wait for triage agent to start
+      await vi.waitFor(
+        () => { expect(mockRunAgent).toHaveBeenCalled(); },
+        { timeout: 2000, interval: 20 },
+      );
+
+      // Now send a comment during the triage run — should be QUEUED (not dropped)
+      mockClassifyIntent.mockResolvedValue({
+        intent: "ask_agent",
+        agentId: "mal",
+        reasoning: "user asking",
+        fromFallback: false,
+      });
+
+      const commentPayload = makeCommentCreate({
+        data: {
+          id: "comment-during-triage-1",
+          body: "Hey, can you also check this?",
+          user: { id: "user-1", name: "Human" },
+          issue: {
+            id: "issue-triage-1",
+            identifier: "ENG-600",
+            title: "Triage test",
+            team: { id: "team-1" },
+            project: null,
+          },
+          createdAt: new Date().toISOString(),
+        },
+      });
+      await postWebhook(api, commentPayload);
+
+      // Should see "queued for replay" log (not "dropping")
+      const logsBeforeResolve = infoLogs(api);
+      expect(logsBeforeResolve.some((l) => l.includes("queued for replay"))).toBe(true);
+      expect(logsBeforeResolve.some((l) => l.includes("dropping"))).toBe(false);
+
+      // Finish the triage agent — replay should fire
+      resolveTriageAgent({
+        success: true,
+        output: '```json\n{"estimate": 3, "labelIds": [], "priority": 3, "assessment": "Medium"}\n```\nTriaged.',
+      });
+
+      // Second agent run fires from the replayed comment
+      await vi.waitFor(
+        () => { expect(mockRunAgent).toHaveBeenCalledTimes(2); },
+        { timeout: 3000, interval: 50 },
+      );
+    });
+
+    it("session handler sets sessionHandledIssues in .created handler", async () => {
+      // Verify that the .created handler (not just .prompted) sets sessionHandledIssues
+      // so that replayed comments are blocked even for first-time mentions.
+      const api = createApi();
+
+      // Fast agent run
+      mockRunAgent.mockResolvedValue({ success: true, output: "Done" });
+
+      const sessionPayload = makeAgentSessionEventCreated();
+      await postWebhook(api, sessionPayload);
+      await waitForMock(mockClearActiveSession);
+
+      // Now send a comment for the same issue — should be skipped by sessionHandledIssues
+      const commentPayload = makeCommentCreate();
+      vi.clearAllMocks();
+      mockGetViewerId.mockResolvedValue("viewer-bot-1");
+
+      await postWebhook(api, commentPayload);
+      // Give processComment time to check sessionHandledIssues
+      await new Promise((r) => setTimeout(r, 100));
+
+      const logs = infoLogs(api);
+      expect(logs.some((l) => l.includes("already handled by session"))).toBe(true);
+      // Agent should NOT run again
+      expect(mockRunAgent).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("Non-issue comment threading (initiative/project updates)", () => {
+    it("initiative update comment (top-level): reply uses comment id as parentId", async () => {
+      // Top-level comment on initiative update — no parentId in comment data.
+      // The response should use the comment's own id as parentId.
+      const api = createApi();
+
+      const commentPayload = {
+        type: "Comment",
+        action: "create",
+        data: {
+          id: "comment-init-top",
+          body: "@main what's the status of this initiative?",
+          user: { id: "user-1", name: "Human" },
+          initiativeUpdateId: "init-update-1",
+          createdAt: new Date().toISOString(),
+        },
+      };
+      await postWebhook(api, commentPayload);
+
+      await waitForMock(mockCreateCommentOnEntity);
+
+      expect(mockRunAgent).toHaveBeenCalledOnce();
+
+      const entityArgs = mockCreateCommentOnEntity.mock.calls[0];
+      expect(entityArgs[0]).toHaveProperty("initiativeUpdateId", "init-update-1");
+      expect(entityArgs[0]).toHaveProperty("parentId", "comment-init-top");
+    });
+
+    it("initiative update comment (reply in thread): reply uses thread root as parentId", async () => {
+      // Reply-in-thread on initiative update — comment.parentId points to thread root.
+      // Linear requires parentId to be the TOP-LEVEL comment, not the reply.
+      // This test reproduces the "incorrect parent" GraphQL error.
+      const api = createApi();
+
+      const commentPayload = {
+        type: "Comment",
+        action: "create",
+        data: {
+          id: "comment-init-reply",
+          parentId: "comment-init-root",  // this comment is a reply to the root
+          body: "@main follow up on this",
+          user: { id: "user-1", name: "Human" },
+          initiativeUpdateId: "init-update-1",
+          createdAt: new Date().toISOString(),
+        },
+      };
+      await postWebhook(api, commentPayload);
+
+      await waitForMock(mockCreateCommentOnEntity);
+
+      expect(mockRunAgent).toHaveBeenCalledOnce();
+
+      const entityArgs = mockCreateCommentOnEntity.mock.calls[0];
+      expect(entityArgs[0]).toHaveProperty("initiativeUpdateId", "init-update-1");
+      // Must use the THREAD ROOT, not the reply's own id
+      expect(entityArgs[0]).toHaveProperty("parentId", "comment-init-root");
+      expect(entityArgs[0].parentId).not.toBe("comment-init-reply");
+    });
+
+    it("project update comment: reply threads under triggering comment with parentId", async () => {
+      const api = createApi();
+
+      const commentPayload = {
+        type: "Comment",
+        action: "create",
+        data: {
+          id: "comment-proj-1",
+          body: "@main summarize this update",
+          user: { id: "user-1", name: "Human" },
+          projectUpdateId: "proj-update-1",
+          createdAt: new Date().toISOString(),
+        },
+      };
+      await postWebhook(api, commentPayload);
+
+      await waitForMock(mockCreateCommentOnEntity);
+
+      expect(mockRunAgent).toHaveBeenCalledOnce();
+
+      const entityArgs = mockCreateCommentOnEntity.mock.calls[0];
+      expect(entityArgs[0]).toHaveProperty("projectUpdateId", "proj-update-1");
+      expect(entityArgs[0]).toHaveProperty("parentId", "comment-proj-1");
+    });
+
+    it("non-issue comment: bot's own comments are skipped", async () => {
+      const api = createApi();
+
+      const commentPayload = {
+        type: "Comment",
+        action: "create",
+        data: {
+          id: "comment-bot-init-1",
+          body: "**[frAInk]** Here's my analysis...",
+          user: { id: "viewer-bot-1", name: "CT Claw" },
+          initiativeUpdateId: "init-update-1",
+          createdAt: new Date().toISOString(),
+        },
+      };
+      await postWebhook(api, commentPayload);
+      await new Promise((r) => setTimeout(r, 100));
+
+      // Bot's own comment should NOT trigger an agent run
+      expect(mockRunAgent).not.toHaveBeenCalled();
+      expect(mockCreateCommentOnEntity).not.toHaveBeenCalled();
     });
   });
 });

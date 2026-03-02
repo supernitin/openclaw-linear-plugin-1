@@ -312,6 +312,7 @@ export class LinearAgentApi {
    */
   async createCommentOnEntity(
     target: {
+      issueId?: string;
       initiativeUpdateId?: string;
       projectUpdateId?: string;
       documentContentId?: string;

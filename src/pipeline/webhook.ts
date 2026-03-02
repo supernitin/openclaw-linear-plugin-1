@@ -273,8 +273,8 @@ async function createCommentWithDedup(
 ): Promise<string> {
   let commentId: string;
   if (parentCommentId) {
-    // Thread reply under the parent comment
-    commentId = await linearApi.createCommentOnEntity({ parentId: parentCommentId }, body, opts);
+    // Thread reply under the parent comment — issueId is required alongside parentId
+    commentId = await linearApi.createCommentOnEntity({ issueId, parentId: parentCommentId }, body, opts);
   } else {
     commentId = await linearApi.createComment(issueId, body, opts);
   }
@@ -354,7 +354,7 @@ async function processComment(
   if (profilesError) {
     api.logger.error("Agent profiles validation failed — posting setup error to Linear");
     try {
-      await createCommentWithDedup(linearApi, issue.id, profilesError, undefined, comment?.id);
+      await createCommentWithDedup(linearApi, issue.id, profilesError, undefined, comment?.parentId ?? comment?.id);
     } catch {}
     return;
   }
@@ -403,7 +403,7 @@ async function processComment(
       );
       if (mentionBlockMsg) {
         api.logger.info(`Comment @mention: blocking work request on untriaged issue ${enrichedForGate?.identifier ?? issue.identifier ?? issue.id}`);
-        try { await createCommentWithDedup(linearApi, issue.id, mentionBlockMsg, undefined, comment?.id); } catch {}
+        try { await createCommentWithDedup(linearApi, issue.id, mentionBlockMsg, undefined, comment?.parentId ?? comment?.id); } catch {}
         return;
       }
 
@@ -458,7 +458,7 @@ async function processComment(
   );
   if (commentBlockMsg) {
     api.logger.info(`Comment: blocking work request on untriaged issue ${enrichedIssue?.identifier ?? issue.identifier ?? issue.id}`);
-    try { await createCommentWithDedup(linearApi, issue.id, commentBlockMsg, undefined, comment?.id); } catch {}
+    try { await createCommentWithDedup(linearApi, issue.id, commentBlockMsg, undefined, comment?.parentId ?? comment?.id); } catch {}
     return;
   }
 
@@ -744,7 +744,8 @@ export async function handleLinearWebhook(
         mentionPattern.lastIndex = 0;
         const mentionMatch = text.match(mentionPattern);
         if (mentionMatch) {
-          const alias = mentionMatch[1];
+          // .match() with /g flag returns full matches, not capture groups — strip @ prefix
+          const alias = mentionMatch[0].replace("@", "");
           const resolved = resolveAgentFromAlias(alias, profiles);
           if (resolved) {
             api.logger.info(`AgentSession routed to ${resolved.agentId} via @${alias} mention in ${text === userMessage ? "comment" : text === sessionPrompt ? "session prompt" : "promptContext"}`);
@@ -906,8 +907,12 @@ export async function handleLinearWebhook(
       `Respond within the scope defined above. Be concise and action-oriented.`,
     ].filter(Boolean).join("\n");
 
-    // Run agent directly (non-blocking)
+    // Run agent directly (non-blocking).
+    // Mark that a session handler is handling this issue — prevents the
+    // Comment.create handler from also dispatching (dual-path duplicate).
     activeRuns.add(issue.id);
+    sessionHandledIssues.set(issue.id, Date.now());
+    pendingComments.delete(issue.id);
     void (async () => {
       const profiles = loadAgentProfiles();
       const label = profiles[agentId]?.label ?? agentId;
@@ -1090,7 +1095,8 @@ export async function handleLinearWebhook(
     if (promptedMentionPattern && userMessage) {
       const mentionMatch = userMessage.match(promptedMentionPattern);
       if (mentionMatch) {
-        const alias = mentionMatch[1];
+        // .match() with /g flag returns full matches, not capture groups — strip @ prefix
+        const alias = mentionMatch[0].replace("@", "");
         const resolved = resolveAgentFromAlias(alias, promptedProfiles);
         if (resolved) {
           api.logger.info(`AgentSession prompted: routed to ${resolved.agentId} via @${alias} mention`);
@@ -1358,7 +1364,7 @@ export async function handleLinearWebhook(
               api, linearApi, profiles, resolved.agentId,
               { parentType, parentId: parentId, initiativeUpdateId, projectUpdateId, documentContentId },
               comment, commentBody, commentor, pluginConfig,
-            ).catch((err) => api.logger.error(`Non-issue comment dispatch error: ${err}`));
+            ).catch((err) => api.logger.warn(`Non-issue comment dispatch error: ${err}`));
             return true;
           }
         }
@@ -1394,10 +1400,17 @@ export async function handleLinearWebhook(
       }
     } catch { /* proceed if viewerId check fails */ }
 
-    // If an agent run is already active for this issue, queue this comment
-    // for replay after the run completes instead of dropping it.
+    // If an agent run is already active for this issue, decide: drop or queue.
     if (activeRuns.has(issue.id)) {
       const issueRef = issue.identifier ?? issue.id;
+      if (sessionHandledIssues.has(issue.id)) {
+        // Session handler owns this run — the same @mention is being
+        // processed via AgentSessionEvent. Drop this Comment.create
+        // to prevent a duplicate response.
+        api.logger.info(`Comment on ${issueRef}: session handler active — dropping duplicate`);
+        return true;
+      }
+      // Non-session run (triage, auto-assign, dispatch) — queue for replay
       pendingComments.set(issue.id, () => {
         api.logger.info(`Replaying queued comment on ${issueRef} (from ${commentor})`);
         void processComment(api, issue, comment, commentBody, commentor, pluginConfig)
@@ -2210,8 +2223,11 @@ async function dispatchCommentToAgent(
       ? result.output
       : `Something went wrong while processing this. The system will retry automatically if possible.`;
 
-    // Thread reply under the triggering comment when we have a comment ID.
-    const parentCommentId = comment?.id as string | undefined;
+    // Thread reply under the triggering comment's root.
+    // Linear requires parentId to be the TOP-LEVEL comment of the thread.
+    // If the triggering comment is itself a reply (has parentId), use that.
+    // Otherwise, the triggering comment IS the root — use its id.
+    const parentCommentId = (comment?.parentId ?? comment?.id) as string | undefined;
 
     // Always post as a threaded comment when responding to a comment.
     // emitActivity creates a top-level agent activity (no parentId threading),
@@ -2238,7 +2254,8 @@ async function dispatchCommentToAgent(
 
     api.logger.info(`Posted ${agentId} response to ${issueRef}${parentCommentId ? ` (threaded under ${parentCommentId})` : ""}`);
   } catch (err) {
-    api.logger.error(`dispatchCommentToAgent error: ${err}`);
+    // Use warn — api.logger.error() is invisible in gateway.log (only info+warn show)
+    api.logger.warn(`dispatchCommentToAgent error: ${err}`);
     if (agentSessionId) {
       await linearApi.emitActivity(agentSessionId, {
         type: "error",
@@ -2337,12 +2354,20 @@ async function dispatchNonIssueCommentToAgent(
       return;
     }
 
-    // Post response as a comment on the same entity
-    const replyTarget = target.initiativeUpdateId
-      ? { initiativeUpdateId: target.initiativeUpdateId }
-      : target.projectUpdateId
-        ? { projectUpdateId: target.projectUpdateId }
-        : { documentContentId: target.documentContentId! };
+    // Post response threaded under the triggering comment.
+    // Linear initiative updates only allow one comment thread — posting
+    // with just { initiativeUpdateId } creates a new thread and fails if
+    // one already exists. Always use parentId to reply in-thread.
+    const replyTarget: Record<string, string> = {};
+    if (target.initiativeUpdateId) replyTarget.initiativeUpdateId = target.initiativeUpdateId;
+    else if (target.projectUpdateId) replyTarget.projectUpdateId = target.projectUpdateId;
+    else replyTarget.documentContentId = target.documentContentId!;
+    // Thread under the triggering comment's root.
+    // Linear requires parentId to be the TOP-LEVEL comment of the thread.
+    // If the triggering comment is itself a reply (has parentId), use that.
+    // Otherwise, the triggering comment IS the root — use its id.
+    const threadRoot = comment?.parentId ?? comment?.id;
+    if (threadRoot) replyTarget.parentId = threadRoot;
 
     const labeledBody = `**[${label}]** ${responseBody}`;
     const opts = avatarUrl ? { createAsUser: label, displayIconUrl: avatarUrl } : undefined;
@@ -2504,8 +2529,9 @@ async function handleCloseIssue(
       api.logger.warn(`No completed state found for ${issueRef} — posting report without state change`);
     }
 
-    // Post closure report — thread under triggering comment when available.
-    const parentCommentId = comment?.id as string | undefined;
+    // Post closure report — thread under triggering comment's root.
+    // Linear requires parentId to be the TOP-LEVEL comment of the thread.
+    const parentCommentId = (comment?.parentId ?? comment?.id) as string | undefined;
     const agentOpts = avatarUrl
       ? { createAsUser: label, displayIconUrl: avatarUrl }
       : undefined;
