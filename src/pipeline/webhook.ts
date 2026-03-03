@@ -21,6 +21,7 @@ import { loadAgentProfiles, buildMentionPattern, resolveAgentFromAlias, validate
 import { getActiveTmuxSession } from "../infra/tmux-runner.js";
 import { capturePane } from "../infra/tmux.js";
 import { loadCodingConfig, resolveToolName } from "../tools/code-tool.js";
+import { runLightweightTriage, storeEntityInMem0, type TriageInput } from "./lightweight-triage.js";
 
 // ── Prompt input sanitization ─────────────────────────────────────
 
@@ -1420,6 +1421,13 @@ export async function handleLinearWebhook(
       return true;
     }
 
+    // Store comment in mem0 for agent recall (non-blocking)
+    void storeEntityInMem0(api, "comment", {
+      identifier: issue.identifier ?? issue.id,
+      title: `Comment by ${commentor} on ${issue.identifier ?? issue.id}`,
+      description: commentBody?.slice(0, 300),
+    }).catch(() => {});
+
     // Delegate to extracted processComment function (shared with replay queue)
     void processComment(api, issue, comment, commentBody, commentor, pluginConfig)
       .catch((err) => api.logger.error(`Comment processing error on ${issue.identifier ?? issue.id}: ${err}`));
@@ -1492,6 +1500,14 @@ export async function handleLinearWebhook(
       api.logger.info(`${trigger} ${issue.id} -> ${viewerId} already processed — skipping`);
       return true;
     }
+
+    // Store entity in mem0 for agent recall (non-blocking)
+    void storeEntityInMem0(api, "issue-assigned", {
+      identifier: issue.identifier ?? issue.id,
+      title: issue.title,
+      trigger,
+      state: issue.state?.name,
+    }).catch(() => {});
 
     // Assignment triggers the full dispatch pipeline:
     // tier assessment → worktree → plan → implement → audit
@@ -1625,6 +1641,36 @@ export async function handleLinearWebhook(
         if (viewerId && issue.creatorId === viewerId) {
           api.logger.info(`Issue.create: ${issue.identifier ?? issue.id} created by our bot — skipping triage`);
           return;
+        }
+
+        // ── Lightweight triage (fast, no LLM) ──────────────────────────
+        // Runs structural checks: project assignment, duplicate detection,
+        // alignment, missing info, formatting. Also stores mem0 summary.
+        try {
+          const triageInput: TriageInput = {
+            issue: {
+              id: issue.id,
+              identifier: enrichedIssue?.identifier ?? issue.identifier,
+              title: enrichedIssue?.title ?? issue.title,
+              description: enrichedIssue?.description ?? issue.description,
+              creatorId: issue.creatorId,
+              team: enrichedIssue?.team ?? issue.team,
+              project: enrichedIssue?.project ?? issue.project,
+              labels: enrichedIssue?.labels,
+              state: enrichedIssue?.state,
+              parent: enrichedIssue?.parent,
+            },
+            enrichedIssue,
+          };
+          const triageResult = await runLightweightTriage(api, linearApi, triageInput, pluginConfig);
+          api.logger.info(`Lightweight triage: ${triageResult.checks.length} checks, ${triageResult.actions.length} actions, ${triageResult.elapsedMs}ms`);
+
+          // Add emoji reaction to the issue itself
+          const flags = triageResult.checks.filter((c) => c.status === "flag");
+          const emoji = flags.length > 0 ? "👀" : "✅";
+          await linearApi.createReaction({ issueId: issue.id }, emoji).catch(() => {});
+        } catch (triageErr) {
+          api.logger.warn(`Lightweight triage failed (non-fatal): ${triageErr}`);
         }
 
         const description = enrichedIssue?.description ?? issue?.description ?? "(no description)";
@@ -1955,6 +2001,13 @@ export async function handleLinearWebhook(
       api.logger.info(`InitiativeUpdate ${updateData.id} already processed — skipping`);
       return true;
     }
+
+    // Store initiative update in mem0 (non-blocking)
+    void storeEntityInMem0(api, "initiative-update", {
+      identifier: updateData?.initiative?.name ?? updateData?.id,
+      title: `Initiative update by ${author}`,
+      description: updateBody?.slice(0, 300),
+    }).catch(() => {});
 
     const linearApi = createLinearApi(api);
     if (!linearApi) {

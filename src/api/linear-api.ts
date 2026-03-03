@@ -240,8 +240,14 @@ export class LinearAgentApi {
     );
   }
 
-  async createReaction(commentId: string, emoji: string): Promise<boolean> {
+  async createReaction(
+    target: string | { commentId?: string; issueId?: string },
+    emoji: string,
+  ): Promise<boolean> {
     try {
+      const input = typeof target === "string"
+        ? { commentId: target, emoji }
+        : { ...target, emoji };
       const data = await this.gql<{
         reactionCreate: { success: boolean };
       }>(
@@ -250,7 +256,7 @@ export class LinearAgentApi {
             success
           }
         }`,
-        { input: { commentId, emoji } },
+        { input },
       );
       return data.reactionCreate.success;
     } catch {
@@ -490,6 +496,25 @@ export class LinearAgentApi {
       `query { teams { nodes { id name key } } }`,
     );
     return data.teams.nodes;
+  }
+
+  async getTeamProjects(teamId: string): Promise<Array<{
+    id: string;
+    name: string;
+    description: string | null;
+    state: string;
+  }>> {
+    const data = await this.gql<{
+      team: { projects: { nodes: Array<{ id: string; name: string; description: string | null; state: string }> } };
+    }>(
+      `query TeamProjects($id: String!) {
+        team(id: $id) {
+          projects { nodes { id name description state } }
+        }
+      }`,
+      { id: teamId },
+    );
+    return data.team.projects.nodes;
   }
 
   async createLabel(
