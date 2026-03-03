@@ -99,28 +99,20 @@ export default function register(api: OpenClawPluginApi) {
   // Register zero-LLM slash commands for dispatch ops
   registerDispatchCommands(api);
 
-  // Register Linear webhook handler as a generic HTTP handler rather than a
-  // named route.  Named routes (registerHttpRoute) are subject to gateway auth
-  // enforcement — external webhook senders (Linear) cannot provide a gateway
-  // token.  Generic handlers (registerHttpHandler) bypass the route-level auth
-  // check, letting the handler itself verify the webhook signature.
-  //
-  // Note: /hooks/linear (back-compat) is NOT registered here because the
-  // gateway hooks handler (step 1 in dispatch) intercepts all /hooks/* paths
-  // and requires the OpenClaw hooks token.  Linear's webhook URL must use
-  // /linear/webhook instead.
-  api.registerHttpHandler(async (req: any, res: any) => {
-    const url = new URL(req.url ?? "/", "http://localhost");
-    if (url.pathname === "/linear/webhook") {
+  // Register Linear webhook handler with plugin-level auth (bypasses gateway
+  // token enforcement — Linear webhooks verify via their own signature).
+  api.registerHttpRoute({
+    path: "/linear/webhook",
+    auth: "plugin",
+    handler: async (req, res) => {
       await handleLinearWebhook(api, req, res);
-      return true;
-    }
-    return false;
+    },
   });
 
-  // Register OAuth callback route
+  // Register OAuth callback route (plugin auth — browser redirect from Linear)
   api.registerHttpRoute({
     path: "/linear/oauth/callback",
+    auth: "plugin",
     handler: async (req, res) => {
       await handleOAuthCallback(api, req, res);
     },
