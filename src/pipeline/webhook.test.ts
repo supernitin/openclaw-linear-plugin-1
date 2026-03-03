@@ -83,6 +83,7 @@ const {
     createInitiativeUpdate: vi.fn().mockResolvedValue("initiative-update-id"),
     getInitiative: vi.fn().mockResolvedValue({ id: "init-1", name: "Q1 Roadmap", description: "Planning", status: "In Progress" }),
     getInitiativeFromUpdate: vi.fn().mockResolvedValue({ id: "init-1", name: "Q1 Roadmap" }),
+    getInitiativeProjects: vi.fn().mockResolvedValue([]),
     createCommentOnEntity: vi.fn().mockResolvedValue("entity-comment-id"),
   },
   loadAgentProfilesMock: vi.fn().mockReturnValue({
@@ -351,6 +352,7 @@ afterEach(() => {
   mockLinearApiInstance.createInitiativeUpdate.mockReset().mockResolvedValue("initiative-update-id");
   mockLinearApiInstance.getInitiative.mockReset().mockResolvedValue({ id: "init-1", name: "Q1 Roadmap", description: "Planning", status: "In Progress" });
   mockLinearApiInstance.getInitiativeFromUpdate.mockReset().mockResolvedValue({ id: "init-1", name: "Q1 Roadmap" });
+  mockLinearApiInstance.getInitiativeProjects.mockReset().mockResolvedValue([]);
   mockLinearApiInstance.createCommentOnEntity.mockReset().mockResolvedValue("entity-comment-id");
   resolveLinearTokenMock.mockReset().mockReturnValue({
     accessToken: "test-token",
@@ -5144,8 +5146,8 @@ describe("InitiativeUpdate.create @mention routing", () => {
     const infoCalls = (result.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
     expect(infoCalls.some((msg: string) => msg.includes("InitiativeUpdate @mention") && msg.includes("mal"))).toBe(true);
     expect(runAgentMock).toHaveBeenCalled();
-    expect(mockLinearApiInstance.createInitiativeUpdate).toHaveBeenCalledWith(
-      "init-1",
+    expect(mockLinearApiInstance.createCommentOnEntity).toHaveBeenCalledWith(
+      { initiativeUpdateId: "iu-1" },
       expect.stringContaining("[Mal]"),
     );
   });
@@ -5231,8 +5233,8 @@ describe("InitiativeUpdate.create @mention routing", () => {
 
     expect(mockLinearApiInstance.getInitiativeFromUpdate).toHaveBeenCalledWith("iu-no-init");
     expect(runAgentMock).toHaveBeenCalled();
-    expect(mockLinearApiInstance.createInitiativeUpdate).toHaveBeenCalledWith(
-      "init-resolved",
+    expect(mockLinearApiInstance.createCommentOnEntity).toHaveBeenCalledWith(
+      { initiativeUpdateId: "iu-no-init" },
       expect.any(String),
     );
   });
@@ -5297,8 +5299,8 @@ describe("InitiativeUpdate.create @mention routing", () => {
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 300));
 
-    expect(mockLinearApiInstance.createInitiativeUpdate).toHaveBeenCalledWith(
-      "init-1",
+    expect(mockLinearApiInstance.createCommentOnEntity).toHaveBeenCalledWith(
+      { initiativeUpdateId: "iu-agent-fail" },
       expect.stringContaining("encountered an issue"),
     );
   });
