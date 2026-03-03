@@ -2046,20 +2046,47 @@ export async function handleLinearWebhook(
         const profile = profiles[resolved.agentId];
         const label = profile?.label ?? resolved.agentId;
 
-        // Fetch initiative details for context
+        // Fetch initiative details + project hierarchy for rich context
         const initiative = await linearApi.getInitiative(initiativeId!);
+        let projectContext = "";
+        try {
+          const projects = await linearApi.getInitiativeProjects(initiativeId!);
+          if (projects.length > 0) {
+            const projectLines: string[] = [``, `## Projects under this initiative:`];
+            for (const proj of projects) {
+              const issueCount = proj.issues?.nodes?.length ?? 0;
+              projectLines.push(`### ${proj.name} (${proj.state})${proj.description ? ` — ${proj.description}` : ""}`);
+              if (issueCount > 0) {
+                for (const iss of proj.issues.nodes.slice(0, 5)) {
+                  projectLines.push(`- ${iss.identifier}: ${iss.title} [${iss.state.name}]`);
+                }
+                if (issueCount > 5) projectLines.push(`- ... and ${issueCount - 5} more issues`);
+              } else {
+                projectLines.push(`- (no issues)`);
+              }
+            }
+            projectContext = projectLines.join("\n");
+          }
+        } catch (err) {
+          api.logger.warn(`Could not fetch initiative projects: ${err}`);
+        }
 
         const message = [
-          `You are responding to an @mention on a Linear Initiative Update. Your text output will be posted as a new update on the initiative.`,
+          `You are responding to an @mention on a Linear Initiative Update. Your text output will be posted as a comment reply on this update.`,
           ``,
           `## Initiative: ${initiative?.name ?? initiativeName}`,
           `**Status:** ${initiative?.status ?? "Unknown"}`,
           initiative?.description ? `**Description:** ${initiative.description}` : "",
+          projectContext,
+          ``,
+          `## Linear tools available:`,
+          `- \`linear_issues\` tool: action="read" to get full issue details, action="search" to find issues by keyword, action="comment" to post on issues.`,
+          `- Standard tools: web_search, exec, read, etc.`,
           ``,
           `**${author} says:**`,
           `> ${sanitizePromptInput(updateBody, 2000)}`,
           ``,
-          `Respond conversationally and concisely. This is an initiative update, not a code issue.`,
+          `Respond conversationally and concisely. Use linear_issues search/read if you need more context about specific issues or projects.`,
         ].filter(Boolean).join("\n");
 
         const sessionId = `linear-initiative-${resolved.agentId}-${Date.now()}`;
@@ -2077,8 +2104,11 @@ export async function handleLinearWebhook(
           : `I received your mention but encountered an issue processing it. Please try again.`;
 
         api.logger.info(`Agent ${resolved.agentId} returned for initiative "${initiativeName}": success=${result.success} outputLen=${responseBody?.length ?? 0}`);
-        await linearApi.createInitiativeUpdate(initiativeId!, `**[${label}]** ${responseBody}`);
-        api.logger.info(`Posted ${resolved.agentId} initiative update response on "${initiativeName}"`);
+        await linearApi.createCommentOnEntity(
+          { initiativeUpdateId: updateData.id },
+          `**[${label}]** ${responseBody}`,
+        );
+        api.logger.info(`Posted ${resolved.agentId} initiative comment reply on "${initiativeName}"`);
       } catch (err) {
         api.logger.warn(`InitiativeUpdate dispatch FAILED for "${initiativeName}": ${err}`);
       }
@@ -2358,13 +2388,27 @@ async function dispatchNonIssueCommentToAgent(
     return;
   }
 
-  // Fetch context about the parent entity
-  let entityContext = "";
+  // Fetch context about the parent entity — include hierarchy when available
+  const entityContextLines: string[] = [];
   if (target.initiativeUpdateId) {
     try {
       const initiative = await linearApi.getInitiativeFromUpdate(target.initiativeUpdateId);
       if (initiative) {
-        entityContext = `\n## Initiative: ${initiative.name}\n`;
+        entityContextLines.push(``, `## Initiative: ${initiative.name}`);
+        // Fetch projects under this initiative for lineage context
+        try {
+          const projects = await linearApi.getInitiativeProjects(initiative.id);
+          if (projects.length > 0) {
+            entityContextLines.push(`### Projects:`);
+            for (const proj of projects) {
+              const issueCount = proj.issues?.nodes?.length ?? 0;
+              entityContextLines.push(`- **${proj.name}** (${proj.state})${issueCount > 0 ? ` — ${issueCount} recent issues` : ""}`);
+              for (const iss of (proj.issues?.nodes ?? []).slice(0, 3)) {
+                entityContextLines.push(`  - ${iss.identifier}: ${iss.title} [${iss.state.name}]`);
+              }
+            }
+          }
+        } catch { /* proceed with basic context */ }
       }
     } catch { /* proceed without context */ }
   }
@@ -2374,9 +2418,10 @@ async function dispatchNonIssueCommentToAgent(
     `Your text output will be posted as a reply on the same thread (do NOT post comments yourself — the handler does it).`,
     ``,
     `**Your role:** Conversational assistant. Answer questions, provide analysis, or offer suggestions.`,
-    `You do NOT have access to Linear issue tools in this context — this is a ${target.parentType}, not an issue.`,
-    `Use standard tools (web_search, exec, read, etc.) if needed.`,
-    entityContext,
+    `You have access to \`linear_issues\` tool: action="read" to get issue details, action="search" to find issues by keyword. Use these to look up related context.`,
+    `Also available: web_search, exec, read, etc.`,
+    ...entityContextLines,
+    ``,
     `**${commentor} says:**`,
     `> ${commentBody}`,
     ``,
