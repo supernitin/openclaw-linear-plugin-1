@@ -885,6 +885,8 @@ export async function handleLinearWebhook(
     const message = [
       `You are an orchestrator responding in a Linear issue session. Your text output will be posted as activities visible to the user.`,
       ``,
+      `**Output rules:** Your text is posted VERBATIM. Do NOT include reasoning steps, false starts, or tool-use narration ("Let me search...", "I couldn't find..."). Output ONLY your final, polished response. Lead with the answer, not background.`,
+      ``,
       ...toolAccessLines,
       ``,
       ...roleLines,
@@ -1215,6 +1217,8 @@ export async function handleLinearWebhook(
 
       const message = [
         `You are an orchestrator responding in a Linear issue session. Your text output will be posted as activities visible to the user.`,
+        ``,
+        `**Output rules:** Your text is posted VERBATIM. Do NOT include reasoning steps, false starts, or tool-use narration ("Let me search...", "I couldn't find..."). Output ONLY your final, polished response. Lead with the answer, not background.`,
         ``,
         ...followUpToolAccessLines,
         ``,
@@ -1778,19 +1782,19 @@ export async function handleLinearWebhook(
         // Assessment tasks — Goal Alignment only when project context exists
         const hasDescription = description && description !== "(no description)" && description.trim().length > 10;
         const assessmentTasks: string[] = [
-          `1. **Research & Enrich** — Think about what would make this issue genuinely actionable. ${hasDescription ? "Build on the existing description." : "The issue has only a title — think like a proactive assistant: what details, links, dates, or context would the creator need to actually act on this?"} Think about where the relevant information lives — email, calendar, files, the web, memory — and go get it. Add concrete details: dates, links, amounts, account info, steps. Don't just restate the issue — make it better than when you found it`,
-          `2. **Duplicate/Overlap Check** — Does this duplicate or significantly overlap with any existing issues listed above? If so, note which ones`,
+          `1. **Research & Enrich** — ${hasDescription ? "Build on the existing description with concrete details (dates, links, amounts)." : "The issue has only a title — search email, calendar, web, or memory for relevant details and add them."} Do the research NOW — don't just suggest it`,
+          `2. **Duplicate Check** — Flag overlapping issues from the list above. If duplicate, just say which one and stop — no further analysis needed`,
         ];
         if (projectName) {
           assessmentTasks.push(
-            `3. **Goal Alignment** — Does this align with the project's stated goals and any linked initiatives? Flag if it seems out of scope or if it could unblock/block other issues`,
+            `3. **Goal Alignment** — One line: does this align with the project? Flag if out of scope`,
           );
         }
         let taskNum = projectName ? 4 : 3;
         assessmentTasks.push(
-          `${taskNum++}. **Impact & Dependencies** — What existing issues, projects, or initiatives does this affect? Note any that would be blocked or accelerated by completing this`,
-          `${taskNum++}. **Suggested Approach** — Recommend a concrete approach: what to do first, what tools or accounts are needed, whether this should be recurring, and any prerequisites. Be specific and practical, not generic`,
-          `${taskNum++}. **Do What You Can** — If you can research, look up, or resolve parts of this issue using your tools, DO IT NOW and include the findings in your assessment. Search email for relevant info, check the calendar, search the web, create reminders — whatever is useful. Only create subtasks (via \`linear_issues\` with action="create" and parentIssueId="${issue.id}") for work that genuinely cannot be done right now: things that require the user to take a physical action, things that require waiting for an external event, or long-running tasks that need separate tracking. Most issues need 0 subtasks. Set "subtasksCreated" in your JSON to the count (usually 0)`,
+          `${taskNum++}. **Dependencies** — Note blockers or blocked issues in one line each`,
+          `${taskNum++}. **Next Step** — What is the single most important next action? Be specific`,
+          `${taskNum++}. **Do What You Can** — Research and resolve what you can with your tools NOW. Only create subtasks (via \`linear_issues\` with action="create" and parentIssueId="${issue.id}") for work requiring user action or external events. Most issues need 0 subtasks. Set "subtasksCreated" in your JSON to the count (usually 0)`,
         );
 
         // Build JSON schema — omit estimate when not used
@@ -1816,9 +1820,9 @@ export async function handleLinearWebhook(
         labelsAndEffort.push(`- Set priority (1=Urgent, 2=High, 3=Medium, 4=Low) if not already set`);
 
         const message = [
-          `IMPORTANT: You are assessing a new Linear issue. Review it in context and provide your analysis. You MUST respond with a JSON block containing your decisions, followed by your assessment as plain text.`,
+          `IMPORTANT: You are assessing a new Linear issue. Review it in context and provide your analysis. You MUST respond with a JSON block containing your decisions, followed by a BRIEF assessment (3-8 lines max).`,
           ``,
-          `**Tool access:** You have access to the user's full environment — use whatever is relevant to enrich this issue. Examples: email (search for statements, confirmations, due dates), calendar (check for existing events, deadlines), reminders, contacts, files on disk, web search, memory (past context about the user). You also have \`linear_issues\` for lookups and updates. Think about where the information needed for this issue would naturally live and go find it.`,
+          `**Tool access:** You have access to the user's full environment — search email, calendar, web, memory, files, and \`linear_issues\` to enrich this issue with concrete details. Do the research — don't just suggest it.`,
           ``,
           `## Issue: ${enrichedIssue?.identifier ?? issue.identifier ?? issue.id} — ${enrichedIssue?.title ?? issue.title ?? "(untitled)"}`,
           `**Status:** ${enrichedIssue?.state?.name ?? "Unknown"} | **Current Estimate:** ${enrichedIssue?.estimate ?? "None"} | **Current Labels:** ${currentLabelNames}`,
@@ -1850,7 +1854,7 @@ export async function handleLinearWebhook(
           ``,
           `IMPORTANT: Only reference real users from the issue data above. Do NOT fabricate or guess user names, emails, or identities. The issue creator is shown in the "Created by" field.`,
           ``,
-          `Then write your full assessment as markdown below the JSON block.`,
+          `Then write a BRIEF assessment (3-8 lines) below the JSON block. Lead with the most important finding (e.g., "Duplicate of LIFE-105" or "Blocked by LIFE-106"). Skip sections that add no insight. Do NOT write multi-paragraph essays or repeat information from the issue title/description.`,
           triageGuidanceAppendix,
         ].filter(Boolean).join("\n");
 
@@ -2074,6 +2078,8 @@ export async function handleLinearWebhook(
         const message = [
           `You are responding to an @mention on a Linear Initiative Update. Your text output will be posted as a comment reply on this update.`,
           ``,
+          `**Output rules:** Your text is posted VERBATIM. Do NOT include reasoning steps, false starts, or tool-use narration. Output ONLY your final response. Keep it conversational and short — match the casual tone of initiative updates. 2-5 sentences is ideal.`,
+          ``,
           `## Initiative: ${initiative?.name ?? initiativeName}`,
           `**Status:** ${initiative?.status ?? "Unknown"}`,
           initiative?.description ? `**Description:** ${initiative.description}` : "",
@@ -2086,7 +2092,7 @@ export async function handleLinearWebhook(
           `**${author} says:**`,
           `> ${sanitizePromptInput(updateBody, 2000)}`,
           ``,
-          `Respond conversationally and concisely. Use linear_issues search/read if you need more context about specific issues or projects.`,
+          `Respond conversationally in 2-5 sentences. Use linear_issues search/read if you need more context, but don't narrate your tool usage — just share the answer.`,
         ].filter(Boolean).join("\n");
 
         const sessionId = `linear-initiative-${resolved.agentId}-${Date.now()}`;
@@ -2235,6 +2241,8 @@ async function dispatchCommentToAgent(
   const message = [
     `You are an orchestrator responding to a Linear comment. Your text output will be automatically posted as a comment on the issue (do NOT post a comment yourself — the handler does it).`,
     ``,
+    `**Output rules:** Your text is posted VERBATIM. Do NOT include reasoning steps, false starts, or tool-use narration ("Let me search...", "I couldn't find...", "Let me try a different approach..."). Output ONLY your final, polished response. Lead with the answer, not background context.`,
+    ``,
     ...toolAccessLines,
     ``,
     ...roleLines,
@@ -2258,7 +2266,7 @@ async function dispatchCommentToAgent(
     `4. **Plan before building.** For non-trivial work, respond with a plan first. Only dispatch \`${cliTool}\` after the plan is clear and grounded in the issue body.`,
     `5. **Match response to request.** Greeting → greet. Question → answer. No work requirements in the issue body → no ${cliTool}.`,
     ``,
-    `Respond within the scope defined above. Be concise and action-oriented.`,
+    `Respond within the scope defined above. Be concise — answer questions in 2-4 sentences unless the topic genuinely requires more. No essays.`,
     commentGuidanceAppendix,
   ].filter(Boolean).join("\n");
 
@@ -2417,6 +2425,8 @@ async function dispatchNonIssueCommentToAgent(
     `You are responding to an @mention on a ${target.parentType} comment in Linear.`,
     `Your text output will be posted as a reply on the same thread (do NOT post comments yourself — the handler does it).`,
     ``,
+    `**Output rules:** Your text is posted VERBATIM. Do NOT include reasoning steps, false starts, or tool-use narration ("Let me search...", "I couldn't find..."). Output ONLY your final, polished response.`,
+    ``,
     `**Your role:** Conversational assistant. Answer questions, provide analysis, or offer suggestions.`,
     `You have access to \`linear_issues\` tool: action="read" to get issue details, action="search" to find issues by keyword. Use these to look up related context.`,
     `Also available: web_search, exec, read, etc.`,
@@ -2425,7 +2435,7 @@ async function dispatchNonIssueCommentToAgent(
     `**${commentor} says:**`,
     `> ${commentBody}`,
     ``,
-    `Respond concisely and helpfully.`,
+    `Respond in 2-5 sentences. Lead with the answer, not background.`,
   ].filter(Boolean).join("\n");
 
   activeRuns.add(runKey);
