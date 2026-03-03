@@ -641,6 +641,99 @@ export class LinearAgentApi {
     }
   }
 
+  async getInitiativeProjects(initiativeId: string): Promise<Array<{
+    id: string;
+    name: string;
+    description: string | null;
+    state: string;
+    issues: { nodes: Array<{ id: string; identifier: string; title: string; state: { name: string; type: string } }> };
+  }>> {
+    try {
+      const data = await this.gql<{
+        initiative: {
+          projects: {
+            nodes: Array<{
+              id: string;
+              name: string;
+              description: string | null;
+              state: string;
+              issues: { nodes: Array<{ id: string; identifier: string; title: string; state: { name: string; type: string } }> };
+            }>;
+          };
+        };
+      }>(
+        `query InitiativeProjects($id: String!) {
+          initiative(id: $id) {
+            projects {
+              nodes {
+                id
+                name
+                description
+                state
+                issues(first: 10, orderBy: updatedAt) {
+                  nodes {
+                    id
+                    identifier
+                    title
+                    state { name type }
+                  }
+                }
+              }
+            }
+          }
+        }`,
+        { id: initiativeId },
+      );
+      return data.initiative.projects.nodes;
+    } catch {
+      return [];
+    }
+  }
+
+  async searchIssues(query: string, opts?: { teamId?: string; limit?: number }): Promise<Array<{
+    id: string;
+    identifier: string;
+    title: string;
+    description: string | null;
+    state: { name: string; type: string };
+    team: { id: string; name: string };
+    project: { id: string; name: string } | null;
+  }>> {
+    const limit = opts?.limit ?? 10;
+    const filter: Record<string, unknown> = {};
+    if (opts?.teamId) filter.team = { id: { eq: opts.teamId } };
+
+    const data = await this.gql<{
+      issueSearch: {
+        nodes: Array<{
+          id: string;
+          identifier: string;
+          title: string;
+          description: string | null;
+          state: { name: string; type: string };
+          team: { id: string; name: string };
+          project: { id: string; name: string } | null;
+        }>;
+      };
+    }>(
+      `query SearchIssues($query: String!, $first: Int!, $filter: IssueFilter) {
+        issueSearch(query: $query, first: $first, filter: $filter) {
+          nodes {
+            id
+            identifier
+            title
+            description
+            state { name type }
+            team { id name }
+            project { id name }
+          }
+        }
+      }`,
+      { query, first: limit, ...(Object.keys(filter).length ? { filter } : {}) },
+    );
+    return data.issueSearch.nodes;
+  }
+
   async getProjectIssues(projectId: string): Promise<Array<{
     id: string;
     identifier: string;

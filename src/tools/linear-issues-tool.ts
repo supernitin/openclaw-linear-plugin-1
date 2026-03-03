@@ -3,7 +3,7 @@ import { jsonResult } from "openclaw/plugin-sdk";
 import { LinearAgentApi, resolveLinearToken } from "../api/linear-api.js";
 import { isValidIssueId as isValidLinearId } from "../infra/validation.js";
 
-type Action = "read" | "create" | "update" | "comment" | "list_states" | "list_labels";
+type Action = "read" | "create" | "update" | "comment" | "list_states" | "list_labels" | "search";
 
 interface ToolParams {
   action: Action;
@@ -18,6 +18,8 @@ interface ToolParams {
   body?: string;
   teamId?: string;
   projectId?: string;
+  query?: string;
+  limit?: number;
 }
 
 function buildApi(pluginConfig?: Record<string, unknown>): LinearAgentApi {
@@ -259,6 +261,29 @@ async function handleListLabels(api: LinearAgentApi, params: ToolParams) {
   return jsonResult({ labels });
 }
 
+async function handleSearch(api: LinearAgentApi, params: ToolParams) {
+  if (!params.query) {
+    return jsonResult({ error: "query is required for action='search'" });
+  }
+  const results = await api.searchIssues(params.query, {
+    teamId: params.teamId,
+    limit: params.limit ?? 10,
+  });
+  return jsonResult({
+    query: params.query,
+    count: results.length,
+    issues: results.map((r) => ({
+      identifier: r.identifier,
+      title: r.title,
+      description: r.description?.slice(0, 200) ?? null,
+      status: r.state.name,
+      statusType: r.state.type,
+      team: r.team.name,
+      project: r.project?.name ?? null,
+    })),
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Tool factory
 // ---------------------------------------------------------------------------
@@ -272,11 +297,13 @@ export function createLinearIssuesTool(
     name: "linear_issues",
     label: "Linear Issues",
     description:
-      "Read, create, update, and manage Linear issues directly via API. " +
-      "Actions: read (get issue details), create (create issue or sub-issue), " +
+      "Read, create, update, search, and manage Linear issues directly via API. " +
+      "Actions: read (get issue details), search (find issues by keyword), " +
+      "create (create issue or sub-issue), " +
       "update (change status/priority/labels/estimate/title), " +
       "comment (post a comment), list_states (get workflow states for a team), " +
       "list_labels (get labels for a team). " +
+      "Use action='search' with query to find relevant issues across the workspace. " +
       "Use action='create' with parentIssueId to create sub-issues for granular work breakdown. " +
       "Status and label names are resolved to IDs automatically.",
     parameters: {
@@ -284,7 +311,7 @@ export function createLinearIssuesTool(
       properties: {
         action: {
           type: "string",
-          enum: ["read", "create", "update", "comment", "list_states", "list_labels"],
+          enum: ["read", "create", "update", "comment", "list_states", "list_labels", "search"],
           description: "The action to perform.",
         },
         issueId: {
@@ -330,7 +357,15 @@ export function createLinearIssuesTool(
         },
         teamId: {
           type: "string",
-          description: "Team ID. Required for list_states, list_labels, and action=create (unless parentIssueId is provided). Get it from a read action first.",
+          description: "Team ID. Required for list_states, list_labels, and action=create (unless parentIssueId is provided). Optional filter for search. Get it from a read action first.",
+        },
+        query: {
+          type: "string",
+          description: "Search query string. Required for action=search. Matches against issue title and description.",
+        },
+        limit: {
+          type: "number",
+          description: "Maximum number of results for action=search. Default 10, max 50.",
         },
       },
       required: ["action"],
@@ -352,8 +387,10 @@ export function createLinearIssuesTool(
             return await handleListStates(linearApi, params);
           case "list_labels":
             return await handleListLabels(linearApi, params);
+          case "search":
+            return await handleSearch(linearApi, params);
           default:
-            return jsonResult({ error: `Unknown action: ${params.action}. Valid: read, create, update, comment, list_states, list_labels` });
+            return jsonResult({ error: `Unknown action: ${params.action}. Valid: read, create, update, comment, list_states, list_labels, search` });
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
