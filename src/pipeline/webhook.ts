@@ -1426,10 +1426,11 @@ export async function handleLinearWebhook(
     }
 
     // Store comment in mem0 for agent recall (non-blocking)
+    // Include the actual comment text — not just metadata — so agents have real context
     void storeEntityInMem0(api, "comment", {
       identifier: issue.identifier ?? issue.id,
-      title: `Comment by ${commentor} on ${issue.identifier ?? issue.id}`,
-      description: commentBody?.slice(0, 300),
+      title: `${commentor} on ${issue.identifier ?? issue.id}: ${(issue.title ?? "").slice(0, 60)}`,
+      description: commentBody?.slice(0, 500),
     }).catch(() => {});
 
     // Delegate to extracted processComment function (shared with replay queue)
@@ -1983,6 +1984,14 @@ export async function handleLinearWebhook(
     const updateBody = updateData?.body ?? "";
     const author = payload.actor?.name ?? "Unknown";
 
+    // Always capture initiative updates to mem0 — these are rich user context
+    // even when there's no @mention (user journaling, status notes, decisions)
+    void storeEntityInMem0(api, "initiative-update", {
+      identifier: updateData?.initiative?.name ?? updateData?.id,
+      title: `${author} on ${updateData?.initiative?.name ?? "initiative"}`,
+      description: updateBody?.slice(0, 500),
+    }).catch(() => {});
+
     // Only process if there's an @mention
     const profiles = loadAgentProfiles();
     const mentionPattern = buildMentionPattern(profiles);
@@ -2005,13 +2014,6 @@ export async function handleLinearWebhook(
       api.logger.info(`InitiativeUpdate ${updateData.id} already processed — skipping`);
       return true;
     }
-
-    // Store initiative update in mem0 (non-blocking)
-    void storeEntityInMem0(api, "initiative-update", {
-      identifier: updateData?.initiative?.name ?? updateData?.id,
-      title: `Initiative update by ${author}`,
-      description: updateBody?.slice(0, 300),
-    }).catch(() => {});
 
     const linearApi = createLinearApi(api);
     if (!linearApi) {
