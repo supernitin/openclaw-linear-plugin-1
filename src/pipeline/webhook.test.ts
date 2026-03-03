@@ -2311,8 +2311,9 @@ describe("dispatchCommentToAgent via Comment.create intents", () => {
 
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 300));
-    const errorCalls = (result.api.logger.error as any).mock.calls.map((c: any[]) => c[0]);
-    expect(errorCalls.some((msg: string) => msg.includes("dispatchCommentToAgent error"))).toBe(true);
+    // dispatchCommentToAgent's inner catch logs to warn (logger.error is invisible in gateway.log)
+    const warnCalls = (result.api.logger.warn as any).mock.calls.map((c: any[]) => c[0]);
+    expect(warnCalls.some((msg: string) => msg.includes("dispatchCommentToAgent error"))).toBe(true);
   });
 
   it("skips dispatch when active run exists in dispatchCommentToAgent", async () => {
@@ -3237,10 +3238,10 @@ describe("Comment.create .catch callbacks on fire-and-forget dispatches", () => 
 
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 300));
-    const errorCalls = (result.api.logger.error as any).mock.calls.map((c: any[]) => c[0]);
-    // The .catch on dispatchCommentToAgent should log
-    expect(errorCalls.some((msg: string) =>
-      msg.includes("dispatch error") || msg.includes("dispatchCommentToAgent error")
+    // dispatchCommentToAgent's inner catch logs to warn (logger.error is invisible in gateway.log)
+    const warnCalls = (result.api.logger.warn as any).mock.calls.map((c: any[]) => c[0]);
+    expect(warnCalls.some((msg: string) =>
+      msg.includes("dispatchCommentToAgent error")
     )).toBe(true);
   });
 
@@ -3424,9 +3425,10 @@ describe("Comment.create .catch callbacks on fire-and-forget dispatches", () => 
 
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 300));
-    const errorCalls = (result.api.logger.error as any).mock.calls.map((c: any[]) => c[0]);
-    expect(errorCalls.some((msg: string) =>
-      msg.includes("Comment dispatch error") || msg.includes("dispatchCommentToAgent error")
+    // dispatchCommentToAgent's inner catch logs to warn (logger.error is invisible in gateway.log)
+    const warnCalls = (result.api.logger.warn as any).mock.calls.map((c: any[]) => c[0]);
+    expect(warnCalls.some((msg: string) =>
+      msg.includes("dispatchCommentToAgent error")
     )).toBe(true);
   });
 
@@ -3461,9 +3463,10 @@ describe("Comment.create .catch callbacks on fire-and-forget dispatches", () => 
 
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 300));
-    const errorCalls = (result.api.logger.error as any).mock.calls.map((c: any[]) => c[0]);
-    expect(errorCalls.some((msg: string) =>
-      msg.includes("Comment dispatch error") || msg.includes("dispatchCommentToAgent error")
+    // dispatchCommentToAgent's inner catch logs to warn (logger.error is invisible in gateway.log)
+    const warnCalls = (result.api.logger.warn as any).mock.calls.map((c: any[]) => c[0]);
+    expect(warnCalls.some((msg: string) =>
+      msg.includes("dispatchCommentToAgent error")
     )).toBe(true);
   });
 
@@ -3497,9 +3500,10 @@ describe("Comment.create .catch callbacks on fire-and-forget dispatches", () => 
 
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 300));
-    const errorCalls = (result.api.logger.error as any).mock.calls.map((c: any[]) => c[0]);
-    expect(errorCalls.some((msg: string) =>
-      msg.includes("Comment dispatch error") || msg.includes("dispatchCommentToAgent error")
+    // dispatchCommentToAgent's inner catch logs to warn (logger.error is invisible in gateway.log)
+    const warnCalls = (result.api.logger.warn as any).mock.calls.map((c: any[]) => c[0]);
+    expect(warnCalls.some((msg: string) =>
+      msg.includes("dispatchCommentToAgent error")
     )).toBe(true);
   });
 
@@ -3691,8 +3695,9 @@ describe("dispatchCommentToAgent internal .catch callbacks", () => {
 
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 300));
-    const errorCalls = (result.api.logger.error as any).mock.calls.map((c: any[]) => c[0]);
-    expect(errorCalls.some((msg: string) => msg.includes("dispatchCommentToAgent error"))).toBe(true);
+    // dispatchCommentToAgent's inner catch logs to warn (logger.error is invisible in gateway.log)
+    const warnCalls = (result.api.logger.warn as any).mock.calls.map((c: any[]) => c[0]);
+    expect(warnCalls.some((msg: string) => msg.includes("dispatchCommentToAgent error"))).toBe(true);
   });
 });
 
