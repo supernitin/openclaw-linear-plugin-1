@@ -834,6 +834,7 @@ export async function handleLinearWebhook(
         `- \`${cliTool}\`: Dispatch work to a worker. Workers return text — they cannot access linear_issues.`,
         `- \`spawn_agent\`/\`ask_agent\`: Delegate to other crew agents.`,
         `- Standard tools: exec, read, edit, write, web_search, etc.`,
+        `- \`mcporter\` skill: Access external MCP servers (finances, APIs, etc.). Run \`mcporter list\` to discover available servers, then \`mcporter call <server.tool> key=value\` to call tools.`,
         ``,
         `**Sub-issue guidance:** Only create sub-issues when work genuinely needs separate tracking — e.g., it requires the user to take action first, depends on an external event, or is a long-running task. For research, lookups, and tasks you can complete with your tools, just do the work directly and report findings. Most requests need 0 sub-issues.`,
       ]
@@ -843,6 +844,7 @@ export async function handleLinearWebhook(
         `- \`${cliTool}\`: **Planning mode only.** Workers may explore the workspace and write plan files (PLAN.md, design docs). Workers MUST NOT create, modify, or delete workspace artifacts, run deployments, or make system changes. Use for workspace exploration and planning only.`,
         `- \`spawn_agent\`/\`ask_agent\`: Delegate to other crew agents.`,
         `- Standard tools: exec, read, edit, write, web_search, etc.`,
+        `- \`mcporter\` skill: Access external MCP servers (finances, APIs, etc.). Run \`mcporter list\` to discover available servers, then \`mcporter call <server.tool> key=value\` to call tools.`,
       ];
 
     const roleLines = isTriaged
@@ -1165,6 +1167,7 @@ export async function handleLinearWebhook(
           `- \`${followUpCliTool}\`: Dispatch work to a worker. Workers return text — they cannot access linear_issues.`,
           `- \`spawn_agent\`/\`ask_agent\`: Delegate to other crew agents.`,
           `- Standard tools: exec, read, edit, write, web_search, etc.`,
+        `- \`mcporter\` skill: Access external MCP servers (finances, APIs, etc.). Run \`mcporter list\` to discover available servers, then \`mcporter call <server.tool> key=value\` to call tools.`,
           ``,
           `**Sub-issue guidance:** Only create sub-issues when work genuinely needs separate tracking — e.g., it requires the user to take action first, depends on an external event, or is a long-running task. For research, lookups, and tasks you can complete with your tools, just do the work directly and report findings. Most requests need 0 sub-issues.`,
         ]
@@ -1174,6 +1177,7 @@ export async function handleLinearWebhook(
           `- \`${followUpCliTool}\`: **Planning mode only.** Workers may explore the workspace and write plan files (PLAN.md, design docs). Workers MUST NOT create, modify, or delete workspace artifacts, run deployments, or make system changes. Use for workspace exploration and planning only.`,
           `- \`spawn_agent\`/\`ask_agent\`: Delegate to other crew agents.`,
           `- Standard tools: exec, read, edit, write, web_search, etc.`,
+        `- \`mcporter\` skill: Access external MCP servers (finances, APIs, etc.). Run \`mcporter list\` to discover available servers, then \`mcporter call <server.tool> key=value\` to call tools.`,
         ];
 
       const followUpRoleLines = followUpIsTriaged
@@ -1823,7 +1827,7 @@ export async function handleLinearWebhook(
         const message = [
           `IMPORTANT: You are assessing a new Linear issue. Review it in context and provide your analysis. You MUST respond with a JSON block containing your decisions, followed by a BRIEF assessment (3-8 lines max).`,
           ``,
-          `**Tool access:** You have access to the user's full environment — search email, calendar, web, memory, files, and \`linear_issues\` to enrich this issue with concrete details. Do the research — don't just suggest it.`,
+          `**Tool access:** You have access to the user's full environment — search email, calendar, web, memory, files, \`linear_issues\`, and \`mcporter\` (run \`mcporter list\` to discover MCP servers like finances, APIs) to enrich this issue with concrete details. Do the research — don't just suggest it.`,
           ``,
           `## Issue: ${enrichedIssue?.identifier ?? issue.identifier ?? issue.id} — ${enrichedIssue?.title ?? issue.title ?? "(untitled)"}`,
           `**Status:** ${enrichedIssue?.state?.name ?? "Unknown"} | **Current Estimate:** ${enrichedIssue?.estimate ?? "None"} | **Current Labels:** ${currentLabelNames}`,
@@ -2090,6 +2094,7 @@ export async function handleLinearWebhook(
           `## Linear tools available:`,
           `- \`linear_issues\` tool: action="read" to get full issue details, action="search" to find issues by keyword, action="comment" to post on issues.`,
           `- Standard tools: web_search, exec, read, etc.`,
+          `- \`mcporter\` skill: Access external MCP servers (finances, APIs, etc.). Run \`mcporter list\` to see available servers, then \`mcporter call <server.tool> key=value\`.`,
           ``,
           `**${author} says:**`,
           `> ${sanitizePromptInput(updateBody, 2000)}`,
@@ -2226,6 +2231,7 @@ async function dispatchCommentToAgent(
       `- \`linear_issues\` tool: Full access. Use action="read" with issueId="${issueRef}" to get details, action="create" to create issues (with parentIssueId for sub-issues when separate tracking is needed), action="update" with status/priority/labels/estimate to modify issues, action="comment" to post comments, action="list_states" to see available workflow states.`,
       `- \`${cliTool}\`: Dispatch work to a worker. Workers return text — they cannot access linear_issues.`,
       `- Standard tools: exec, read, edit, write, web_search, etc.`,
+        `- \`mcporter\` skill: Access external MCP servers (finances, APIs, etc.). Run \`mcporter list\` to discover available servers, then \`mcporter call <server.tool> key=value\` to call tools.`,
       ``,
       `**Sub-issue guidance:** Only create sub-issues when work genuinely needs separate tracking — e.g., it requires the user to take action first, depends on an external event, or is a long-running task. For research, lookups, and tasks you can complete with your tools, just do the work directly and report findings. Most requests need 0 sub-issues.`,
     ]
@@ -2234,6 +2240,7 @@ async function dispatchCommentToAgent(
       `- \`linear_issues\` tool: READ ONLY. Use action="read" with issueId="${issueRef}" to get details, action="list_states"/"list_labels" for metadata. Do NOT use action="update", action="create", or action="comment".`,
       `- \`${cliTool}\`: **Planning mode only.** Workers may explore the workspace and write plan files (PLAN.md, design docs). Workers MUST NOT create, modify, or delete workspace artifacts, run deployments, or make system changes. Use for workspace exploration and planning only.`,
       `- Standard tools: exec, read, edit, write, web_search, etc.`,
+        `- \`mcporter\` skill: Access external MCP servers (finances, APIs, etc.). Run \`mcporter list\` to discover available servers, then \`mcporter call <server.tool> key=value\` to call tools.`,
     ];
 
   const roleLines = isTriaged
