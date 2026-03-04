@@ -834,7 +834,7 @@ export async function handleLinearWebhook(
         `- \`${cliTool}\`: Dispatch work to a worker. Workers return text — they cannot access linear_issues.`,
         `- \`spawn_agent\`/\`ask_agent\`: Delegate to other crew agents.`,
         `- Standard tools: exec, read, edit, write, web_search, etc.`,
-        `- \`mcporter\` skill: Access external MCP servers (finances, APIs, etc.). Run \`mcporter list\` to discover available servers, then \`mcporter call <server.tool> key=value\` to call tools.`,
+        `- \`mcporter\` CLI: Access MCP servers (Linear projects/initiatives via \`mcporter call linear.*\`, finances via \`mcporter call monarch-money.*\`, etc.). Run \`mcporter list\` to discover servers, \`mcporter list <server> --schema\` for tool docs.`,
         ``,
         `**Sub-issue guidance:** Only create sub-issues when work genuinely needs separate tracking — e.g., it requires the user to take action first, depends on an external event, or is a long-running task. For research, lookups, and tasks you can complete with your tools, just do the work directly and report findings. Most requests need 0 sub-issues.`,
       ]
@@ -844,7 +844,7 @@ export async function handleLinearWebhook(
         `- \`${cliTool}\`: **Planning mode only.** Workers may explore the workspace and write plan files (PLAN.md, design docs). Workers MUST NOT create, modify, or delete workspace artifacts, run deployments, or make system changes. Use for workspace exploration and planning only.`,
         `- \`spawn_agent\`/\`ask_agent\`: Delegate to other crew agents.`,
         `- Standard tools: exec, read, edit, write, web_search, etc.`,
-        `- \`mcporter\` skill: Access external MCP servers (finances, APIs, etc.). Run \`mcporter list\` to discover available servers, then \`mcporter call <server.tool> key=value\` to call tools.`,
+        `- \`mcporter\` CLI: Access MCP servers (Linear projects/initiatives via \`mcporter call linear.*\`, finances via \`mcporter call monarch-money.*\`, etc.). Run \`mcporter list\` to discover servers, \`mcporter list <server> --schema\` for tool docs.`,
       ];
 
     const roleLines = isTriaged
@@ -1167,7 +1167,7 @@ export async function handleLinearWebhook(
           `- \`${followUpCliTool}\`: Dispatch work to a worker. Workers return text — they cannot access linear_issues.`,
           `- \`spawn_agent\`/\`ask_agent\`: Delegate to other crew agents.`,
           `- Standard tools: exec, read, edit, write, web_search, etc.`,
-        `- \`mcporter\` skill: Access external MCP servers (finances, APIs, etc.). Run \`mcporter list\` to discover available servers, then \`mcporter call <server.tool> key=value\` to call tools.`,
+        `- \`mcporter\` CLI: Access MCP servers (Linear projects/initiatives via \`mcporter call linear.*\`, finances via \`mcporter call monarch-money.*\`, etc.). Run \`mcporter list\` to discover servers, \`mcporter list <server> --schema\` for tool docs.`,
           ``,
           `**Sub-issue guidance:** Only create sub-issues when work genuinely needs separate tracking — e.g., it requires the user to take action first, depends on an external event, or is a long-running task. For research, lookups, and tasks you can complete with your tools, just do the work directly and report findings. Most requests need 0 sub-issues.`,
         ]
@@ -1177,7 +1177,7 @@ export async function handleLinearWebhook(
           `- \`${followUpCliTool}\`: **Planning mode only.** Workers may explore the workspace and write plan files (PLAN.md, design docs). Workers MUST NOT create, modify, or delete workspace artifacts, run deployments, or make system changes. Use for workspace exploration and planning only.`,
           `- \`spawn_agent\`/\`ask_agent\`: Delegate to other crew agents.`,
           `- Standard tools: exec, read, edit, write, web_search, etc.`,
-        `- \`mcporter\` skill: Access external MCP servers (finances, APIs, etc.). Run \`mcporter list\` to discover available servers, then \`mcporter call <server.tool> key=value\` to call tools.`,
+        `- \`mcporter\` CLI: Access MCP servers (Linear projects/initiatives via \`mcporter call linear.*\`, finances via \`mcporter call monarch-money.*\`, etc.). Run \`mcporter list\` to discover servers, \`mcporter list <server> --schema\` for tool docs.`,
         ];
 
       const followUpRoleLines = followUpIsTriaged
@@ -2091,10 +2091,10 @@ export async function handleLinearWebhook(
           initiative?.description ? `**Description:** ${initiative.description}` : "",
           projectContext,
           ``,
-          `## Linear tools available:`,
-          `- \`linear_issues\` tool: action="read" to get full issue details, action="search" to find issues by keyword, action="comment" to post on issues.`,
-          `- Standard tools: web_search, exec, read, etc.`,
-          `- \`mcporter\` skill: Access external MCP servers (finances, APIs, etc.). Run \`mcporter list\` to see available servers, then \`mcporter call <server.tool> key=value\`.`,
+          `## Tools available:`,
+          `- \`linear_issues\` tool: action="read" (issue details), "search" (find issues), "create" (new issues/sub-issues), "update" (status/priority/labels), "comment" (post on issues).`,
+          `- \`mcporter\` CLI: For Linear project/initiative/milestone operations: \`mcporter call linear.save_project name="..." team="Life"\`, \`mcporter call linear.save_initiative\`, \`mcporter call linear.list_projects\`. Run \`mcporter list linear --schema\` to see all 36 Linear tools.`,
+          `- Also: web_search, exec, file read/write, etc.`,
           ``,
           `**${author} says:**`,
           `> ${sanitizePromptInput(updateBody, 2000)}`,
@@ -2231,7 +2231,7 @@ async function dispatchCommentToAgent(
       `- \`linear_issues\` tool: Full access. Use action="read" with issueId="${issueRef}" to get details, action="create" to create issues (with parentIssueId for sub-issues when separate tracking is needed), action="update" with status/priority/labels/estimate to modify issues, action="comment" to post comments, action="list_states" to see available workflow states.`,
       `- \`${cliTool}\`: Dispatch work to a worker. Workers return text — they cannot access linear_issues.`,
       `- Standard tools: exec, read, edit, write, web_search, etc.`,
-        `- \`mcporter\` skill: Access external MCP servers (finances, APIs, etc.). Run \`mcporter list\` to discover available servers, then \`mcporter call <server.tool> key=value\` to call tools.`,
+        `- \`mcporter\` CLI: Access MCP servers (Linear projects/initiatives via \`mcporter call linear.*\`, finances via \`mcporter call monarch-money.*\`, etc.). Run \`mcporter list\` to discover servers, \`mcporter list <server> --schema\` for tool docs.`,
       ``,
       `**Sub-issue guidance:** Only create sub-issues when work genuinely needs separate tracking — e.g., it requires the user to take action first, depends on an external event, or is a long-running task. For research, lookups, and tasks you can complete with your tools, just do the work directly and report findings. Most requests need 0 sub-issues.`,
     ]
@@ -2240,7 +2240,7 @@ async function dispatchCommentToAgent(
       `- \`linear_issues\` tool: READ ONLY. Use action="read" with issueId="${issueRef}" to get details, action="list_states"/"list_labels" for metadata. Do NOT use action="update", action="create", or action="comment".`,
       `- \`${cliTool}\`: **Planning mode only.** Workers may explore the workspace and write plan files (PLAN.md, design docs). Workers MUST NOT create, modify, or delete workspace artifacts, run deployments, or make system changes. Use for workspace exploration and planning only.`,
       `- Standard tools: exec, read, edit, write, web_search, etc.`,
-        `- \`mcporter\` skill: Access external MCP servers (finances, APIs, etc.). Run \`mcporter list\` to discover available servers, then \`mcporter call <server.tool> key=value\` to call tools.`,
+        `- \`mcporter\` CLI: Access MCP servers (Linear projects/initiatives via \`mcporter call linear.*\`, finances via \`mcporter call monarch-money.*\`, etc.). Run \`mcporter list\` to discover servers, \`mcporter list <server> --schema\` for tool docs.`,
     ];
 
   const roleLines = isTriaged
@@ -2437,8 +2437,10 @@ async function dispatchNonIssueCommentToAgent(
     `**Output rules:** Your text is posted VERBATIM. Do NOT include reasoning steps, false starts, or tool-use narration ("Let me search...", "I couldn't find..."). Output ONLY your final, polished response.`,
     ``,
     `**Your role:** Conversational assistant. Answer questions, provide analysis, or offer suggestions.`,
-    `You have access to \`linear_issues\` tool: action="read" to get issue details, action="search" to find issues by keyword. Use these to look up related context.`,
-    `Also available: web_search, exec, read, etc.`,
+    `**Tools available:**`,
+    `- \`linear_issues\` tool: action="read" (issue details), "search" (find issues), "create" (new issues/sub-issues), "update" (status/priority/labels), "comment" (post on issues).`,
+    `- \`mcporter\` CLI: Access MCP servers via exec. For Linear project/initiative/milestone operations: \`mcporter call linear.save_project name="..." team="Life"\`, \`mcporter call linear.save_initiative\`, \`mcporter call linear.list_projects\`. Run \`mcporter list linear --schema\` to see all 36 Linear tools.`,
+    `- Also: web_search, exec, file read/write, etc.`,
     ...entityContextLines,
     ``,
     `**${commentor} says:**`,
