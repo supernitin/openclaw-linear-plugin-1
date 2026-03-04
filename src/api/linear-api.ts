@@ -345,6 +345,18 @@ export class LinearAgentApi {
     return data.commentCreate.comment.id;
   }
 
+  async getCommentAuthorId(commentId: string): Promise<string | null> {
+    try {
+      const data = await this.gql<{ comment: { user: { id: string } | null } }>(
+        `query CommentAuthor($id: String!) { comment(id: $id) { user { id } } }`,
+        { id: commentId },
+      );
+      return data.comment?.user?.id ?? null;
+    } catch {
+      return null;
+    }
+  }
+
   async createInitiativeUpdate(
     initiativeId: string,
     body: string,

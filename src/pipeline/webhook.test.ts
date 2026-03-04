@@ -85,6 +85,7 @@ const {
     getInitiativeFromUpdate: vi.fn().mockResolvedValue({ id: "init-1", name: "Q1 Roadmap" }),
     getInitiativeProjects: vi.fn().mockResolvedValue([]),
     createCommentOnEntity: vi.fn().mockResolvedValue("entity-comment-id"),
+    getCommentAuthorId: vi.fn().mockResolvedValue(null),
   },
   loadAgentProfilesMock: vi.fn().mockReturnValue({
     mal: { label: "Mal", mission: "captain", mentionAliases: ["mal", "mason"], isDefault: true, avatarUrl: "https://example.com/mal.png" },
@@ -354,6 +355,7 @@ afterEach(() => {
   mockLinearApiInstance.getInitiativeFromUpdate.mockReset().mockResolvedValue({ id: "init-1", name: "Q1 Roadmap" });
   mockLinearApiInstance.getInitiativeProjects.mockReset().mockResolvedValue([]);
   mockLinearApiInstance.createCommentOnEntity.mockReset().mockResolvedValue("entity-comment-id");
+  mockLinearApiInstance.getCommentAuthorId.mockReset().mockResolvedValue(null);
   resolveLinearTokenMock.mockReset().mockReturnValue({
     accessToken: "test-token",
     refreshToken: "test-refresh",
@@ -1177,6 +1179,128 @@ describe("Comment.create intent routing", () => {
     const infoCalls = (result.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
     expect(infoCalls.some((msg: string) => msg.includes("no agent @mention — skipping"))).toBe(true);
     expect(runAgentMock).not.toHaveBeenCalled();
+  });
+
+  it("dispatches thread reply to bot comment on initiative update without @mention", async () => {
+    runAgentMock.mockClear();
+    // Parent comment was authored by the bot (viewer-1)
+    mockLinearApiInstance.getCommentAuthorId.mockResolvedValue("viewer-1");
+    resolveAgentFromAliasMock.mockReturnValue(null); // no @mention match
+
+    const result = await postWebhook({
+      type: "Comment",
+      action: "create",
+      data: {
+        id: "comment-thread-reply",
+        body: "Try again please",
+        user: { id: "u1", name: "Nitin" },
+        parentId: "bot-comment-parent",
+        initiativeUpdateId: "init-update-3",
+        initiativeUpdate: { id: "init-update-3", health: "onTrack", bodyData: {} },
+      },
+    });
+
+    expect(result.status).toBe(200);
+    await new Promise((r) => setTimeout(r, 100));
+    const infoCalls = (result.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
+    expect(infoCalls.some((msg: string) => msg.includes("Thread reply to bot"))).toBe(true);
+    expect(runAgentMock).toHaveBeenCalled();
+  });
+
+  it("skips thread reply to non-bot comment on initiative update", async () => {
+    runAgentMock.mockClear();
+    // Parent comment was authored by someone else
+    mockLinearApiInstance.getCommentAuthorId.mockResolvedValue("other-user-id");
+
+    const result = await postWebhook({
+      type: "Comment",
+      action: "create",
+      data: {
+        id: "comment-thread-reply-nonbot",
+        body: "Reply to someone else",
+        user: { id: "u1", name: "User" },
+        parentId: "human-comment-parent",
+        initiativeUpdateId: "init-update-4",
+        initiativeUpdate: { id: "init-update-4", health: "onTrack", bodyData: {} },
+      },
+    });
+
+    expect(result.status).toBe(200);
+    const infoCalls = (result.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
+    expect(infoCalls.some((msg: string) => msg.includes("no agent @mention — skipping"))).toBe(true);
+    expect(runAgentMock).not.toHaveBeenCalled();
+  });
+
+  it("skips bot's own thread reply on initiative update (self-comment guard)", async () => {
+    runAgentMock.mockClear();
+    // Comment authored by the bot itself (viewer-1)
+    const result = await postWebhook({
+      type: "Comment",
+      action: "create",
+      data: {
+        id: "comment-bot-self-reply",
+        body: "Bot replying to itself",
+        user: { id: "viewer-1", name: "frAInk" },
+        parentId: "some-parent",
+        initiativeUpdateId: "init-update-5",
+        initiativeUpdate: { id: "init-update-5", health: "onTrack", bodyData: {} },
+      },
+    });
+
+    expect(result.status).toBe(200);
+    const infoCalls = (result.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
+    expect(infoCalls.some((msg: string) => msg.includes("skipping our own comment"))).toBe(true);
+    expect(runAgentMock).not.toHaveBeenCalled();
+  });
+
+  it("dispatch prompt for initiative @mention includes mcporter Linear guidance", async () => {
+    runAgentMock.mockClear();
+    resolveAgentFromAliasMock.mockReturnValue({ agentId: "mal", profile: { label: "Mal" } });
+
+    await postWebhook({
+      type: "Comment",
+      action: "create",
+      data: {
+        id: "comment-prompt-check-mcporter",
+        body: "@mal create a project for this",
+        user: { id: "u1", name: "Nitin" },
+        initiativeUpdateId: "init-update-prompt",
+        initiativeUpdate: { id: "init-update-prompt", health: "onTrack", bodyData: {} },
+      },
+    });
+
+    await new Promise((r) => setTimeout(r, 100));
+    expect(runAgentMock).toHaveBeenCalled();
+    const agentCall = runAgentMock.mock.calls[0][0];
+    expect(agentCall.message).toContain("mcporter call linear.");
+    expect(agentCall.message).toContain("mcporter list");
+  });
+
+  it("dispatch prompt for initiative @mention includes all linear_issues actions", async () => {
+    runAgentMock.mockClear();
+    resolveAgentFromAliasMock.mockReturnValue({ agentId: "mal", profile: { label: "Mal" } });
+
+    await postWebhook({
+      type: "Comment",
+      action: "create",
+      data: {
+        id: "comment-prompt-check-actions",
+        body: "@mal check the issues",
+        user: { id: "u1", name: "Nitin" },
+        initiativeUpdateId: "init-update-actions",
+        initiativeUpdate: { id: "init-update-actions", health: "onTrack", bodyData: {} },
+      },
+    });
+
+    await new Promise((r) => setTimeout(r, 100));
+    expect(runAgentMock).toHaveBeenCalled();
+    const agentCall = runAgentMock.mock.calls[0][0];
+    // All linear_issues actions should be mentioned
+    expect(agentCall.message).toContain('"read"');
+    expect(agentCall.message).toContain('"search"');
+    expect(agentCall.message).toContain('"create"');
+    expect(agentCall.message).toContain('"update"');
+    expect(agentCall.message).toContain('"comment"');
   });
 
   it("deduplicates by comment ID", async () => {
@@ -5303,5 +5427,52 @@ describe("InitiativeUpdate.create @mention routing", () => {
       { initiativeUpdateId: "iu-agent-fail" },
       expect.stringContaining("encountered an issue"),
     );
+  });
+
+  it("initiative update prompt includes mcporter Linear guidance", async () => {
+    resolveAgentFromAliasMock.mockReturnValue({ agentId: "mal" });
+    runAgentMock.mockClear();
+
+    await postWebhook({
+      type: "InitiativeUpdate",
+      action: "create",
+      data: {
+        id: "iu-prompt-mcporter",
+        body: "Hey @mal create a project for this",
+        initiative: { id: "init-1", name: "Q1 Roadmap" },
+      },
+      actor: { name: "Nitin" },
+    });
+
+    await new Promise((r) => setTimeout(r, 300));
+    expect(runAgentMock).toHaveBeenCalled();
+    const agentCall = runAgentMock.mock.calls[0][0];
+    expect(agentCall.message).toContain("mcporter call linear.");
+    expect(agentCall.message).toContain("save_project");
+  });
+
+  it("initiative update prompt includes all linear_issues actions", async () => {
+    resolveAgentFromAliasMock.mockReturnValue({ agentId: "mal" });
+    runAgentMock.mockClear();
+
+    await postWebhook({
+      type: "InitiativeUpdate",
+      action: "create",
+      data: {
+        id: "iu-prompt-actions",
+        body: "Hey @mal check the issues",
+        initiative: { id: "init-1", name: "Q1 Roadmap" },
+      },
+      actor: { name: "Nitin" },
+    });
+
+    await new Promise((r) => setTimeout(r, 300));
+    expect(runAgentMock).toHaveBeenCalled();
+    const agentCall = runAgentMock.mock.calls[0][0];
+    expect(agentCall.message).toContain('"read"');
+    expect(agentCall.message).toContain('"search"');
+    expect(agentCall.message).toContain('"create"');
+    expect(agentCall.message).toContain('"update"');
+    expect(agentCall.message).toContain('"comment"');
   });
 });
