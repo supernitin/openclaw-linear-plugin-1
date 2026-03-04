@@ -357,6 +357,22 @@ export class LinearAgentApi {
     }
   }
 
+  async hasBotCommentInThread(parentCommentId: string, botUserId: string): Promise<boolean> {
+    try {
+      const data = await this.gql<{
+        comment: { children: { nodes: Array<{ user: { id: string } | null }> } };
+      }>(
+        `query ThreadChildren($id: String!) {
+          comment(id: $id) { children { nodes { user { id } } } }
+        }`,
+        { id: parentCommentId },
+      );
+      return data.comment?.children?.nodes?.some((c) => c.user?.id === botUserId) ?? false;
+    } catch {
+      return false;
+    }
+  }
+
   async createInitiativeUpdate(
     initiativeId: string,
     body: string,

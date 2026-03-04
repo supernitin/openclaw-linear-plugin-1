@@ -1378,23 +1378,26 @@ export async function handleLinearWebhook(
           }
         }
 
-        // No @mention — check if this is a thread reply to the bot's own comment
+        // No @mention — check if bot has participated in this thread
+        // Linear threads use top-level parentId (not direct parent), so we check
+        // if the bot authored ANY child comment in the thread, not just the parentId author.
         if (comment?.parentId) {
           try {
             const viewerId = await linearApi.getViewerId();
-            const parentAuthorId = await linearApi.getCommentAuthorId(comment.parentId);
-            if (viewerId && parentAuthorId === viewerId) {
-              // Thread reply to bot — dispatch to default agent
-              const defaultProfile = Object.entries(profiles).find(([, p]) => p.isDefault);
-              const defaultAgentId = defaultProfile?.[0] ?? Object.keys(profiles)[0];
-              if (defaultAgentId) {
-                api.logger.info(`Thread reply to bot on ${parentType} ${parentId} — dispatching to ${defaultAgentId}`);
-                void dispatchNonIssueCommentToAgent(
-                  api, linearApi, profiles, defaultAgentId,
-                  { parentType, parentId: parentId, initiativeUpdateId, projectUpdateId, documentContentId },
-                  comment, commentBody, commentor, pluginConfig,
-                ).catch((err) => api.logger.warn(`Non-issue thread reply dispatch error: ${err}`));
-                return true;
+            if (viewerId) {
+              const botInThread = await linearApi.hasBotCommentInThread(comment.parentId, viewerId);
+              if (botInThread) {
+                const defaultProfile = Object.entries(profiles).find(([, p]) => p.isDefault);
+                const defaultAgentId = defaultProfile?.[0] ?? Object.keys(profiles)[0];
+                if (defaultAgentId) {
+                  api.logger.info(`Thread reply (bot participated) on ${parentType} ${parentId} — dispatching to ${defaultAgentId}`);
+                  void dispatchNonIssueCommentToAgent(
+                    api, linearApi, profiles, defaultAgentId,
+                    { parentType, parentId: parentId, initiativeUpdateId, projectUpdateId, documentContentId },
+                    comment, commentBody, commentor, pluginConfig,
+                  ).catch((err) => api.logger.warn(`Non-issue thread reply dispatch error: ${err}`));
+                  return true;
+                }
               }
             }
           } catch { /* fall through to skip */ }

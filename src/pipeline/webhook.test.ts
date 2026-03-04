@@ -86,6 +86,7 @@ const {
     getInitiativeProjects: vi.fn().mockResolvedValue([]),
     createCommentOnEntity: vi.fn().mockResolvedValue("entity-comment-id"),
     getCommentAuthorId: vi.fn().mockResolvedValue(null),
+    hasBotCommentInThread: vi.fn().mockResolvedValue(false),
   },
   loadAgentProfilesMock: vi.fn().mockReturnValue({
     mal: { label: "Mal", mission: "captain", mentionAliases: ["mal", "mason"], isDefault: true, avatarUrl: "https://example.com/mal.png" },
@@ -356,6 +357,7 @@ afterEach(() => {
   mockLinearApiInstance.getInitiativeProjects.mockReset().mockResolvedValue([]);
   mockLinearApiInstance.createCommentOnEntity.mockReset().mockResolvedValue("entity-comment-id");
   mockLinearApiInstance.getCommentAuthorId.mockReset().mockResolvedValue(null);
+  mockLinearApiInstance.hasBotCommentInThread.mockReset().mockResolvedValue(false);
   resolveLinearTokenMock.mockReset().mockReturnValue({
     accessToken: "test-token",
     refreshToken: "test-refresh",
@@ -1183,8 +1185,8 @@ describe("Comment.create intent routing", () => {
 
   it("dispatches thread reply to bot comment on initiative update without @mention", async () => {
     runAgentMock.mockClear();
-    // Parent comment was authored by the bot (viewer-1)
-    mockLinearApiInstance.getCommentAuthorId.mockResolvedValue("viewer-1");
+    // Bot has a comment in this thread
+    mockLinearApiInstance.hasBotCommentInThread.mockResolvedValue(true);
     resolveAgentFromAliasMock.mockReturnValue(null); // no @mention match
 
     const result = await postWebhook({
@@ -1203,14 +1205,14 @@ describe("Comment.create intent routing", () => {
     expect(result.status).toBe(200);
     await new Promise((r) => setTimeout(r, 100));
     const infoCalls = (result.api.logger.info as any).mock.calls.map((c: any[]) => c[0]);
-    expect(infoCalls.some((msg: string) => msg.includes("Thread reply to bot"))).toBe(true);
+    expect(infoCalls.some((msg: string) => msg.includes("Thread reply (bot participated)"))).toBe(true);
     expect(runAgentMock).toHaveBeenCalled();
   });
 
-  it("skips thread reply to non-bot comment on initiative update", async () => {
+  it("skips thread reply when bot has not participated in thread", async () => {
     runAgentMock.mockClear();
-    // Parent comment was authored by someone else
-    mockLinearApiInstance.getCommentAuthorId.mockResolvedValue("other-user-id");
+    // Bot has NO comment in this thread
+    mockLinearApiInstance.hasBotCommentInThread.mockResolvedValue(false);
 
     const result = await postWebhook({
       type: "Comment",
